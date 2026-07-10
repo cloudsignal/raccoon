@@ -56,9 +56,9 @@ describe('createApprovalValueStore', () => {
     expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve);
   });
 
-  // ---- one-shot consumption (two-phase, #R4-9 + #R5-8) ----------------------
+  // ---- atomic reservation (commit/rollback, #R4-9 + #R5-8 + #R6-1) -----------
 
-  it('commit() consumes the entry — a replay after commit cannot resolve it again (#R4-9/#R5-8)', () => {
+  it('commit() finalizes the reservation — a replay after commit cannot resolve it again (#R4-9/#R5-8)', () => {
     const store = createApprovalValueStore();
     store.remember('req-1', 'alice', new Map([['Approve', approve]]));
     const resolved = store.resolve('req-1', 'alice', 'Approve');
@@ -67,28 +67,51 @@ describe('createApprovalValueStore', () => {
     expect(store.resolve('req-1', 'alice', 'Approve')).toBeUndefined(); // replay: already consumed
   });
 
-  it('resolve() alone does NOT consume — a transient dispatch failure can retry the same response (#R5-8)', () => {
-    // Consumption must wait for the choice to have actually been dispatched
-    // (commit()). Consuming eagerly on resolve meant a transient OpenClaw
-    // dispatch failure permanently burned the approval: the retry's resolve
-    // came back undefined, degraded to the bracket-tag fallback, and the
-    // real pending approval could never be acted on again.
+  it('resolve() RESERVES atomically — a second resolve before commit/rollback gets undefined (#R6-1)', () => {
+    // Two distinct responses for the same approval (Allow clicked, then Deny
+    // clicked — different envelopes, same refId) previously BOTH resolved,
+    // because resolve() left the entry available until commit(). Both then
+    // dispatched competing commands. Resolution must be an atomic
+    // reservation: the first resolve takes the entry out of circulation
+    // immediately; the loser degrades to the bracket-tag fallback.
     const store = createApprovalValueStore();
-    store.remember('req-1', 'alice', new Map([['Approve', approve]]));
-    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // dispatch then fails; no commit
-    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // retry still resolves
+    store.remember('req-1', 'alice', new Map([['Allow', approve], ['Deny', skip]]));
+    const first = store.resolve('req-1', 'alice', 'Allow');
+    expect(first?.choice).toEqual(approve);
+    expect(store.resolve('req-1', 'alice', 'Deny')).toBeUndefined(); // reserved — NOT both dispatchable
+    expect(store.resolve('req-1', 'alice', 'Allow')).toBeUndefined(); // same for a replay of the winner
   });
 
-  it('commit() is a no-op if the entry was already re-consumed or replaced (idempotent, keyed to its own resolve)', () => {
+  it('rollback() releases the reservation — a transient dispatch failure can retry (#R5-8/#R6-1)', () => {
+    // The R5-8 retry property, now via explicit rollback: a dispatch failure
+    // rolls the reservation back so the approval is not burned; nothing is
+    // available in between (no double-dispatch window).
     const store = createApprovalValueStore();
     store.remember('req-1', 'alice', new Map([['Approve', approve]]));
     const first = store.resolve('req-1', 'alice', 'Approve');
-    first!.commit();
-    // Same refId legitimately re-remembered later (refIds are ulids in
-    // practice, but the store must not blow up either way).
-    store.remember('req-1', 'alice', new Map([['Approve', skip]]));
-    first!.commit(); // stale handle: must NOT delete the new entry
+    expect(first?.choice).toEqual(approve); // dispatch then fails…
+    first!.rollback();
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // …retry still resolves
+  });
+
+  it('rollback() does not clobber an entry re-remembered for the same refId since', () => {
+    const store = createApprovalValueStore();
+    store.remember('req-1', 'alice', new Map([['Approve', approve]]));
+    const first = store.resolve('req-1', 'alice', 'Approve');
+    store.remember('req-1', 'alice', new Map([['Approve', skip]])); // replaced meanwhile
+    first!.rollback(); // stale handle: must NOT overwrite the new entry
     expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(skip);
+  });
+
+  it('commit() after rollback()+re-resolve is a stale no-op (handles are single-use)', () => {
+    const store = createApprovalValueStore();
+    store.remember('req-1', 'alice', new Map([['Approve', approve]]));
+    const first = store.resolve('req-1', 'alice', 'Approve');
+    first!.rollback();
+    const second = store.resolve('req-1', 'alice', 'Approve');
+    first!.commit(); // stale: the entry now belongs to `second`'s reservation
+    second!.rollback();
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // still available
   });
 
   // ---- expiry ---------------------------------------------------------------

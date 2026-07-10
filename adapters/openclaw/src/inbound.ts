@@ -264,19 +264,26 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     // Await the dispatch promise to propagate any errors thrown by OpenClaw.
     await dispatchPromise;
 
-    // #R5-8: the turn dispatched successfully — NOW consume the approval
-    // mapping (one-shot), and only for a real click. An edited free-text
-    // response never sent the command, so its mapping stays resolvable for
-    // the click that eventually acts on the still-pending approval; a
-    // failed dispatch never reaches this line, so a retry can re-resolve.
-    if (resolvedApproval && ctx.approval?.editedText === undefined) {
-      resolvedApproval.commit();
+    // #R5-8/#R6-1: the turn dispatched successfully — settle the
+    // reservation. A real click commits (final, replay-proof consumption);
+    // an edited free-text response rolls back — it never sent the command,
+    // so the mapping must return to circulation for the click that
+    // eventually acts on the still-pending OpenClaw approval.
+    if (resolvedApproval) {
+      if (ctx.approval?.editedText === undefined) resolvedApproval.commit();
+      else resolvedApproval.rollback();
     }
+  } catch (err) {
+    // #R5-8/#R6-1: the dispatch failed — release the reservation so a retry
+    // can resolve the command again, instead of the approval being burned.
+    resolvedApproval?.rollback();
+    throw err;
   } finally {
     // Guard: if the consumer exits early (break / return), suppress any
     // subsequent rejection from dispatchPromise so it cannot become an
     // unhandled rejection. The turn is not cancellable — it runs to
-    // completion in the background.
+    // completion in the background. (An early exit leaves the reservation
+    // unsettled; the store's TTL is the backstop for that path.)
     dispatchPromise.catch(() => {});
   }
 }

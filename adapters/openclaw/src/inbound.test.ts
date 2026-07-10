@@ -193,6 +193,64 @@ describe('buildRaccoonInboundRunner', () => {
     expect(capturedBody).toContain('my custom reply');
   });
 
+  it('competing responses to one approval cannot both dispatch commands — the loser degrades to the bracket tag (#R6-1)', async () => {
+    // The bridge dedups by ENVELOPE id, not refId, so two distinct clicks
+    // (Allow, then Deny — two envelopes, same refId) both reach the runner.
+    // With resolution-as-reservation, only the first becomes a real slash
+    // command; the second must degrade to the non-command bracket tag, never
+    // a competing /deny alongside an already-dispatched /approve.
+    const bodies: string[] = [];
+    mockDispatch.mockImplementation(async (arg) => {
+      bodies.push((arg.ctxPayload as { Body: string }).Body);
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    const store = createApprovalValueStore();
+    store.remember('req-7', ctx.userId, new Map([
+      ['Allow', { value: 'approve req-7 allow-once', isCommand: true }],
+      ['Deny', { value: 'approve req-7 deny', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const allow = { ...ctx, text: 'Allow', approval: { refId: 'req-7', choice: 'Allow' } };
+    const deny = { ...ctx, text: 'Deny', approval: { refId: 'req-7', choice: 'Deny' } };
+
+    // CONCURRENT turns — the reviewer's exact repro: both resolves happen
+    // before either turn finishes (so before any commit). The bridge does
+    // not serialize per-user turns, so this interleaving is real. Gate the
+    // first dispatch open only once the second turn has also dispatched.
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => { releaseFirst = r; });
+    mockDispatch.mockReset();
+    mockDispatch
+      .mockImplementationOnce(async (arg) => {
+        bodies.push((arg.ctxPayload as { Body: string }).Body);
+        await firstGate; // park mid-turn, resolution already taken
+        arg.dispatcher.sendFinalReply({ text: 'ok' });
+        arg.dispatcher.markComplete();
+        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+      })
+      .mockImplementationOnce(async (arg) => {
+        bodies.push((arg.ctxPayload as { Body: string }).Body);
+        arg.dispatcher.sendFinalReply({ text: 'ok' });
+        arg.dispatcher.markComplete();
+        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+      });
+
+    const allowDone = (async () => { for await (const _chunk of runner.run(allow)) { /* drain */ } })();
+    await new Promise((r) => setTimeout(r, 10)); // Allow's turn has resolved + dispatched, parked at the gate
+    const denyDone = (async () => { for await (const _chunk of runner.run(deny)) { /* drain */ } })();
+    await new Promise((r) => setTimeout(r, 10)); // Deny's turn resolves + dispatches while Allow is mid-turn
+    releaseFirst();
+    await Promise.all([allowDone, denyDone]);
+
+    expect(bodies[0]).toBe('/approve req-7 allow-once');
+    expect(bodies[1]).not.toMatch(/^\//); // degraded, not a competing command
+    expect(bodies[1]).toContain('req-7'); // still correlated for the agent
+  });
+
   it('a transient dispatch failure does not burn the approval — the retry still resolves the command (#R5-8)', async () => {
     let capturedBody: string | undefined;
     mockDispatch
