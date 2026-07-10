@@ -1,7 +1,13 @@
 /* Raccoon app service worker — build __RACCOON_BUILD_ID__ */
 const BUILD_ID = '__RACCOON_BUILD_ID__';
-const SHELL_CACHE = `raccoon-shell-${BUILD_ID}`;
-const STATIC_CACHE = `raccoon-static-${BUILD_ID}`;
+// All Raccoon caches share this prefix so activation can prune OUR stale
+// builds without touching caches owned by anything else on the same origin
+// (#R6-10): the SW scope is the whole origin, and a Raccoon install may sit
+// alongside another app (e.g. a dashboard, or a host embedding) whose caches
+// must survive our activate.
+const CACHE_PREFIX = 'raccoon-';
+const SHELL_CACHE = `${CACHE_PREFIX}shell-${BUILD_ID}`;
+const STATIC_CACHE = `${CACHE_PREFIX}static-${BUILD_ID}`;
 
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
@@ -36,7 +42,11 @@ self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
     const names = await caches.keys();
     await Promise.all(names
-      .filter((n) => n !== SHELL_CACHE && n !== STATIC_CACHE)
+      // Only prune OUR own stale caches (#R6-10) — never another same-origin
+      // app's. A superseded build's raccoon-shell-<old>/raccoon-static-<old>
+      // match the prefix and are not the current pair, so they go; foreign
+      // caches (no raccoon- prefix) are left untouched.
+      .filter((n) => n.startsWith(CACHE_PREFIX) && n !== SHELL_CACHE && n !== STATIC_CACHE)
       .map((n) => caches.delete(n)));
     await self.clients.claim();
   })());
