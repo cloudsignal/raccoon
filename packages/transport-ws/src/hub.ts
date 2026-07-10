@@ -13,6 +13,13 @@ import { MemoryCredentialStore, type CredentialStore } from './credential-store.
 
 interface PairingToken { userId: string; expiresAt: number; used: boolean }
 
+// #R6-11: sentinel a hello's internal deadline rejects with, so a
+// never-settling external verification (validatePairingToken / verifySession
+// / createSession) cannot keep handleHello — and therefore its
+// outstandingHellos slot — pending forever. Distinct from a real store
+// error, which propagates normally.
+const HELLO_DEADLINE = Symbol('hello-deadline');
+
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -61,8 +68,11 @@ export interface WsHubOptions {
   vapidPublicKey?: string;
   /** External pairing validation (e.g. enrollment tokens in a host DB).
    *  Checked before the built-in in-memory token map. Return the userId
-   *  to grant, or null to reject. */
-  validatePairingToken?: (token: string) => Promise<string | null>;
+   *  to grant, or null to reject. `signal` aborts when the hello deadline
+   *  (helloTimeoutMs) fires (#R6-11) — a cooperative validator should pass
+   *  it to its own I/O so a hung backend cancels rather than dangles; the
+   *  hub bounds the slot either way. */
+  validatePairingToken?: (token: string, signal?: AbortSignal) => Promise<string | null>;
 }
 
 export class WsHub {
@@ -78,7 +88,7 @@ export class WsHub {
   private readonly maxPayloadBytes: number;
   private readonly staticDir: string | null;
   private readonly vapidPublicKey: string | null;
-  private readonly validatePairingToken: ((token: string) => Promise<string | null>) | null;
+  private readonly validatePairingToken: ((token: string, signal?: AbortSignal) => Promise<string | null>) | null;
 
   private server: Server | null = null;
   private wss: WebSocketServer | null = null;
@@ -131,6 +141,26 @@ export class WsHub {
   // tasks one timeout-cycle at a time. Gated at connection accept AND at
   // hello start; decremented only when handleHello actually settles.
   private outstandingHellos = 0;
+
+  /** #R6-11: bound every awaited step of a hello by helloTimeoutMs. Returns a
+   *  `race()` that settles either with the wrapped promise or by rejecting
+   *  with HELLO_DEADLINE once the deadline passes, plus a `done()` to clear
+   *  the timer on the normal path. A hung external verification is thereby
+   *  abandoned — handleHello returns, its `.finally()` runs, and the
+   *  outstandingHellos slot is reclaimed — instead of being held forever. */
+  private helloDeadline(): { race: <T>(p: Promise<T>) => Promise<T>; done: () => void } {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(HELLO_DEADLINE), this.helloTimeoutMs);
+    });
+    // If some hello path never calls race(), this promise stays unconsumed;
+    // swallow its eventual rejection so it can't surface as unhandled.
+    timeout.catch(() => {});
+    return {
+      race: <T>(p: Promise<T>): Promise<T> => Promise.race([p, timeout]),
+      done: () => clearTimeout(timer),
+    };
+  }
 
   constructor(opts: WsHubOptions) {
     this.instance = opts.instance;
@@ -337,6 +367,31 @@ export class WsHub {
   }
 
   private async handleHello(ws: WebSocket, ip: string, raw: string): Promise<void> {
+    // #R6-11: bound the WHOLE hello by helloTimeoutMs. If any awaited step
+    // hangs (a never-settling validatePairingToken / verifySession /
+    // createSession), the deadline wins the race, this returns, and the
+    // caller's `.finally()` reclaims the outstandingHellos slot — a hung
+    // validator can no longer hold a slot forever. The AbortController gives
+    // a cooperative validator an actual cancellation hook (the "or
+    // cancellation" half of the fix); non-cooperative work still can't hold
+    // the slot, it just runs on detached in the background until it settles.
+    const deadline = this.helloDeadline();
+    const controller = new AbortController();
+    try {
+      await deadline.race(this.handleHelloInner(ws, ip, raw, controller.signal));
+    } catch (err) {
+      if (err === HELLO_DEADLINE) {
+        controller.abort();
+        try { ws.close(4408, 'hello timeout'); } catch { /* already closing */ }
+        return;
+      }
+      throw err;
+    } finally {
+      deadline.done();
+    }
+  }
+
+  private async handleHelloInner(ws: WebSocket, ip: string, raw: string, signal: AbortSignal): Promise<void> {
     // Captured BEFORE anything else, including any await this call makes
     // (verifySession, validatePairingToken, createSession). A revoke stamped
     // at or after this instant — no matter which of those awaits it lands
@@ -396,7 +451,10 @@ export class WsHub {
 
     let grantUserId: string | null = null;
     if (this.validatePairingToken) {
-      grantUserId = await this.validatePairingToken(env.payload.token).catch(() => null);
+      // #R6-11: pass the abort signal so a cooperative validator can cancel
+      // when the hello deadline fires. A validator that ignores it is still
+      // bounded — the deadline race in handleHello reclaims the slot either way.
+      grantUserId = await this.validatePairingToken(env.payload.token, signal).catch(() => null);
     }
     if (!grantUserId) {
       const record = this.pairingTokens.get(env.payload.token);

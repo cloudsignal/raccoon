@@ -510,31 +510,61 @@ describe('WsHub pairing', () => {
     expect(received).toEqual([]);
   });
 
-  it('outstanding verification work is bounded even as timed-out sockets free their pending slots (#R5-7)', async () => {
+  it('CONCURRENT outstanding verification work is bounded by the cap (#R5-7)', async () => {
     // The pending-connection cap bounds SOCKETS, but each hello can park an
-    // unresolvable external verification. Previously the hello timeout freed
-    // the socket's pending slot while its verification stayed outstanding —
-    // so an attacker could accumulate unbounded in-flight verification work
-    // one timeout-cycle at a time. The cap must bound outstanding
-    // verification tasks until they actually settle.
+    // in-flight external verification. Previously the socket-level timeout
+    // freed the pending slot while its verification stayed outstanding, so an
+    // attacker could accumulate unbounded CONCURRENT verification work. Here
+    // a generous helloTimeoutMs keeps both hellos well within their deadline,
+    // so this isolates the concurrency bound from deadline reclamation
+    // (#R6-11, next test): while the first verification is genuinely in
+    // flight, a second connection is refused.
     let validatorCalls = 0;
     hub = new WsHub({
       instance: 'test',
       maxPendingConnections: 1,
-      helloTimeoutMs: 50,
+      helloTimeoutMs: 2000,
       validatePairingToken: () => { validatorCalls += 1; return new Promise<string | null>(() => { /* never settles */ }); },
     });
     const { port } = await hub.start();
 
     const first = await connect(port);
     first.send(pairRequest('t1'));
-    expect(await nextClose(first)).toBe(4408); // times out, socket slot freed…
+    await new Promise((r) => setTimeout(r, 20)); // first's verification is now in flight, holding the slot
 
-    // …but its verification is STILL outstanding. A new connection must be
-    // refused (4503) rather than allowed to start a second one.
     const second = await connect(port);
     second.send(pairRequest('t2'));
-    expect(await nextClose(second)).toBe(4503);
+    expect(await nextClose(second)).toBe(4503); // refused: the one slot is occupied
     expect(validatorCalls).toBe(1); // the hung validator was never re-entered
+  });
+
+  it('a hung validator does not consume its slot forever — the deadline reclaims it (#R6-11)', async () => {
+    // The R5-7 counter alone would let a never-settling validator hold its
+    // slot permanently (handleHello never returns → the decrementing
+    // .finally() never runs). An internal deadline must abandon the hung
+    // verification so the slot is reclaimed and later connections succeed.
+    let firstToken = true;
+    hub = new WsHub({
+      instance: 'test',
+      maxPendingConnections: 1,
+      helloTimeoutMs: 60,
+      validatePairingToken: async (token) => {
+        if (firstToken) { firstToken = false; return new Promise<string | null>(() => {}); } // hangs forever
+        return token === 'good' ? 'u2' : null;
+      },
+    });
+    const { port } = await hub.start();
+
+    const stuck = await connect(port);
+    stuck.send(pairRequest('t1'));
+    expect(await nextClose(stuck)).toBe(4408); // deadline fires: socket closed…
+
+    // …AND the slot is reclaimed — a fresh connection is admitted and granted,
+    // not rejected 4503 by a permanently-held slot.
+    await new Promise((r) => setTimeout(r, 20));
+    const ok = await connect(port);
+    ok.send(pairRequest('good'));
+    const grant = await nextMessage(ok);
+    expect(grant.kind).toBe('pair.grant');
   });
 });
