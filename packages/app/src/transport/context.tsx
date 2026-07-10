@@ -129,6 +129,14 @@ export function TransportProvider(props: TransportProviderProps) {
   // are not missed.
   const drainLockRef = useRef(false);
   const drainPendingRef = useRef(false);
+  // R4-4: a stable, unique id for THIS tab/window instance, lazily generated
+  // once. Stamped onto every row this tab claims via markSending() so
+  // demoteSending() can tell "a row I myself abandoned" (always safe to
+  // requeue immediately) apart from "a row a DIFFERENT, possibly still-alive
+  // tab is actively sending" (only safe to requeue once its lease expires) —
+  // see outbox.ts's demoteSending() for the full reasoning.
+  const tabIdRef = useRef<string | undefined>(undefined);
+  if (!tabIdRef.current) tabIdRef.current = crypto.randomUUID();
   // R4-3: bumped SYNCHRONOUSLY (before any await) on every identity
   // transition — wipe/unpair AND successful (re-)pairing — see unpair(),
   // the auth-error handler, loadSession's success path, and
@@ -208,7 +216,16 @@ export function TransportProvider(props: TransportProviderProps) {
     // re-pair can complete in the same window). Without this check, a stale
     // entry was sent through whatever transport happened to be active,
     // reaching the wrong user's session with the wrong user's content.
-    const claimed = await outbox.markSending(entry.id);
+    //
+    // R4-4: markSending() is a pending-only compare-and-set. Two tabs can
+    // both see the same row as 'pending' in their own listPending()
+    // snapshot; only the FIRST to actually commit its markSending()
+    // transaction wins the claim (IndexedDB serializes the two 'readwrite'
+    // transactions, and the second sees status already 'sending', not
+    // 'pending' — so it fails the CAS and gets false back). Without this,
+    // both tabs unconditionally flipped the row to 'sending' and both
+    // transmitted it.
+    const claimed = await outbox.markSending(entry.id, tabIdRef.current!);
     if (!claimed) return;
     try {
       await transport.send(entry.env);
@@ -322,7 +339,7 @@ export function TransportProvider(props: TransportProviderProps) {
         if (active) channels.add(active);
         for (const c of channels) requestHistory(c);
       }
-      if (s === 'closed') void outbox.demoteSending();
+      if (s === 'closed') void outbox.demoteSending(tabIdRef.current!);
     });
     const isOverride = !!props.transportOverride;
     const u3 = transport.onAuthError(() => {
@@ -407,7 +424,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // BEFORE wireTransport so the first drain() this boot (triggered by the
       // 'open' status event) is guaranteed to see the requeued rows as 'pending',
       // not race against them still being 'sending'.
-      void outbox.demoteSending().finally(() => {
+      void outbox.demoteSending(tabIdRef.current!).finally(() => {
         wireTransport(override);
         setPhase('ready');
         void override.connect().catch(() => { /* reconnect loop handles it */ });
@@ -438,7 +455,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // R3-8: see the matching comment in the transportOverride branch above —
       // must complete before wireTransport so the boot drain() can't miss rows
       // stranded in 'sending' by a crash/reload in the previous session.
-      await outbox.demoteSending();
+      await outbox.demoteSending(tabIdRef.current!);
       const transport = makeTransport({ url: loaded.url, session: loaded.sessionToken, device: 'raccoon-app' });
       wireTransport(transport);
       setPhase('ready');

@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createEnvelope } from '@raccoon/protocol';
 import { closeDbForTests } from './idb.js';
 import * as outbox from './outbox.js';
@@ -9,6 +9,7 @@ afterEach(async () => { await closeDbForTests(); });
 const msg = (text: string) => createEnvelope('msg', {
   from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text },
 });
+const TAB = 'test-tab-1';
 
 describe('outbox', () => {
   it('enqueues pending entries and lists them oldest-first', async () => {
@@ -40,11 +41,11 @@ describe('outbox', () => {
   it('markSending → markSendFailed cycles back to pending until MAX_ATTEMPTS', async () => {
     const e = await outbox.enqueue(msg('x'));
     for (let i = 1; i < outbox.MAX_ATTEMPTS; i += 1) {
-      await outbox.markSending(e.id);
+      await outbox.markSending(e.id, TAB);
       await outbox.markSendFailed(e.id, 'offline');
       expect((await outbox.listPending())).toHaveLength(1);
     }
-    await outbox.markSending(e.id);
+    await outbox.markSending(e.id, TAB);
     await outbox.markSendFailed(e.id, 'offline');
     expect(await outbox.listPending()).toHaveLength(0);
     const all = await outbox.listForChannel('coordinator');
@@ -54,7 +55,7 @@ describe('outbox', () => {
 
   it('markFailed hard-fails; retry resets to pending', async () => {
     const e = await outbox.enqueue(msg('x'));
-    await outbox.markSending(e.id);
+    await outbox.markSending(e.id, TAB);
     await outbox.markFailed(e.id, 'no ack');
     expect((await outbox.listForChannel('coordinator'))[0]!.status).toBe('failed');
     await outbox.retry(e.id);
@@ -65,9 +66,48 @@ describe('outbox', () => {
 
   it('demoteSending returns in-flight entries to pending', async () => {
     const e = await outbox.enqueue(msg('x'));
-    await outbox.markSending(e.id);
+    await outbox.markSending(e.id, TAB);
     expect(await outbox.listPending()).toHaveLength(0);
-    await outbox.demoteSending();
+    await outbox.demoteSending(TAB);
+    expect(await outbox.listPending()).toHaveLength(1);
+  });
+
+  it('markSending is a pending-only compare-and-set: only the first of two racing tabs claims the row (#R4-4)', async () => {
+    const e = await outbox.enqueue(msg('x'));
+    // Two tabs both saw the row as 'pending' in their own listPending()
+    // snapshot and both call markSending() for it.
+    const claimedByTabA = await outbox.markSending(e.id, 'tab-a');
+    const claimedByTabB = await outbox.markSending(e.id, 'tab-b');
+    expect(claimedByTabA).toBe(true);
+    expect(claimedByTabB).toBe(false); // already 'sending' by the time tab-b's CAS runs
+    const entry = (await outbox.listForChannel('coordinator'))[0]!;
+    expect(entry.status).toBe('sending');
+    expect(entry.attempts).toBe(1); // NOT incremented twice
+  });
+
+  it('demoteSending does not reclaim another tab\'s row whose lease has not expired (#R4-4)', async () => {
+    const e = await outbox.enqueue(msg('x'));
+    await outbox.markSending(e.id, 'tab-a'); // fresh, non-expired lease
+    await outbox.demoteSending('tab-b'); // a DIFFERENT tab's boot-time (or close-triggered) call
+    // Still 'sending', owned by tab-a — tab-b must not have touched it.
+    expect(await outbox.listPending()).toEqual([]);
+    const entry = (await outbox.listForChannel('coordinator'))[0]!;
+    expect(entry.status).toBe('sending');
+  });
+
+  it('demoteSending reclaims another tab\'s row once its lease has expired (crashed-tab recovery)', async () => {
+    const e = await outbox.enqueue(msg('x'));
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - outbox.SEND_LEASE_MS - 1000);
+    await outbox.markSending(e.id, 'crashed-tab'); // backdated: already-expired lease
+    dateNowSpy.mockRestore();
+    await outbox.demoteSending('tab-b');
+    expect(await outbox.listPending()).toHaveLength(1);
+  });
+
+  it('demoteSending always reclaims its OWN tab\'s row, lease or no lease (same-tab close)', async () => {
+    const e = await outbox.enqueue(msg('x'));
+    await outbox.markSending(e.id, 'tab-a'); // fresh lease, owned by tab-a
+    await outbox.demoteSending('tab-a'); // tab-a's own transport closed — must reclaim immediately
     expect(await outbox.listPending()).toHaveLength(1);
   });
 
@@ -75,12 +115,12 @@ describe('outbox', () => {
     // Seed many 'sending' entries so demoteSending()'s per-entry put() loop
     // spans several IDB transactions, giving a real interleaving window.
     const entries = await Promise.all(Array.from({ length: 20 }, (_, i) => outbox.enqueue(msg(`m${i}`))));
-    for (const e of entries) await outbox.markSending(e.id);
+    for (const e of entries) await outbox.markSending(e.id, TAB);
 
     // Fire demoteSending() WITHOUT awaiting (mirrors the transport's 'closed'
-    // status callback: void outbox.demoteSending()), then immediately clear —
+    // status callback: void outbox.demoteSending(tabId)), then immediately clear —
     // mirrors wipeAndReset() racing that callback.
-    const demote = outbox.demoteSending();
+    const demote = outbox.demoteSending(TAB);
     await outbox.clearAll();
     await demote;
 
@@ -99,7 +139,7 @@ describe('outbox', () => {
     // mutator the same way: fire it unawaited, then immediately clearAll(),
     // and confirm no row survives regardless of interleaving.
     const mutators: Array<(id: string) => Promise<unknown>> = [
-      (id) => outbox.markSending(id),
+      (id) => outbox.markSending(id, TAB),
       (id) => outbox.markSendFailed(id, 'offline'),
       (id) => outbox.markFailed(id, 'no ack'),
       (id) => outbox.retry(id),
@@ -142,7 +182,7 @@ describe('outbox', () => {
     } as typeof IDBDatabase.prototype.transaction;
     try {
       count = 0;
-      await outbox.markSending(seeded.id);
+      await outbox.markSending(seeded.id, TAB);
       expect(count).toBe(1);
 
       count = 0;

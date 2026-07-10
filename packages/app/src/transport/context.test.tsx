@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
 import { act, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createEnvelope } from '@raccoon/protocol';
 import { closeDbForTests, kvGet, kvSet } from '../lib/idb.js';
 import { loadSession, saveSession } from '../lib/session.js';
@@ -106,7 +106,14 @@ describe('TransportProvider', () => {
     const stranded = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'stranded' },
     }));
-    await outbox.markSending(stranded.id);
+    // Owned by a DIFFERENT (now-crashed) tab — this boot's fresh tabIdRef
+    // cannot match it. #R4-4: demoteSending() only reclaims a row it doesn't
+    // own once its lease has expired, so simulate real staleness (rather
+    // than a still-possibly-alive claim) by backdating Date.now() for just
+    // this one markSending() call, landing leaseExpiresAt safely in the past.
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - outbox.SEND_LEASE_MS - 1000);
+    await outbox.markSending(stranded.id, 'crashed-prior-tab');
+    dateNowSpy.mockRestore();
     expect(await outbox.listPending()).toEqual([]); // excluded from listPending while 'sending'
 
     const transport = new FakeTransport();

@@ -11,9 +11,23 @@ export interface OutboxEntry {
   attempts: number;
   status: OutboxStatus;
   lastError?: string;
+  /** Set while status is 'sending' (#R4-4): which tab (see context.tsx's
+   *  tabIdRef) currently owns this in-flight send, and until when its claim
+   *  is valid. Lets demoteSending() distinguish "stranded by a crashed tab"
+   *  (safe to requeue) from "actively being sent by a still-alive tab"
+   *  (must not be touched) without any cross-tab coordination beyond the
+   *  IndexedDB rows themselves. */
+  ownerId?: string;
+  leaseExpiresAt?: number;
 }
 
 export const MAX_ATTEMPTS = 5;
+// Generous margin over the client's own ACK_TIMEOUT_MS (10s, context.tsx):
+// a legitimately in-flight send resolves (settles or fails) well within
+// this window on its OWNING tab. Only once a claim outlives it does another
+// tab treat the row as abandoned. Exported so tests can advance exactly past
+// it rather than hardcoding a duplicate magic number.
+export const SEND_LEASE_MS = 20_000;
 
 const listeners = new Set<(channel: string) => void>();
 
@@ -88,30 +102,43 @@ export async function listForChannel(channel: string): Promise<OutboxEntry[]> {
 }
 
 /** Shared get-then-put: reads the entry, computes the next version via
- *  `update`, and writes it back — all within one transaction. Returns the
- *  updated entry (so callers can inspect its resulting status, e.g.
- *  markSendFailed's terminal-vs-retry distinction, as well as notify() on its
- *  channel), or undefined if there was no entry to update (already cleared,
- *  e.g. by a concurrent wipe). */
-async function mutate(id: string, update: (entry: OutboxEntry) => OutboxEntry): Promise<OutboxEntry | undefined> {
+ *  `update`, and writes it back — all within one transaction. `update` may
+ *  return undefined to abort the write (a precondition wasn't met, e.g.
+ *  markSending's pending-only compare-and-set) without touching the row.
+ *  Returns the updated entry (so callers can inspect its resulting status,
+ *  e.g. markSendFailed's terminal-vs-retry distinction, as well as notify()
+ *  on its channel), or undefined if there was no entry to update (already
+ *  cleared, e.g. by a concurrent wipe) or the precondition failed. */
+async function mutate(
+  id: string,
+  update: (entry: OutboxEntry) => OutboxEntry | undefined,
+): Promise<OutboxEntry | undefined> {
   return withTransaction('outbox', 'readwrite', async (s) => {
     const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
     const next = update(entry);
+    if (!next) return undefined;
     await promisifyRequest(s.put(next));
     return next;
   });
 }
 
-/** Returns true if a row was actually claimed (existed and was updated to
- *  'sending'), false if there was no row to claim (already cleared, e.g. by
- *  a concurrent wipe). Callers MUST check this before sending: a stale
- *  drain() snapshot entry whose row has since been cleared must never be
- *  sent through whatever transport/session happens to be active by the time
- *  the send is attempted (#R4-3) — the row being gone is the signal that it
- *  no longer belongs to the current identity. */
-export async function markSending(id: string): Promise<boolean> {
-  const entry = await mutate(id, (entry) => ({ ...entry, attempts: entry.attempts + 1, status: 'sending' }));
+/**
+ * Pending-only compare-and-set: claims the row for `ownerId` (this tab) ONLY
+ * if its status is currently 'pending'. Returns true if claimed, false if
+ * there was no row to claim (already cleared, e.g. by a concurrent wipe —
+ * see #R4-3) OR it was already claimed by someone else (already 'sending' —
+ * #R4-4: two tabs racing listPending() could otherwise BOTH unconditionally
+ * flip the same row to 'sending' and both transmit it, observed as attempts
+ * incrementing to 2 for one logical send). Callers MUST check this before
+ * sending: only a true claim may proceed to transport.send().
+ */
+export async function markSending(id: string, ownerId: string): Promise<boolean> {
+  const entry = await mutate(id, (entry) => (
+    entry.status === 'pending'
+      ? { ...entry, attempts: entry.attempts + 1, status: 'sending', ownerId, leaseExpiresAt: Date.now() + SEND_LEASE_MS }
+      : undefined
+  ));
   if (entry) notify(entry.channel);
   return entry !== undefined;
 }
@@ -151,19 +178,37 @@ export async function settle(id: string): Promise<void> {
   if (channel) notify(channel);
 }
 
-/** Fires one subscriber notification per demoted entry — subscribers that
- *  trigger drains must tolerate bursts (the provider drains on status
- *  transitions, not per notification). All demotions happen within ONE
- *  transaction (see the module comment above). */
-export async function demoteSending(): Promise<void> {
+/**
+ * Requeues 'sending' rows back to 'pending' — but only ones this tab is safe
+ * to touch (#R4-4): rows THIS tab (`myTabId`) owns (its own transport just
+ * closed, or it's booting fresh and abandoning whatever it thought it owned
+ * pre-reload — never true for a fresh page load in practice, but harmless)
+ * are always requeued immediately, since this tab itself knows it cannot
+ * finish them. A row owned by a DIFFERENT tab is only requeued once its
+ * lease has expired — that tab has had ample time (SEND_LEASE_MS, well
+ * past the client's own ACK_TIMEOUT_MS) to settle or fail it on its own, so
+ * a still-'sending' row past that point is stranded (crashed tab), not
+ * merely slow. Without the lease check, boot-time demoteSending() (R3-8)
+ * would requeue — and a subsequent drain() would then RE-SEND — a row a
+ * different, still-alive tab is actively transmitting.
+ *
+ * Fires one subscriber notification per demoted entry — subscribers that
+ * trigger drains must tolerate bursts (the provider drains on status
+ * transitions, not per notification). All demotions happen within ONE
+ * transaction (see the module comment above).
+ */
+export async function demoteSending(myTabId: string): Promise<void> {
   const demoted = await withTransaction('outbox', 'readwrite', async (s) => {
     const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
     const touched: string[] = [];
+    const now = Date.now();
     for (const entry of all) {
-      if (entry.status === 'sending') {
-        await promisifyRequest(s.put({ ...entry, status: 'pending' }));
-        touched.push(entry.channel);
-      }
+      if (entry.status !== 'sending') continue;
+      const ownedByMe = entry.ownerId === myTabId;
+      const leaseExpired = entry.leaseExpiresAt === undefined || entry.leaseExpiresAt <= now;
+      if (!ownedByMe && !leaseExpired) continue; // another tab is actively (and still validly) sending this
+      await promisifyRequest(s.put({ ...entry, status: 'pending', ownerId: undefined, leaseExpiresAt: undefined }));
+      touched.push(entry.channel);
     }
     return touched;
   });
