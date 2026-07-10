@@ -130,6 +130,38 @@ describe('TransportProvider', () => {
     expect(await outbox.listPending()).toEqual([]); // moved to 'sending' again by the successful attempt
   });
 
+  it('does not wire/connect a transport if the provider unmounts during boot recovery (#R4-10)', async () => {
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+
+    // Gate the boot's demoteSending() await so the test can unmount the
+    // provider while the boot effect's async continuation is still
+    // in flight, mid-way through the loadSession().then(...) chain.
+    let releaseDemote!: () => void;
+    const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
+    const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; });
+
+    const transport = new FakeTransport();
+    const { unmount } = render(
+      <TransportProvider makeTransport={() => transport}>
+        <Probe />
+      </TransportProvider>,
+    );
+
+    await waitFor(() => expect(demoteSpy).toHaveBeenCalled());
+
+    unmount();
+    releaseDemote();
+    // Let the boot continuation resume and run to completion (if unguarded).
+    await new Promise((r) => setTimeout(r, 20));
+
+    // A provider that unmounted mid-boot must never wire or connect a
+    // transport afterward — that transport would live forever with no
+    // owner able to close it.
+    expect(transport.connected).toBe(false);
+
+    demoteSpy.mockRestore();
+  });
+
   it('re-requests history for loaded channels on reconnect so messages missed while offline appear (#10)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
@@ -396,6 +428,33 @@ describe('TransportProvider', () => {
       );
       await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
       expect(api.session).toEqual(hostSession);
+    });
+
+    it('does not wire/connect the override transport if the provider unmounts during boot recovery (#R4-10)', async () => {
+      let releaseDemote!: () => void;
+      const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
+      const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; });
+
+      const transport = new FakeTransport();
+      const { unmount } = render(
+        <TransportProvider transportOverride={transport} sessionOverride={hostSession}>
+          <Probe />
+        </TransportProvider>,
+      );
+
+      await waitFor(() => expect(demoteSpy).toHaveBeenCalled());
+
+      unmount();
+      releaseDemote();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // A provider that unmounted mid-boot must never wire or connect the
+      // host-supplied transport afterward — that would leave subscriptions
+      // bound to a dead component instance and connect a transport nobody
+      // asked for.
+      expect(transport.connected).toBe(false);
+
+      demoteSpy.mockRestore();
     });
 
     it('channel list reflects sessionOverride.channels', async () => {

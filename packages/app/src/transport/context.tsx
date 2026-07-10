@@ -418,6 +418,7 @@ export function TransportProvider(props: TransportProviderProps) {
         setSession(props.sessionOverride);
       }
       const override = props.transportOverride;
+      let overrideCancelled = false;
       // R3-8: requeue any 'sending' rows stranded by a crash/reload mid-send in a
       // prior session — demoteSending() otherwise only runs off the transport's
       // 'closed' event, which a killed tab never gets to fire. Must complete
@@ -425,11 +426,18 @@ export function TransportProvider(props: TransportProviderProps) {
       // 'open' status event) is guaranteed to see the requeued rows as 'pending',
       // not race against them still being 'sending'.
       void outbox.demoteSending(tabIdRef.current!).finally(() => {
+        // R4-10: if the provider unmounted while demoteSending() was in
+        // flight, the cleanup below already ran and will never run again —
+        // wiring now would leave zombie subscriptions bound to this dead
+        // component instance, and connect() a host-owned transport nobody
+        // asked for.
+        if (overrideCancelled) return;
         wireTransport(override);
         setPhase('ready');
         void override.connect().catch(() => { /* reconnect loop handles it */ });
       });
       return () => {
+        overrideCancelled = true;
         for (const unsub of unsubsRef.current) unsub();
         unsubsRef.current = [];
         for (const timer of ackTimers.current.values()) clearTimeout(timer);
@@ -456,6 +464,13 @@ export function TransportProvider(props: TransportProviderProps) {
       // must complete before wireTransport so the boot drain() can't miss rows
       // stranded in 'sending' by a crash/reload in the previous session.
       await outbox.demoteSending(tabIdRef.current!);
+      // R4-10: re-check after the await above — if the provider unmounted
+      // while demoteSending() was in flight, the cleanup below already ran
+      // (transportRef was still null/stale at that point, so it had nothing
+      // to close) and will never run again. Without this check, wiring and
+      // connecting a transport here would leak it forever: nothing would
+      // ever call close() on it.
+      if (cancelled) return;
       const transport = makeTransport({ url: loaded.url, session: loaded.sessionToken, device: 'raccoon-app' });
       wireTransport(transport);
       setPhase('ready');
