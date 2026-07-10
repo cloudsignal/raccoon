@@ -29,6 +29,15 @@ const MIME: Record<string, string> = {
 
 const NO_STORE = new Set(['/index.html', '/version.json', '/service-worker.js', '/manifest.webmanifest']);
 
+// R3-10: bound the resources an unauthenticated connection can hold before it
+// ever sends a valid hello. Without these, an attacker can open unlimited
+// sockets and never complete the handshake (exhausting file descriptors /
+// memory), or send an oversized frame (unbounded per-message memory — the
+// `ws` library's own default maxPayload is 100 MiB).
+const DEFAULT_HELLO_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_PENDING_CONNECTIONS = 200;
+const DEFAULT_MAX_PAYLOAD_BYTES = 262_144; // 256 KiB — generous for any real hello/envelope frame
+
 export interface WsHubOptions {
   instance: string;
   host?: string;
@@ -37,6 +46,15 @@ export interface WsHubOptions {
   channels?: string[];
   pairingTtlMs?: number;
   pairingAttemptsPerMinute?: number;
+  /** Max ms a connection may stay open without sending a valid first message
+   *  before it's closed. Default 10_000. */
+  helloTimeoutMs?: number;
+  /** Max concurrent connections that have not yet completed hello. Once
+   *  reached, new connections are closed immediately. Default 200. */
+  maxPendingConnections?: number;
+  /** Max bytes for a single WebSocket message (the `ws` library's own
+   *  default is 100 MiB). Default 262_144 (256 KiB). */
+  maxPayloadBytes?: number;
   /** Serve a static SPA build (the Raccoon app dist/) over plain HTTP on the same port. */
   staticDir?: string;
   /** Advertised in pair.grant so clients can register web-push subscriptions. */
@@ -55,6 +73,9 @@ export class WsHub {
   private readonly store: CredentialStore;
   private readonly pairingTtlMs: number;
   private readonly maxAttempts: number;
+  private readonly helloTimeoutMs: number;
+  private readonly maxPendingConnections: number;
+  private readonly maxPayloadBytes: number;
   private readonly staticDir: string | null;
   private readonly vapidPublicKey: string | null;
   private readonly validatePairingToken: ((token: string) => Promise<string | null>) | null;
@@ -64,6 +85,11 @@ export class WsHub {
   private pairingTokens = new Map<string, PairingToken>();
   private attempts = new Map<string, { count: number; resetAt: number }>();
   private byUser = new Map<string, Set<WebSocket>>();
+  // Connections that have not yet sent a valid first message (hello). Tracked
+  // separately from byUser so the pending-connection cap (R3-10) only bounds
+  // pre-auth resource usage, never a legitimately high count of authenticated
+  // sockets.
+  private pendingConnections = new Set<WebSocket>();
   // Set by revokeUser() (Date.now() at revoke time). handleHello captures its
   // OWN start time BEFORE any await (including the external validatePairingToken
   // call, whose duration we don't control) and, right before granting, checks
@@ -87,6 +113,9 @@ export class WsHub {
     this.store = opts.store ?? new MemoryCredentialStore();
     this.pairingTtlMs = opts.pairingTtlMs ?? 300_000;
     this.maxAttempts = opts.pairingAttemptsPerMinute ?? 10;
+    this.helloTimeoutMs = opts.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
+    this.maxPendingConnections = opts.maxPendingConnections ?? DEFAULT_MAX_PENDING_CONNECTIONS;
+    this.maxPayloadBytes = opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.staticDir = opts.staticDir ?? null;
     this.vapidPublicKey = opts.vapidPublicKey ?? null;
     this.validatePairingToken = opts.validatePairingToken ?? null;
@@ -94,10 +123,37 @@ export class WsHub {
 
   async start(): Promise<{ port: number }> {
     this.server = createServer((req, res) => this.serveHttp(req, res));
-    this.wss = new WebSocketServer({ server: this.server });
+    this.wss = new WebSocketServer({ server: this.server, maxPayload: this.maxPayloadBytes });
     this.wss.on('connection', (ws, req) => {
+      // R3-10: cap concurrent pre-auth connections BEFORE tracking this one,
+      // so an attacker opening unlimited sockets and never sending hello
+      // cannot exhaust server resources — legitimate authenticated sockets
+      // (already moved out of pendingConnections by attach()) are unaffected.
+      if (this.pendingConnections.size >= this.maxPendingConnections) {
+        ws.close(4503, 'server busy');
+        return;
+      }
+      this.pendingConnections.add(ws);
+      // `ws` emits frame-level errors (e.g. a frame exceeding maxPayload) as
+      // an 'error' event on the socket itself; Node's default EventEmitter
+      // behavior for an 'error' event with no listener is to throw, which
+      // crashes the whole process. Attached for the socket's whole lifetime
+      // (not just pre-auth) — the same object is reused by attach().
+      ws.on('error', () => { /* 'close' (e.g. 1009 for oversized frames) already informs the client */ });
       const ip = req.socket.remoteAddress ?? 'unknown';
+      // R3-10: a connection that never sends a first message would otherwise
+      // sit open indefinitely, holding the pending-connection slot forever.
+      const helloTimer = setTimeout(() => {
+        this.pendingConnections.delete(ws);
+        try { ws.close(4408, 'hello timeout'); } catch { /* already closing */ }
+      }, this.helloTimeoutMs);
+      ws.once('close', () => {
+        clearTimeout(helloTimer);
+        this.pendingConnections.delete(ws);
+      });
       ws.once('message', (data) => {
+        clearTimeout(helloTimer);
+        this.pendingConnections.delete(ws);
         // handleHello is async; a bare `void` call discards its promise with
         // no rejection handler. A store failure (verifySession/createSession
         // rejecting, e.g. a DB outage) then becomes an unhandled rejection,
@@ -132,6 +188,7 @@ export class WsHub {
     if (this.wss) for (const ws of this.wss.clients) ws.terminate();
     for (const set of this.byUser.values()) for (const ws of set) ws.terminate();
     this.byUser.clear();
+    this.pendingConnections.clear();
     await new Promise<void>((resolve) => (this.wss ? this.wss.close(() => resolve()) : resolve()));
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
     this.wss = null;

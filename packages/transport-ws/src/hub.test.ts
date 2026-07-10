@@ -311,4 +311,62 @@ describe('WsHub pairing', () => {
     ws.send(pairRequest('wrong'));
     expect(await nextClose(ws)).toBe(4429);
   });
+
+  // ---- R3-10: pre-auth WS exhaustion guards ------------------------------
+
+  it('closes a connection with 4408 if it never sends a first message within helloTimeoutMs', async () => {
+    hub = new WsHub({ instance: 'test', helloTimeoutMs: 30 });
+    const { port } = await hub.start();
+    const ws = await connect(port);
+    expect(await nextClose(ws)).toBe(4408);
+  });
+
+  it('does not time out a connection that sends hello before the deadline', async () => {
+    hub = new WsHub({ instance: 'test', helloTimeoutMs: 200 });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    const grant = await nextMessage(ws);
+    expect(grant.kind).toBe('pair.grant'); // hello was processed, not timed out
+    ws.close();
+  });
+
+  it('rejects a new connection with 4503 once maxPendingConnections is reached, without affecting already-authenticated sockets', async () => {
+    hub = new WsHub({ instance: 'test', maxPendingConnections: 1, helloTimeoutMs: 60_000 });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    // Authenticate a connection FIRST — once granted it is no longer
+    // "pending" and so no longer counts toward the cap.
+    const authed = await connect(port);
+    authed.send(pairRequest(token));
+    await nextMessage(authed); // pair.grant
+
+    // A second connection never sends hello — occupies the single pending slot.
+    const blocked = await connect(port);
+
+    // A third connection is rejected outright: the pending cap is full.
+    const rejected = await connect(port);
+    expect(await nextClose(rejected)).toBe(4503);
+
+    // The already-authenticated connection is unaffected: it can still
+    // exchange messages normally while the cap is saturated.
+    hub.sendToUser('u1', createEnvelope('msg', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator', payload: { text: 'still alive' },
+    }));
+    const msg = await nextMessage(authed);
+    expect(msg.kind).toBe('msg');
+
+    authed.close();
+    blocked.close();
+  });
+
+  it('closes a connection that sends a frame larger than maxPayloadBytes', async () => {
+    hub = new WsHub({ instance: 'test', maxPayloadBytes: 64 });
+    const { port } = await hub.start();
+    const ws = await connect(port);
+    ws.send('x'.repeat(1000));
+    expect(await nextClose(ws)).toBe(1009); // ws library's own "message too big" code
+  });
 });
