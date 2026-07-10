@@ -12,6 +12,7 @@ Status: Plan C complete. Protocol, ws transport, push, and installable PWA.
 
     npm install
     npm test
+    npm run build:app      # required once: example:echo serves the built PWA
     npm run example:echo   # prints a ws:// URL and a pairing token
 
 ## App
