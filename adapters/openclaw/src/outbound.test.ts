@@ -397,4 +397,147 @@ describe('createRaccoonOutbound', () => {
       'raccoon outbound: malformed target "alice"',
     );
   });
+
+  // ---- R3-9: presentationCapabilities + renderPresentation ---------------
+
+  it('declares presentationCapabilities.buttons: true (and does not overclaim charts)', () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    expect(adapter.presentationCapabilities?.supported).toBe(true);
+    expect(adapter.presentationCapabilities?.buttons).toBe(true);
+    expect(adapter.presentationCapabilities?.charts).toBe(false);
+  });
+
+  it('renderPresentation: a buttons block → one approval.request envelope with title, description, and options', async () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const result = await adapter.renderPresentation!({
+      payload: { text: 'Deploy to prod?' },
+      presentation: {
+        title: 'Confirm deploy',
+        blocks: [
+          { type: 'context', text: 'Build #482, main@a1b2c3' },
+          { type: 'buttons', buttons: [{ label: 'Approve' }, { label: 'Reject' }] },
+        ],
+      },
+      ctx: makeCtx('Deploy to prod?', 'user:alice'),
+    });
+    expect(hub.envelopes).toHaveLength(1);
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    if (env.kind === 'approval.request') {
+      expect(env.payload.title).toBe('Confirm deploy');
+      expect(env.payload.description).toBe('Build #482, main@a1b2c3');
+      expect(env.payload.options).toEqual(['Approve', 'Reject']);
+    }
+    expect(result.messageId).toBe(env.id);
+  });
+
+  it('renderPresentation: falls back to payload.text as title when presentation.title is absent', async () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    await adapter.renderPresentation!({
+      payload: { text: 'Pick one:' },
+      presentation: { blocks: [{ type: 'buttons', buttons: [{ label: 'Yes' }, { label: 'No' }] }] },
+      ctx: makeCtx('Pick one:', 'user:alice'),
+    });
+    const env = hub.envelopes[0]!;
+    if (env.kind === 'approval.request') expect(env.payload.title).toBe('Pick one:');
+  });
+
+  it('renderPresentation: resolves a callback action value (never reinterpreted as a command) via the approval-value store', async () => {
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator',
+      approvalValues: { remember, resolve: (_refId: string, label: string) => label },
+    });
+    await adapter.renderPresentation!({
+      payload: { text: 'Choose:' },
+      presentation: {
+        blocks: [{
+          type: 'buttons',
+          buttons: [
+            { label: 'Approve', action: { type: 'callback', value: 'cb:approve-task-42' } },
+            { label: 'Legacy', value: 'legacy:value' },
+            { label: 'Bare' },
+          ],
+        }],
+      },
+      ctx: makeCtx('Choose:', 'user:alice'),
+    });
+    const env = hub.envelopes[0]!;
+    expect(remember).toHaveBeenCalledTimes(1);
+    const [refIdArg, labelToValue] = remember.mock.calls[0]!;
+    expect(refIdArg).toBe(env.kind === 'approval.request' ? env.payload.refId : undefined);
+    expect(labelToValue.get('Approve')).toBe('cb:approve-task-42');
+    expect(labelToValue.get('Legacy')).toBe('legacy:value');
+    expect(labelToValue.get('Bare')).toBe('Bare');
+  });
+
+  it('renderPresentation: a select block (no buttons) renders as an approval.request too, not a text fallback', async () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const result = await adapter.renderPresentation!({
+      payload: { text: 'Pick a region:' },
+      presentation: {
+        blocks: [{
+          type: 'select',
+          options: [{ label: 'us-east', value: 'region:us-east' }, { label: 'eu-west' }],
+        }],
+      },
+      ctx: makeCtx('Pick a region:', 'user:alice'),
+    });
+    expect(hub.envelopes).toHaveLength(1);
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    if (env.kind === 'approval.request') expect(env.payload.options).toEqual(['us-east', 'eu-west']);
+    expect(result.messageId).toBe(env.id);
+  });
+
+  it('renderPresentation: no buttons/select → renders text/context blocks as plain msg text', async () => {
+    mockChunk.mockReturnValueOnce(['Line one.\n\nLine two.']);
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const result = await adapter.renderPresentation!({
+      payload: { text: 'fallback (unused)' },
+      presentation: {
+        blocks: [
+          { type: 'text', text: 'Line one.' },
+          { type: 'divider' },
+          { type: 'context', text: 'Line two.' },
+        ],
+      },
+      ctx: makeCtx('fallback (unused)', 'user:alice'),
+    });
+    expect(hub.envelopes).toHaveLength(1);
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('msg');
+    if (env.kind === 'msg') expect(env.payload.text).toBe('Line one.\n\nLine two.');
+    expect(result.messageId).toBe(env.id);
+  });
+
+  it('renderPresentation: an empty presentation (no blocks with content) falls back to payload.text', async () => {
+    mockChunk.mockReturnValueOnce(['plain fallback text']);
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    await adapter.renderPresentation!({
+      payload: { text: 'plain fallback text' },
+      presentation: { blocks: [] },
+      ctx: makeCtx('plain fallback text', 'user:alice'),
+    });
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('msg');
+    if (env.kind === 'msg') expect(env.payload.text).toBe('plain fallback text');
+  });
+
+  it('sendPayload with payload.presentation (no interactive) also renders buttons, not silently dropping them', async () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const ctx = {
+      ...makeCtx('Confirm?', 'user:alice'),
+      payload: {
+        text: 'Confirm?',
+        presentation: { blocks: [{ type: 'buttons', buttons: [{ label: 'Yes' }, { label: 'No' }] }] },
+      },
+    };
+    const result = await adapter.sendPayload!(ctx);
+    expect(hub.envelopes).toHaveLength(1);
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    if (env.kind === 'approval.request') expect(env.payload.options).toEqual(['Yes', 'No']);
+    expect(result.messageId).toBe(env.id);
+  });
 });

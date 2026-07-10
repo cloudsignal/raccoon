@@ -190,22 +190,88 @@ declare module 'openclaw/plugin-sdk/channel-core' {
   // Mirrored 1:1 for the subset Raccoon needs to read in the outbound adapter.
   // ---------------------------------------------------------------------------
 
+  // MessagePresentationAction (message-presentation docs, confirmed 2026-07-10
+  // via docs.openclaw.ai/plugins/message-presentation). 'command' executes a
+  // native slash command; 'callback' carries opaque plugin data. Per the spec:
+  // "Channel plugins must not reinterpret callback data as slash commands."
+  export type MessagePresentationAction =
+    | { type: 'command'; command: string }
+    | { type: 'callback'; value: string };
+
   // InteractiveReplyButton (payload-BHJeg3MX.d.ts, line 53 — alias for MessagePresentationButton)
   // We declare the minimal subset we read: label (required), value (optional).
   export interface InteractiveReplyButton {
     label: string;
+    action?: MessagePresentationAction;
+    /** Legacy callback value. Prefer action for new controls. */
     value?: string;
     style?: string;
     disabled?: boolean;
     priority?: number;
     reusable?: boolean;
     url?: string;
+    webApp?: { url: string };
   }
+  // The real SDK aliases these 1:1 (see comment above each) — reuse the same
+  // declarations under their modern names for the renderPresentation surface.
+  export type MessagePresentationButton = InteractiveReplyButton;
 
   // InteractiveReplyOption (payload-BHJeg3MX.d.ts, line 57 — alias for MessagePresentationOption)
   export interface InteractiveReplyOption {
     label: string;
     value?: string;
+  }
+  export type MessagePresentationOption = InteractiveReplyOption;
+
+  // MessagePresentationBlock / MessagePresentation (confirmed 2026-07-10 via
+  // docs.openclaw.ai/plugins/message-presentation). Chart variants are
+  // declared for completeness but Raccoon's presentationCapabilities.charts
+  // is false — renderPresentation never needs to render them richly.
+  export type MessagePresentationBlock =
+    | { type: 'text'; text: string }
+    | { type: 'context'; text: string }
+    | { type: 'divider' }
+    | { type: 'buttons'; buttons: MessagePresentationButton[] }
+    | { type: 'select'; placeholder?: string; options: MessagePresentationOption[] }
+    | { type: 'chart'; chartType: 'pie'; title: string; segments: Array<{ label: string; value: number }> }
+    | {
+        type: 'chart'; chartType: 'bar' | 'area' | 'line'; title: string;
+        categories: string[]; series: Array<{ name: string; values: number[] }>;
+        xLabel?: string; yLabel?: string;
+      };
+
+  export interface MessagePresentation {
+    title?: string;
+    tone?: 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+    blocks: MessagePresentationBlock[];
+  }
+
+  // PresentationCapabilities (confirmed 2026-07-10 via
+  // docs.openclaw.ai/plugins/message-presentation). `limits` is shown in the
+  // SDK's own example but not confirmed required, and we have no real numeric
+  // constraints to report for Raccoon (protocol.ts's approval.request payload
+  // has no length/count caps beyond non-empty strings) — declared optional so
+  // omitting it doesn't overclaim precision we can't verify.
+  export interface PresentationCapabilities {
+    supported: boolean;
+    buttons?: boolean;
+    selects?: boolean;
+    context?: boolean;
+    divider?: boolean;
+    charts?: boolean;
+    limits?: {
+      actions?: {
+        maxActions?: number;
+        maxActionsPerRow?: number;
+        maxRows?: number;
+        maxLabelLength?: number;
+        maxValueBytes?: number;
+        supportsStyles?: boolean;
+        supportsDisabled?: boolean;
+      };
+      selects?: { maxOptions?: number; maxLabelLength?: number; maxValueBytes?: number };
+      text?: { maxLength?: number; encoding?: string; markdownDialect?: string };
+    };
   }
 
   // InteractiveReplyTextBlock (payload-BHJeg3MX.d.ts, line 62)
@@ -327,6 +393,26 @@ declare module 'openclaw/plugin-sdk/channel-core' {
      *   chunker?: ((text: string, limit: number, ctx?: ChannelOutboundChunkContext) => string[]) | null
      */
     chunker?: ((text: string, limit: number, ctx?: ChannelOutboundChunkContext) => string[]) | null;
+    /**
+     * Declares which MessagePresentation block types this adapter can render
+     * natively. Confirmed 2026-07-10 via docs.openclaw.ai/plugins/message-presentation:
+     * "Core owns fallback behavior so producers can stay channel-agnostic" —
+     * i.e. core falls back to conservative text itself when this is absent or
+     * a block type isn't declared; adapters do not implement that fallback.
+     */
+    presentationCapabilities?: PresentationCapabilities;
+    /**
+     * Renders a structured MessagePresentation payload natively. Core calls
+     * this "when the adapter can render the payload" (per presentationCapabilities)
+     * and falls back to text itself otherwise — see presentationCapabilities above.
+     * Return type mirrors sendPayload's: both are alternate outbound-delivery
+     * paths reporting the same delivery result back to core.
+     */
+    renderPresentation?: (args: {
+      payload: ReplyPayload;
+      presentation: MessagePresentation;
+      ctx: ChannelOutboundContext;
+    }) => Promise<OutboundDeliveryResult>;
     [key: string]: unknown;
   }
 

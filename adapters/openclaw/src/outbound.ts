@@ -51,6 +51,10 @@ import type {
   OutboundDeliveryResult,
   InteractiveReply,
   InteractiveReplyButton,
+  MessagePresentation,
+  MessagePresentationButton,
+  MessagePresentationOption,
+  ReplyPayload,
 } from 'openclaw/plugin-sdk/channel-core';
 import { ulid } from 'ulid';
 
@@ -179,6 +183,112 @@ function makeResult(messageId: string, channelName: string): OutboundDeliveryRes
 }
 
 // ---------------------------------------------------------------------------
+// MessagePresentation helpers (R3-9 — real renderPresentation adoption)
+// ---------------------------------------------------------------------------
+
+/** First 'buttons' block's buttons, or null if none. */
+function findPresentationButtons(presentation: MessagePresentation): MessagePresentationButton[] | null {
+  for (const block of presentation.blocks) {
+    if (block.type === 'buttons' && block.buttons.length > 0) return block.buttons;
+  }
+  return null;
+}
+
+/** First 'select' block's options, or null if none. Raccoon renders a select
+ *  block the same way as a buttons block (a row of choice buttons) — its UI
+ *  has no separate dropdown control, so this is a faithful native render,
+ *  not a degraded fallback. */
+function findPresentationSelect(presentation: MessagePresentation): MessagePresentationOption[] | null {
+  for (const block of presentation.blocks) {
+    if (block.type === 'select' && block.options.length > 0) return block.options;
+  }
+  return null;
+}
+
+/**
+ * Resolve a button's underlying value: prefer the modern `action` field
+ * ('callback' carries opaque plugin data; 'command' names a native slash
+ * command Raccoon has no dispatcher for, so its command string is passed
+ * through as the resolved value for whatever consumes the approval response
+ * downstream), falling back to the legacy `value` field, then the label.
+ * Per the spec, a 'callback' action's value must never be reinterpreted as a
+ * slash command — this function only ever returns it as an opaque string.
+ */
+function resolvePresentationButtonValue(b: MessagePresentationButton): string {
+  if (b.action?.type === 'callback') return b.action.value;
+  if (b.action?.type === 'command') return b.action.command;
+  return b.value ?? b.label;
+}
+
+/** Join the presentation's 'text'/'context' blocks (and blank lines for
+ *  'divider') into a single string. 'chart' blocks are omitted — Raccoon
+ *  declares presentationCapabilities.charts: false and has no faithful plain
+ *  text rendering for chart data. */
+function presentationTextBlocks(presentation: MessagePresentation): string {
+  const lines: string[] = [];
+  for (const block of presentation.blocks) {
+    if (block.type === 'text' || block.type === 'context') lines.push(block.text);
+    else if (block.type === 'divider') lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+/**
+ * Render a MessagePresentation to OAM envelopes: a buttons or select block
+ * becomes one approval.request (select options rendered as choice buttons —
+ * see findPresentationSelect); otherwise the presentation's text/context
+ * blocks are sent as plain msg text, falling back to `fallbackText` if the
+ * presentation carries no renderable text of its own.
+ */
+async function deliverPresentation(
+  hub: OutboundHub,
+  channel: string,
+  approvalValues: ApprovalValueStore | undefined,
+  userId: string,
+  presentation: MessagePresentation,
+  fallbackText: string,
+): Promise<OutboundDeliveryResult> {
+  const buttons = findPresentationButtons(presentation);
+  const selectOptions = buttons === null ? findPresentationSelect(presentation) : null;
+
+  if (buttons !== null || selectOptions !== null) {
+    const choices: Array<{ label: string; value: string }> = buttons !== null
+      ? buttons.map((b) => ({ label: b.label, value: resolvePresentationButtonValue(b) }))
+      : selectOptions!.map((o) => ({ label: o.label, value: o.value ?? o.label }));
+
+    const refId = ulid();
+    const title = presentation.title?.trim()
+      || (fallbackText.trim().length > 0 ? fallbackText.trim() : 'Approval required');
+    const description = presentationTextBlocks(presentation);
+    const env = createEnvelope('approval.request', {
+      from: agentAddress(channel),
+      to: userAddress(userId),
+      channel,
+      payload: { refId, title, description, options: choices.map((c) => c.label) },
+    });
+    approvalValues?.remember(refId, new Map(choices.map((c) => [c.label, c.value])));
+    hub.sendToUser(userId, env);
+    return makeResult(env.id, channel);
+  }
+
+  const rendered = presentationTextBlocks(presentation);
+  const text = rendered.length > 0 ? rendered : fallbackText;
+  const chunks = chunkReplyText(text);
+  const firstId = sendMsgChunks(hub, channel, userId, chunks);
+  return makeResult(firstId, channel);
+}
+
+/** Type guard: does this ReplyPayload.presentation value look like a real
+ *  MessagePresentation (has a `blocks` array)? presentation is typed
+ *  `unknown` on ReplyPayload per the real SDK, so callers must narrow it. */
+function asMessagePresentation(presentation: unknown): MessagePresentation | null {
+  if (presentation && typeof presentation === 'object' && Array.isArray((presentation as MessagePresentation).blocks)) {
+    return presentation as MessagePresentation;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -282,7 +392,18 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
       return makeResult(firstId, channel);
     }
 
-    // No interactive — plain text path (same logic as sendText).
+    // No (mappable) interactive: defensively check payload.presentation too.
+    // Core is expected to route a presentation-bearing payload to
+    // renderPresentation directly (see below), but a caller that reaches
+    // sendPayload with only `presentation` set (no `interactive`) must not
+    // silently lose its buttons/select — render it the same way.
+    const presentation = asMessagePresentation(payload.presentation);
+    if (presentation) {
+      const fallbackText = typeof payload.text === 'string' && payload.text.length > 0 ? payload.text : ctx.text;
+      return deliverPresentation(hub, channel, approvalValues, userId, presentation, fallbackText);
+    }
+
+    // No interactive/presentation — plain text path (same logic as sendText).
     const text =
       typeof payload.text === 'string' && payload.text.length > 0
         ? payload.text
@@ -290,6 +411,26 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
     const chunks = chunkReplyText(text);
     const firstId = sendMsgChunks(hub, channel, userId, chunks);
     return makeResult(firstId, channel);
+  }
+
+  // ------------------------------------------------------------------
+  // renderPresentation — native rendering for the modern MessagePresentation
+  // shape. Declared alongside presentationCapabilities below; core calls this
+  // instead of sendPayload when it has a presentation to deliver and this
+  // adapter declares it can render it (see the shim's doc comment for the
+  // confirmed contract: "core owns fallback behavior").
+  // ------------------------------------------------------------------
+  async function renderPresentation(args: {
+    payload: ReplyPayload;
+    presentation: MessagePresentation;
+    ctx: ChannelOutboundContext;
+  }): Promise<OutboundDeliveryResult> {
+    const userId = parseRaccoonUserId(args.ctx.to);
+    const fallbackText =
+      typeof args.payload.text === 'string' && args.payload.text.length > 0
+        ? args.payload.text
+        : args.ctx.text;
+    return deliverPresentation(hub, channel, approvalValues, userId, args.presentation, fallbackText);
   }
 
   // ------------------------------------------------------------------
@@ -310,5 +451,19 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
     sendText,
     sendPayload,
     chunker,
+    // Declares which MessagePresentation block types Raccoon renders
+    // natively (confirmed shape: docs.openclaw.ai/plugins/message-presentation).
+    // `limits` is intentionally omitted: protocol.ts's approval.request payload
+    // has no numeric length/count caps beyond non-empty strings, so there is
+    // nothing real to report there.
+    presentationCapabilities: {
+      supported: true,
+      buttons: true,
+      selects: true,
+      context: true,
+      divider: true,
+      charts: false,
+    },
+    renderPresentation,
   };
 }
