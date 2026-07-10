@@ -1,0 +1,23 @@
+{
+  "name": "@raccoon/openclaw",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@raccoon/bridge": "0.1.0",
+    "@raccoon/pairing": "0.1.0",
+    "@raccoon/push": "0.1.0",
+    "@raccoon/transport-ws": "0.1.0"
+  },
+  "devDependencies": { "@types/node": "^22.0.0" },
+  "openclaw": {
+    "extensions": ["./src/index.ts"],
+    "channel": {
+      "id": "raccoon",
+      "label": "Raccoon",
+      "blurb": "Self-hosted Raccoon messenger channel (installable PWA + push)."
+    }
+  }
+}

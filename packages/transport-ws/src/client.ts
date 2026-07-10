@@ -1,0 +1,186 @@
+import {
+  createEnvelope,
+  tryParseEnvelope,
+  type AnyEnvelope,
+  type Envelope,
+  type Transport,
+  type TransportStatus,
+} from '@raccoon/protocol';
+
+type WsLike = {
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(type: 'open', listener: (event: Record<string, never>) => void): void;
+  addEventListener(type: 'close', listener: (event: { code: number }) => void): void;
+  addEventListener(type: 'message', listener: (event: { data: unknown }) => void): void;
+  addEventListener(type: 'error', listener: (event: Record<string, never>) => void): void;
+  readyState: number;
+};
+type WsCtor = new (url: string) => WsLike;
+
+const AUTH_CLOSE_CODES = new Set([4401, 4403, 4429]);
+
+export interface WsClientOptions {
+  url: string;
+  session?: string;
+  pairingToken?: string;
+  device?: string;
+  WebSocketImpl?: WsCtor;
+  maxBackoffMs?: number;
+}
+
+export class WsClientTransport implements Transport {
+  private opts: WsClientOptions;
+  private ws: WsLike | null = null;
+  private status: TransportStatus = 'closed';
+  private closedByUser = false;
+  private everOpened = false;
+  private backoffMs = 500;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private envelopeHandlers = new Set<(env: AnyEnvelope) => void>();
+  private statusHandlers = new Set<(s: TransportStatus) => void>();
+  private grantHandlers = new Set<(g: Envelope<'pair.grant'>) => void>();
+  private wsCtor: WsCtor | null = null;
+  private authHandlers = new Set<(code: number) => void>();
+
+  constructor(opts: WsClientOptions) {
+    if (!opts.session && !opts.pairingToken) {
+      throw new Error('WsClientTransport requires session or pairingToken');
+    }
+    this.opts = opts;
+  }
+
+  onEnvelope(h: (env: AnyEnvelope) => void): () => void {
+    this.envelopeHandlers.add(h);
+    return () => this.envelopeHandlers.delete(h);
+  }
+
+  onStatus(h: (s: TransportStatus) => void): () => void {
+    this.statusHandlers.add(h);
+    return () => this.statusHandlers.delete(h);
+  }
+
+  onGrant(h: (g: Envelope<'pair.grant'>) => void): () => void {
+    this.grantHandlers.add(h);
+    return () => this.grantHandlers.delete(h);
+  }
+
+  onAuthError(h: (code: number) => void): () => void {
+    this.authHandlers.add(h);
+    return () => this.authHandlers.delete(h);
+  }
+
+  private async resolveCtor(): Promise<WsCtor> {
+    if (this.opts.WebSocketImpl) return this.opts.WebSocketImpl;
+    const g = (globalThis as { WebSocket?: unknown }).WebSocket;
+    if (g) return g as WsCtor;
+    const mod = await import('ws');
+    return mod.default as unknown as WsCtor;
+  }
+
+  private setStatus(s: TransportStatus): void {
+    this.status = s;
+    for (const h of this.statusHandlers) h(s);
+  }
+
+  async connect(): Promise<void> {
+    this.closedByUser = false;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    await this.dial();
+  }
+
+  private async dial(): Promise<void> {
+    const Ctor = this.wsCtor ?? (this.wsCtor = await this.resolveCtor());
+    return new Promise((resolve, reject) => {
+      const ws = new Ctor(this.opts.url);
+      this.ws = ws;
+      this.setStatus('connecting');
+      let settled = false;
+
+      ws.addEventListener('open', () => {
+        if (this.opts.session) {
+          ws.send(JSON.stringify({ session: this.opts.session }));
+        } else {
+          ws.send(JSON.stringify(createEnvelope('pair.request', {
+            from: 'system', to: 'system', channel: 'pairing',
+            payload: { token: this.opts.pairingToken!, device: this.opts.device ?? 'unknown' },
+          })));
+        }
+      });
+
+      ws.addEventListener('message', (event: { data: unknown }) => {
+        let parsed: unknown;
+        try { parsed = JSON.parse(String(event.data)); } catch { return; }
+
+        if (this.status !== 'open') {
+          // Hello phase: resume-ok or pair.grant establishes the session.
+          if (typeof parsed === 'object' && parsed !== null && 'ok' in parsed) {
+            this.established();
+            if (!settled) { settled = true; resolve(); }
+            return;
+          }
+          const env = tryParseEnvelope(parsed);
+          if (env?.kind === 'pair.grant') {
+            this.opts = { ...this.opts, session: env.payload.sessionToken, pairingToken: undefined };
+            for (const h of this.grantHandlers) h(env);
+            this.established();
+            if (!settled) { settled = true; resolve(); }
+            return;
+          }
+          return;
+        }
+
+        const env = tryParseEnvelope(parsed);
+        if (env) for (const h of this.envelopeHandlers) h(env);
+      });
+
+      ws.addEventListener('close', (event: { code: number }) => {
+        const wasOpen = this.status === 'open';
+        this.setStatus('closed');
+        this.ws = null;
+        if (AUTH_CLOSE_CODES.has(event.code)) {
+          for (const h of this.authHandlers) h(event.code);
+        }
+        if (!settled) {
+          settled = true;
+          reject(new Error(`connection closed during handshake (code ${event.code})`));
+          return;
+        }
+        if (this.closedByUser || AUTH_CLOSE_CODES.has(event.code)) return;
+        if (wasOpen || this.everOpened) this.scheduleReconnect();
+      });
+
+      ws.addEventListener('error', () => { /* close event follows */ });
+    });
+  }
+
+  private established(): void {
+    this.everOpened = true;
+    this.backoffMs = 500;
+    this.setStatus('open');
+  }
+
+  private scheduleReconnect(): void {
+    const delay = this.backoffMs;
+    this.backoffMs = Math.min(this.backoffMs * 2, this.opts.maxBackoffMs ?? 15_000);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closedByUser) return;
+      void this.dial().catch(() => { /* next close schedules again unless auth-coded */ });
+    }, delay);
+  }
+
+  async send(env: AnyEnvelope): Promise<void> {
+    if (!this.ws || this.status !== 'open') throw new Error('transport not open');
+    this.ws.send(JSON.stringify(env));
+  }
+
+  async close(): Promise<void> {
+    this.closedByUser = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.ws?.close(1000, 'client close');
+    this.ws = null;
+    this.setStatus('closed');
+  }
+}

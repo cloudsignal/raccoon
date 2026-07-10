@@ -1,0 +1,36 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink: oklch(0.16 0.01 250);
+  --color-ink-soft: oklch(0.45 0.01 250);
+  --color-ink-faint: oklch(0.55 0.01 250);
+  --color-line: oklch(0.92 0.005 250);
+  --color-surface: oklch(1 0 0);
+  --color-surface-dim: oklch(0.965 0.008 250);
+  --color-primary: oklch(0.62 0.13 175);
+  --color-wallpaper: var(--raccoon-wallpaper, #ede6da);
+  --color-outgoing: var(--raccoon-outgoing, #d9fdd3);
+  --color-outgoing-ink: oklch(0.2 0.05 160);
+  --color-outgoing-meta: oklch(0.45 0.04 165 / 0.9);
+  --color-tick-read: oklch(0.65 0.12 235);
+  --color-online: oklch(0.7 0.16 155);
+  --font-sans: ui-sans-serif, system-ui, sans-serif;
+}
+
+@keyframes typing-bounce {
+  0%, 100% { transform: translateY(-25%); animation-timing-function: cubic-bezier(0.8, 0, 1, 1); }
+  50% { transform: translateY(0); animation-timing-function: cubic-bezier(0, 0, 0.2, 1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+}
+
+html, body, #root { height: 100%; }
+body { margin: 0; }
+
+.wallpaper {
+  background-color: var(--color-wallpaper);
+  background-image: radial-gradient(oklch(0 0 0 / 0.035) 1px, transparent 0);
+  background-size: 18px 18px;
+}

@@ -1,0 +1,10 @@
+{
+  "name": "@raccoon/protocol",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": { "ulid": "^2.4.0", "zod": "^4.0.0" },
+  "devDependencies": { "@types/node": "^22.0.0" }
+}

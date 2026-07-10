@@ -1,0 +1,15 @@
+{
+  "name": "@raccoon/transport-mqtt",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@raccoon/protocol": "0.1.0",
+    "mqtt": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

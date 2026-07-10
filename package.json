@@ -1,0 +1,19 @@
+{
+  "name": "raccoon-monorepo",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "workspaces": ["packages/*", "examples/*", "adapters/*"],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p packages/protocol && tsc --noEmit -p packages/transport-ws && tsc --noEmit -p packages/transport-mqtt && tsc --noEmit -p packages/transport-cloudsignal && tsc --noEmit -p packages/bridge && tsc --noEmit -p packages/pairing && tsc --noEmit -p packages/push && tsc --noEmit -p examples/echo && tsc --noEmit -p adapters/openclaw && tsc --noEmit -p packages/app",
+    "build:app": "npm run build -w @raccoon/app",
+    "demo": "npm run build:app && npm start -w @raccoon/example-echo",
+    "example:echo": "npm start -w @raccoon/example-echo"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}

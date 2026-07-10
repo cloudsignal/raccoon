@@ -1,0 +1,13 @@
+{
+  "name": "@raccoon/bridge",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": { "@raccoon/protocol": "0.1.0" },
+  "devDependencies": {
+    "@raccoon/transport-ws": "0.1.0",
+    "@types/node": "^22.0.0"
+  }
+}
