@@ -407,18 +407,50 @@ describe('createRaccoonOutbound', () => {
     expect(adapter.presentationCapabilities?.charts).toBe(false);
   });
 
-  it('renderPresentation: a buttons block → one approval.request envelope with title, description, and options', async () => {
+  // renderPresentation is a PURE TRANSFORM (R4-1 correction): synchronous,
+  // no hub side effects, returns a ReplyPayload | null for core to route
+  // back through sendPayload (Raccoon's real, and only, delivery path for
+  // presentations — see the "sendPayload with payload.presentation" tests
+  // below for the actual delivery behavior).
+  it('renderPresentation is synchronous, performs no delivery, and returns the payload with presentation attached', () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
-    const result = await adapter.renderPresentation!({
-      payload: { text: 'Deploy to prod?' },
-      presentation: {
-        title: 'Confirm deploy',
-        blocks: [
-          { type: 'context', text: 'Build #482, main@a1b2c3' },
-          { type: 'buttons', buttons: [{ label: 'Approve' }, { label: 'Reject' }] },
-        ],
+    const payload = { text: 'Deploy to prod?' };
+    const presentation = {
+      title: 'Confirm deploy',
+      blocks: [{ type: 'buttons' as const, buttons: [{ label: 'Approve' }, { label: 'Reject' }] }],
+    };
+    const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('Deploy to prod?', 'user:alice') });
+    expect(result).not.toBeInstanceOf(Promise); // synchronous, not async
+    expect(hub.envelopes).toHaveLength(0); // no side effect
+    expect(result).toEqual({ text: 'Deploy to prod?', presentation });
+  });
+
+  it('renderPresentation preserves other ReplyPayload fields when attaching presentation', () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const payload = { text: 'hi', mediaUrls: ['https://example.com/a.png'], replyToId: 'm1' };
+    const presentation = { blocks: [] };
+    const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('hi', 'user:alice') });
+    expect(result).toEqual({ ...payload, presentation });
+  });
+
+  // ---- sendPayload with payload.presentation: the REAL delivery path -----
+  // (whether reached directly, or via core round-tripping renderPresentation's
+  // transformed payload back through sendPayload for a 'gateway'-mode channel).
+
+  it('sendPayload with payload.presentation buttons → one approval.request envelope with title, description, and options', async () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const result = await adapter.sendPayload!({
+      ...makeCtx('Deploy to prod?', 'user:alice'),
+      payload: {
+        text: 'Deploy to prod?',
+        presentation: {
+          title: 'Confirm deploy',
+          blocks: [
+            { type: 'context', text: 'Build #482, main@a1b2c3' },
+            { type: 'buttons', buttons: [{ label: 'Approve' }, { label: 'Reject' }] },
+          ],
+        },
       },
-      ctx: makeCtx('Deploy to prod?', 'user:alice'),
     });
     expect(hub.envelopes).toHaveLength(1);
     const env = hub.envelopes[0]!;
@@ -431,36 +463,37 @@ describe('createRaccoonOutbound', () => {
     expect(result.messageId).toBe(env.id);
   });
 
-  it('renderPresentation: falls back to payload.text as title when presentation.title is absent', async () => {
+  it('sendPayload with payload.presentation buttons falls back to payload.text as title when presentation.title is absent', async () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
-    await adapter.renderPresentation!({
-      payload: { text: 'Pick one:' },
-      presentation: { blocks: [{ type: 'buttons', buttons: [{ label: 'Yes' }, { label: 'No' }] }] },
-      ctx: makeCtx('Pick one:', 'user:alice'),
+    await adapter.sendPayload!({
+      ...makeCtx('Pick one:', 'user:alice'),
+      payload: { text: 'Pick one:', presentation: { blocks: [{ type: 'buttons', buttons: [{ label: 'Yes' }, { label: 'No' }] }] } },
     });
     const env = hub.envelopes[0]!;
     if (env.kind === 'approval.request') expect(env.payload.title).toBe('Pick one:');
   });
 
-  it('renderPresentation: resolves a callback action value (never reinterpreted as a command) via the approval-value store', async () => {
+  it('sendPayload with payload.presentation resolves a callback action value (never reinterpreted as a command) via the approval-value store', async () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
       hub, channel: 'coordinator',
       approvalValues: { remember, resolve: (_refId: string, label: string) => label },
     });
-    await adapter.renderPresentation!({
-      payload: { text: 'Choose:' },
-      presentation: {
-        blocks: [{
-          type: 'buttons',
-          buttons: [
-            { label: 'Approve', action: { type: 'callback', value: 'cb:approve-task-42' } },
-            { label: 'Legacy', value: 'legacy:value' },
-            { label: 'Bare' },
-          ],
-        }],
+    await adapter.sendPayload!({
+      ...makeCtx('Choose:', 'user:alice'),
+      payload: {
+        text: 'Choose:',
+        presentation: {
+          blocks: [{
+            type: 'buttons',
+            buttons: [
+              { label: 'Approve', action: { type: 'callback', value: 'cb:approve-task-42' } },
+              { label: 'Legacy', value: 'legacy:value' },
+              { label: 'Bare' },
+            ],
+          }],
+        },
       },
-      ctx: makeCtx('Choose:', 'user:alice'),
     });
     const env = hub.envelopes[0]!;
     expect(remember).toHaveBeenCalledTimes(1);
@@ -471,17 +504,14 @@ describe('createRaccoonOutbound', () => {
     expect(labelToValue.get('Bare')).toBe('Bare');
   });
 
-  it('renderPresentation: a select block (no buttons) renders as an approval.request too, not a text fallback', async () => {
+  it('sendPayload with payload.presentation select (no buttons) renders as an approval.request too, not a text fallback', async () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
-    const result = await adapter.renderPresentation!({
-      payload: { text: 'Pick a region:' },
-      presentation: {
-        blocks: [{
-          type: 'select',
-          options: [{ label: 'us-east', value: 'region:us-east' }, { label: 'eu-west' }],
-        }],
+    const result = await adapter.sendPayload!({
+      ...makeCtx('Pick a region:', 'user:alice'),
+      payload: {
+        text: 'Pick a region:',
+        presentation: { blocks: [{ type: 'select', options: [{ label: 'us-east', value: 'region:us-east' }, { label: 'eu-west' }] }] },
       },
-      ctx: makeCtx('Pick a region:', 'user:alice'),
     });
     expect(hub.envelopes).toHaveLength(1);
     const env = hub.envelopes[0]!;
@@ -490,19 +520,15 @@ describe('createRaccoonOutbound', () => {
     expect(result.messageId).toBe(env.id);
   });
 
-  it('renderPresentation: no buttons/select → renders text/context blocks as plain msg text', async () => {
+  it('sendPayload with payload.presentation (no buttons/select) renders text/context blocks as plain msg text', async () => {
     mockChunk.mockReturnValueOnce(['Line one.\n\nLine two.']);
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
-    const result = await adapter.renderPresentation!({
-      payload: { text: 'fallback (unused)' },
-      presentation: {
-        blocks: [
-          { type: 'text', text: 'Line one.' },
-          { type: 'divider' },
-          { type: 'context', text: 'Line two.' },
-        ],
+    const result = await adapter.sendPayload!({
+      ...makeCtx('fallback (unused)', 'user:alice'),
+      payload: {
+        text: 'fallback (unused)',
+        presentation: { blocks: [{ type: 'text', text: 'Line one.' }, { type: 'divider' }, { type: 'context', text: 'Line two.' }] },
       },
-      ctx: makeCtx('fallback (unused)', 'user:alice'),
     });
     expect(hub.envelopes).toHaveLength(1);
     const env = hub.envelopes[0]!;
@@ -511,13 +537,12 @@ describe('createRaccoonOutbound', () => {
     expect(result.messageId).toBe(env.id);
   });
 
-  it('renderPresentation: an empty presentation (no blocks with content) falls back to payload.text', async () => {
+  it('sendPayload with an empty payload.presentation (no blocks with content) falls back to payload.text', async () => {
     mockChunk.mockReturnValueOnce(['plain fallback text']);
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
-    await adapter.renderPresentation!({
-      payload: { text: 'plain fallback text' },
-      presentation: { blocks: [] },
-      ctx: makeCtx('plain fallback text', 'user:alice'),
+    await adapter.sendPayload!({
+      ...makeCtx('plain fallback text', 'user:alice'),
+      payload: { text: 'plain fallback text', presentation: { blocks: [] } },
     });
     const env = hub.envelopes[0]!;
     expect(env.kind).toBe('msg');

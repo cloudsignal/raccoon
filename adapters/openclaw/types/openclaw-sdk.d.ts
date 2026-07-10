@@ -402,19 +402,35 @@ declare module 'openclaw/plugin-sdk/channel-core' {
      */
     presentationCapabilities?: PresentationCapabilities;
     /**
-     * Renders a structured MessagePresentation payload natively. Core calls
-     * this "when the adapter can render the payload" (per presentationCapabilities)
-     * and falls back to text itself otherwise — see presentationCapabilities above.
-     * Return type mirrors sendPayload's: both are alternate outbound-delivery
-     * paths reporting the same delivery result back to core.
+     * PURE TRANSFORM — does not deliver. Confirmed 2026-07-10 via
+     * docs.openclaw.ai/plan/ui-channels (quoted signature):
+     *   renderPresentation?: (params: { payload: ReplyPayload; presentation:
+     *     MessagePresentation; ctx: ChannelOutboundSendContext }) => ReplyPayload | null
+     * SYNCHRONOUS, returning a transformed ReplyPayload for core to send
+     * through the channel's own sendPayload/sendText afterward (core's
+     * sequence: resolve capabilities → degrade unsupported blocks → call
+     * renderPresentation → send the result via the channel's transport) —
+     * NOT a value this function delivers itself, and NOT
+     * Promise<OutboundDeliveryResult> (an earlier version of this shim had
+     * this wrong, modeled on sendPayload's contract instead of the real one).
      */
     renderPresentation?: (args: {
       payload: ReplyPayload;
       presentation: MessagePresentation;
-      ctx: ChannelOutboundContext;
-    }) => Promise<OutboundDeliveryResult>;
+      ctx: ChannelOutboundSendContext;
+    }) => ReplyPayload | null;
     [key: string]: unknown;
   }
+
+  // ChannelOutboundSendContext (docs.openclaw.ai/plan/ui-channels, confirmed
+  // 2026-07-10) — the ctx type renderPresentation receives, named distinctly
+  // from ChannelOutboundContext in the real SDK. We alias it here: Raccoon's
+  // renderPresentation doesn't read any field off ctx (see outbound.ts), so
+  // the exact shape is not load-bearing for us, but the name is kept
+  // faithful to the confirmed signature rather than reusing
+  // ChannelOutboundContext under a name the SDK doesn't actually export for
+  // this position.
+  export type ChannelOutboundSendContext = ChannelOutboundContext;
 
   // ChannelMeta (types.core-BnNQH4rw.d.ts, lines 190-212)
   // Required members: id, label, selectionLabel, docsPath, blurb.

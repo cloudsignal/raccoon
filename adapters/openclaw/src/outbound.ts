@@ -48,6 +48,7 @@ import type {
   ChannelOutboundContext,
   ChannelOutboundPayloadContext,
   ChannelOutboundChunkContext,
+  ChannelOutboundSendContext,
   OutboundDeliveryResult,
   InteractiveReply,
   InteractiveReplyButton,
@@ -392,11 +393,15 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
       return makeResult(firstId, channel);
     }
 
-    // No (mappable) interactive: defensively check payload.presentation too.
-    // Core is expected to route a presentation-bearing payload to
-    // renderPresentation directly (see below), but a caller that reaches
-    // sendPayload with only `presentation` set (no `interactive`) must not
-    // silently lose its buttons/select — render it the same way.
+    // No (mappable) interactive: check payload.presentation too. This is the
+    // REAL delivery path for the modern MessagePresentation shape (R4-1
+    // correction) — renderPresentation (below) is a pure, side-effect-free
+    // transform; core calls it, then routes the transformed payload back
+    // through sendPayload/sendText for actual delivery, since Raccoon is a
+    // 'gateway'-mode channel (all real sends go through this adapter's own
+    // methods, never a core-generic path). A caller that reaches sendPayload
+    // directly with only `presentation` set (no `interactive`) hits the same
+    // branch, so there's exactly one delivery path regardless of how it got here.
     const presentation = asMessagePresentation(payload.presentation);
     if (presentation) {
       const fallbackText = typeof payload.text === 'string' && payload.text.length > 0 ? payload.text : ctx.text;
@@ -414,23 +419,35 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
   }
 
   // ------------------------------------------------------------------
-  // renderPresentation — native rendering for the modern MessagePresentation
-  // shape. Declared alongside presentationCapabilities below; core calls this
-  // instead of sendPayload when it has a presentation to deliver and this
-  // adapter declares it can render it (see the shim's doc comment for the
-  // confirmed contract: "core owns fallback behavior").
+  // renderPresentation — PURE TRANSFORM, no delivery (R4-1 correction).
+  //
+  // Confirmed signature (docs.openclaw.ai/plan/ui-channels, 2026-07-10):
+  //   renderPresentation?: (params: { payload: ReplyPayload; presentation:
+  //     MessagePresentation; ctx: ChannelOutboundSendContext }) => ReplyPayload | null
+  // — SYNCHRONOUS, returning a transformed ReplyPayload for core to send
+  // through the channel's OWN delivery hooks, not a value this function
+  // delivers itself. Core's sequence: resolve capabilities → degrade
+  // unsupported blocks → call renderPresentation → send the result via the
+  // channel's transport. For a 'gateway'-mode channel (Raccoon), "the
+  // channel's transport" IS sendPayload/sendText — there is no separate
+  // core-generic delivery path.
+  //
+  // The original implementation called deliverPresentation() here directly,
+  // performing hub.sendToUser() as a side effect and returning an
+  // OutboundDeliveryResult — a materially different, incompatible contract
+  // that (a) never matched what core actually expects back from this hook
+  // and (b) risked a double-send if core ALSO routed the transformed payload
+  // through sendPayload afterward. Since sendPayload already fully handles
+  // payload.presentation (see above), the correct transform here is the
+  // identity: hand the presentation straight back attached to the payload,
+  // and let sendPayload perform the one real delivery.
   // ------------------------------------------------------------------
-  async function renderPresentation(args: {
+  function renderPresentation(args: {
     payload: ReplyPayload;
     presentation: MessagePresentation;
-    ctx: ChannelOutboundContext;
-  }): Promise<OutboundDeliveryResult> {
-    const userId = parseRaccoonUserId(args.ctx.to);
-    const fallbackText =
-      typeof args.payload.text === 'string' && args.payload.text.length > 0
-        ? args.payload.text
-        : args.ctx.text;
-    return deliverPresentation(hub, channel, approvalValues, userId, args.presentation, fallbackText);
+    ctx: ChannelOutboundSendContext;
+  }): ReplyPayload | null {
+    return { ...args.payload, presentation: args.presentation };
   }
 
   // ------------------------------------------------------------------

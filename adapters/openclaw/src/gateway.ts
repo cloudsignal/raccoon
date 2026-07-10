@@ -275,6 +275,15 @@ export function createRegistryOutbound(
     });
   }
 
+  // presentationCapabilities, renderPresentation, and chunker are all
+  // stateless (none touch the hub — renderPresentation is a pure transform,
+  // see outbound.ts's R4-1 correction; chunker only chunks text): built once
+  // from a placeholder hub that real calls never reach.
+  const stateless = createRaccoonOutbound({
+    hub: { sendToUser: () => false, onEnvelope: () => () => {} },
+    channel: 'raccoon',
+  });
+
   return {
     deliveryMode: 'gateway',
     async sendText(ctx) {
@@ -283,12 +292,16 @@ export function createRegistryOutbound(
     async sendPayload(ctx) {
       return forAccount(ctx.accountId ?? undefined).sendPayload!(ctx);
     },
-    // The chunker is stateless (does not need the hub); reuse the T4 chunker.
-    chunker: createRaccoonOutbound({
-      // A placeholder hub is never touched by chunker(); it only chunks text.
-      hub: { sendToUser: () => false, onEnvelope: () => () => {} },
-      channel: 'raccoon',
-    }).chunker,
+    chunker: stateless.chunker,
+    // R4-1: this wrapper previously dropped these two fields entirely, so
+    // OpenClaw never saw Raccoon declare presentation support and always
+    // degraded exec approvals to plain text in production — the T4 adapter's
+    // renderPresentation/presentationCapabilities (createRaccoonOutbound)
+    // were correct but unreachable, since raccoonChannelPlugin.outbound is
+    // THIS registry wrapper, not the inner per-account adapter the tests
+    // exercised.
+    presentationCapabilities: stateless.presentationCapabilities,
+    renderPresentation: stateless.renderPresentation,
   };
 }
 

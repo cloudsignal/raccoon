@@ -136,4 +136,27 @@ describe('createRegistryOutbound (outbound↔hub seam)', () => {
     const adapter = createRegistryOutbound(resolveRunning);
     expect(typeof adapter.chunker).toBe('function');
   });
+
+  // R4-1: this wrapper previously dropped presentationCapabilities and
+  // renderPresentation entirely — the T4 adapter (createRaccoonOutbound)
+  // declared them correctly, but raccoonChannelPlugin.outbound is THIS
+  // registry wrapper, not the inner adapter, so OpenClaw never saw them in
+  // production and always degraded exec approvals to plain text.
+
+  it('exposes presentationCapabilities.buttons: true (forwarded from the T4 adapter)', () => {
+    const adapter = createRegistryOutbound(resolveRunning);
+    expect(adapter.presentationCapabilities?.supported).toBe(true);
+    expect(adapter.presentationCapabilities?.buttons).toBe(true);
+  });
+
+  it('exposes a synchronous renderPresentation that performs no delivery (forwarded from the T4 adapter)', () => {
+    const adapter = createRegistryOutbound(resolveRunning);
+    expect(typeof adapter.renderPresentation).toBe('function');
+    const payload = { text: 'hi' };
+    const presentation = { blocks: [] as never[] };
+    const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('user:alice', 'default') as any });
+    expect(result).not.toBeInstanceOf(Promise);
+    expect(result).toEqual({ text: 'hi', presentation });
+    expect(hub.envelopes).toHaveLength(0); // no running-account resolution needed; no delivery side effect
+  });
 });
