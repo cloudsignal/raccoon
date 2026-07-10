@@ -70,17 +70,28 @@ export function withPushFallback(
   // interleaving, matching the atomicity the cap-check already relied on for
   // concurrent subscribes.
   const opChains = new Map<string, Promise<void>>();
+  // #R5-9: two promises per op, deliberately distinct. `result` carries the
+  // op's REAL outcome to the caller (clearForUser must reject when
+  // store.clear() fails — a revoke that swallowed it reported success while
+  // the user's subscriptions were all still deliverable). `next` — the link
+  // the chain itself continues from — swallows that failure so one failed op
+  // never wedges every later op for the user.
   const enqueue = (userId: string, op: () => Promise<void>): Promise<void> => {
     const prev = opChains.get(userId) ?? Promise.resolve();
-    const next = prev.then(op).catch(() => { /* best-effort */ });
+    const result = prev.then(op);
+    const next = result.catch(() => { /* chain continues past a failed op */ });
     opChains.set(userId, next);
     void next.finally(() => { if (opChains.get(userId) === next) opChains.delete(userId); });
-    return next;
+    return result;
   };
 
   const stopCapture = hub.onEnvelope((env, userId) => {
+    // Both captures stay best-effort: enqueue()'s returned promise now
+    // reflects the op's real outcome (#R5-9), and nothing here awaits it —
+    // so attach a catch to keep a failed add/remove from becoming an
+    // unhandled rejection. (The chain itself is failure-proof internally.)
     if (env.kind === 'push.subscribe') {
-      enqueue(userId, () => addSubscription(userId, env.payload.subscription));
+      void enqueue(userId, () => addSubscription(userId, env.payload.subscription)).catch(() => {});
       return;
     }
     if (env.kind === 'push.unsubscribe') {
@@ -88,7 +99,7 @@ export function withPushFallback(
       // (per the SubscriptionStore contract), so a client can only ever
       // unsubscribe an endpoint registered under its own authenticated
       // identity, never another user's.
-      enqueue(userId, () => opts.store.remove(userId, env.payload.endpoint));
+      void enqueue(userId, () => opts.store.remove(userId, env.payload.endpoint)).catch(() => {});
     }
   });
 

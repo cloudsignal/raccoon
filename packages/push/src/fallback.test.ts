@@ -208,6 +208,43 @@ describe('withPushFallback', () => {
     expect(await originalList('u1')).toHaveLength(0);
   });
 
+  it('clearForUser propagates a store.clear() failure instead of resolving as success (#R5-9)', async () => {
+    // The per-user FIFO chain must swallow op failures INTERNALLY (so one
+    // failed op never wedges the chain) — but the promise clearForUser hands
+    // its caller must reflect the clear's real outcome. Previously it
+    // inherited the chain's own swallowed link, so a revoke reported success
+    // while the user's push subscriptions were all still active.
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    store.clear = async () => { throw new Error('db outage'); };
+    const { clearForUser } = withPushFallback(inner, { store, sender: new FakeSender() });
+
+    await expect(clearForUser('u1')).rejects.toThrow('db outage');
+  });
+
+  it('a failed clearForUser does not wedge the per-user chain — later ops still run (#R5-9)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/after-failure';
+    const originalClear = store.clear.bind(store);
+    let failNext = true;
+    store.clear = async (userId: string) => {
+      if (failNext) { failNext = false; throw new Error('db outage'); }
+      return originalClear(userId);
+    };
+    const { clearForUser } = withPushFallback(inner, { store, sender: new FakeSender() });
+
+    await expect(clearForUser('u1')).rejects.toThrow('db outage');
+
+    // The chain is still alive: a subsequent subscribe for the same user
+    // must land normally.
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system', payload: { subscription: sub(endpoint) },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await store.list('u1')).toHaveLength(1);
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();
