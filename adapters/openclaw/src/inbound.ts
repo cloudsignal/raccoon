@@ -75,24 +75,6 @@ export function buildRaccoonInboundRunner(
   };
 }
 
-/**
- * Command authorization for a Raccoon user. OpenClaw's FinalizedMsgContext is
- * default-deny (missing/false = not authorized), and the channel is the authority
- * that sets it. We authorize a user for commands ONLY if they appear in
- * `channels.raccoon.commandsAllowFrom`; when that list is unset, no one is command-
- * authorized (default-deny). This replaces a hardcoded `true`, which authorized
- * every message regardless of any configured command allowlist.
- */
-function isCommandAuthorized(cfg: OpenClawConfig, userId: string): boolean {
-  const ch = (cfg as { channels?: Record<string, unknown> }).channels;
-  const section = ch?.['raccoon'];
-  if (!section || typeof section !== 'object' || Array.isArray(section)) return false;
-  const raw = (section as Record<string, unknown>)['commandsAllowFrom'];
-  if (!Array.isArray(raw)) return false;
-  const normalized = userId.trim().toLowerCase();
-  return raw.some((e) => typeof e === 'string' && e.trim().toLowerCase() === normalized);
-}
-
 async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIterable<string> {
   // Async push-pull queue:
   //   - OpenClaw calls dispatcher.sendFinalReply() → enqueue() pushes text
@@ -132,7 +114,20 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     SessionKey: sessionKey,
     AgentId: opts.agentId,
     MessageSid: ctx.messageId,
-    CommandAuthorized: isCommandAuthorized(opts.cfg, ctx.userId),
+    // INVARIANT: runOneTurn is private and reachable from exactly one call
+    // site (run(), above), which already returns an empty iterable — never
+    // reaching this function — when gate.checkAllowed denies the user. So by
+    // the time we build this payload, the channel's own dmPolicy/allowFrom
+    // gate has already authorized this sender. Per OpenClaw's documented
+    // command-authorization fallback chain, "channel allowlists / pairing
+    // access" is a recognized authorization source when OpenClaw's own
+    // commands.allowFrom is not configured — which is exactly what our gate
+    // represents. An operator wanting a STRICTER, command-specific allowlist
+    // should set OpenClaw's own `commands.allowFrom` (per OpenClaw's docs,
+    // this becomes the sole authorization source once configured,
+    // superseding this). See adapters/openclaw/src/inbound.test.ts for the
+    // test asserting the invariant this relies on.
+    CommandAuthorized: true,
   };
 
   // Build the dispatcher that funnels final payloads into our queue.

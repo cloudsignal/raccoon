@@ -51,7 +51,11 @@ describe('buildRaccoonInboundRunner', () => {
     expect(chunks).toEqual(['hello', ' world']);
   });
 
-  it('sets CommandAuthorized from channels.raccoon.commandsAllowFrom, default-deny (#2)', async () => {
+  it('sets CommandAuthorized true, relying on the upstream gate invariant (R2-4)', async () => {
+    // CommandAuthorized is unconditionally true in ctxPayload because runOneTurn
+    // is only ever reached after gate.checkAllowed has already authorized the
+    // sender (proved below, and in the "checkAllowed gate" describe block: a
+    // denied user gets an empty iterable and dispatch is never called at all).
     let captured: { ctxPayload: { CommandAuthorized: boolean } } | undefined;
     mockDispatch.mockImplementation(async (arg) => {
       captured = arg as unknown as { ctxPayload: { CommandAuthorized: boolean } };
@@ -60,15 +64,21 @@ describe('buildRaccoonInboundRunner', () => {
       return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
     });
 
-    // Unset commandsAllowFrom -> default-deny (previously hardcoded true).
-    const denyRunner = buildRaccoonInboundRunner({ ...opts, cfg: { channels: { raccoon: {} } } as unknown as InboundRunnerOpts['cfg'] });
-    for await (const _chunk of denyRunner.run(ctx)) { /* drain */ }
-    expect(captured?.ctxPayload.CommandAuthorized).toBe(false);
-
-    // User listed in commandsAllowFrom -> authorized.
-    const allowRunner = buildRaccoonInboundRunner({ ...opts, cfg: { channels: { raccoon: { commandsAllowFrom: ['user-123'] } } } as unknown as InboundRunnerOpts['cfg'] });
+    const allowRunner = buildRaccoonInboundRunner(opts, { checkAllowed: () => true });
     for await (const _chunk of allowRunner.run(ctx)) { /* drain */ }
     expect(captured?.ctxPayload.CommandAuthorized).toBe(true);
+
+    // A denied user never reaches runOneTurn (empty iterable, dispatch not
+    // called) — so there is no path where CommandAuthorized:true is set for an
+    // unauthorized sender.
+    captured = undefined;
+    mockDispatch.mockClear();
+    const denyRunner = buildRaccoonInboundRunner(opts, { checkAllowed: () => false });
+    const chunks: string[] = [];
+    for await (const chunk of denyRunner.run(ctx)) chunks.push(chunk);
+    expect(chunks).toEqual([]);
+    expect(mockDispatch).not.toHaveBeenCalled();
+    expect(captured).toBeUndefined();
   });
 
   it('skips sendBlockReply and sendToolResult payloads', async () => {
@@ -217,7 +227,7 @@ describe('buildRaccoonInboundRunner', () => {
       SessionKey: `raccoon:user:${ctx.userId}`,
       AgentId: opts.agentId,
       MessageSid: ctx.messageId,
-      CommandAuthorized: false, // default-deny: opts.cfg has no channels.raccoon.commandsAllowFrom
+      CommandAuthorized: true, // no gate wired here -> reachable at all -> upstream-authorized (R2-4)
     });
   });
 });
