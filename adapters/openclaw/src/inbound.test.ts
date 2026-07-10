@@ -251,6 +251,54 @@ describe('buildRaccoonInboundRunner', () => {
     expect(bodies[1]).toContain('req-7'); // still correlated for the agent
   });
 
+  it('an edited response does not reserve the approval, so a concurrent real click still resolves the command (#R6-1b)', async () => {
+    // An edited free-text response can NEVER execute the command (it goes out
+    // as bracket text). Reserving the approval for the duration of its
+    // (potentially long) turn would make a concurrent real Allow degrade to
+    // ordinary text and get a successful ack while the edit later rolls back.
+    // The edit must not reserve at all.
+    const bodies: string[] = [];
+    let releaseEdit!: () => void;
+    const editGate = new Promise<void>((r) => { releaseEdit = r; });
+    mockDispatch
+      .mockImplementationOnce(async (arg) => { // the edited turn — parks mid-flight
+        bodies.push((arg.ctxPayload as { Body: string }).Body);
+        await editGate;
+        arg.dispatcher.sendFinalReply({ text: 'ok' });
+        arg.dispatcher.markComplete();
+        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+      })
+      .mockImplementationOnce(async (arg) => { // the concurrent real Allow
+        bodies.push((arg.ctxPayload as { Body: string }).Body);
+        arg.dispatcher.sendFinalReply({ text: 'ok' });
+        arg.dispatcher.markComplete();
+        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+      });
+
+    const store = createApprovalValueStore();
+    store.remember('req-8', ctx.userId, new Map([
+      ['Allow', { value: 'approve req-8 allow-once', isCommand: true }],
+    ]));
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+
+    const editTurn = (async () => {
+      for await (const _ of runner.run({
+        ...ctx, text: 'wait, let me explain',
+        approval: { refId: 'req-8', choice: 'Allow', editedText: 'wait, let me explain' },
+      })) { /* drain */ }
+    })();
+    await new Promise((r) => setTimeout(r, 10)); // edit turn is parked mid-flight
+
+    // The real Allow click, while the edit is still running: it must resolve
+    // the command, not find the approval reserved and degrade.
+    for await (const _ of runner.run({ ...ctx, text: 'Allow', approval: { refId: 'req-8', choice: 'Allow' } })) { /* drain */ }
+    releaseEdit();
+    await editTurn;
+
+    expect(bodies[0]).not.toMatch(/^\//); // the edit went out as bracket text
+    expect(bodies[1]).toBe('/approve req-8 allow-once'); // the real click still executed
+  });
+
   it('a transient dispatch failure does not burn the approval — the retry still resolves the command (#R5-8)', async () => {
     let capturedBody: string | undefined;
     mockDispatch

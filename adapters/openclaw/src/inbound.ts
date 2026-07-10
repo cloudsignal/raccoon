@@ -163,12 +163,17 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
   // the specific pending approval either way.
   //
   // #R5-8: resolve() no longer consumes — resolvedApproval.commit() below
-  // (after a successful dispatch, non-edited path only) does. Consuming
-  // here burned the approval on any transient dispatch failure, and the
-  // edited-text path consumed the command mapping without ever sending the
-  // command, so a later real click could never act on the still-pending
-  // OpenClaw approval.
-  const resolvedApproval = ctx.approval
+  // (after a successful dispatch) does. Consuming at resolve burned the
+  // approval on any transient dispatch failure.
+  //
+  // #R6-1b: only resolve (and therefore RESERVE, #R6-1) for a real click. An
+  // edited free-text response can never execute the command — it goes out as
+  // bracket text regardless — so reserving the approval for the duration of
+  // its (possibly long) turn would make a concurrent real Allow/Deny find the
+  // approval taken and degrade to ordinary text (acked as success) while the
+  // edit later rolls the reservation back. Skipping resolve() for edits
+  // leaves the approval free for the click that actually acts on it.
+  const resolvedApproval = ctx.approval && ctx.approval.editedText === undefined
     ? opts.approvalValues?.resolve(ctx.approval.refId, ctx.userId, ctx.approval.choice)
     : undefined;
   const approvalText = ctx.approval
@@ -264,15 +269,11 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     // Await the dispatch promise to propagate any errors thrown by OpenClaw.
     await dispatchPromise;
 
-    // #R5-8/#R6-1: the turn dispatched successfully — settle the
-    // reservation. A real click commits (final, replay-proof consumption);
-    // an edited free-text response rolls back — it never sent the command,
-    // so the mapping must return to circulation for the click that
-    // eventually acts on the still-pending OpenClaw approval.
-    if (resolvedApproval) {
-      if (ctx.approval?.editedText === undefined) resolvedApproval.commit();
-      else resolvedApproval.rollback();
-    }
+    // #R5-8/#R6-1: the turn dispatched successfully — commit (final,
+    // replay-proof consumption). resolvedApproval only exists for a real
+    // click now (#R6-1b: edits never resolve/reserve), so there is no
+    // edited-path rollback to do here.
+    resolvedApproval?.commit();
   } catch (err) {
     // #R5-8/#R6-1: the dispatch failed — release the reservation so a retry
     // can resolve the command again, instead of the approval being burned.

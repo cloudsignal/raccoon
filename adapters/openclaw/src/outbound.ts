@@ -208,19 +208,23 @@ function findPresentationSelect(presentation: MessagePresentation): MessagePrese
 }
 
 /**
- * Resolve a button to its ApprovalChoice: prefer the modern `action` field
- * ('callback' carries opaque plugin data; 'command' names a REAL native
- * OpenClaw slash command — see inbound.ts's buildApprovalText, which sends
- * an isCommand choice back as a standalone `/`-prefixed message, per the
- * confirmed contract that OpenClaw only recognizes commands as standalone
- * messages starting with `/`), falling back to the legacy `value` field,
- * then the label. Per the spec, a 'callback' action's value must never be
- * reinterpreted as a slash command — isCommand is false for it.
+ * Resolve a button OR select option to its ApprovalChoice. Both carry the
+ * same choice-bearing shape in the real SDK (2026.6.11):
+ * `{ label; action?: MessagePresentationAction; value?: string }` — a select
+ * option is NOT command-free (#R6-9b: the adapter previously forced
+ * isCommand:false for options, so an exec approval rendered as a select
+ * degraded its command click to bracket text and never executed /approve).
+ *
+ * Preference: the modern `action` field ('callback' carries opaque plugin
+ * data — never a command; 'command' names a REAL native OpenClaw slash
+ * command — see inbound.ts's buildApprovalText, which sends an isCommand
+ * choice back as a standalone `/`-prefixed message), then the legacy `value`
+ * field, then the label.
  */
-function resolveButtonChoice(b: MessagePresentationButton): ApprovalChoice {
-  if (b.action?.type === 'callback') return { value: b.action.value, isCommand: false };
-  if (b.action?.type === 'command') return { value: b.action.command, isCommand: true };
-  return { value: b.value ?? b.label, isCommand: false };
+function resolveChoice(c: { label: string; action?: MessagePresentationButton['action']; value?: string }): ApprovalChoice {
+  if (c.action?.type === 'callback') return { value: c.action.value, isCommand: false };
+  if (c.action?.type === 'command') return { value: c.action.command, isCommand: true };
+  return { value: c.value ?? c.label, isCommand: false };
 }
 
 /** Join the presentation's 'text'/'context' blocks (and blank lines for
@@ -255,9 +259,10 @@ async function deliverPresentation(
 
   if (buttons !== null || selectOptions !== null) {
     const choices: Array<{ label: string; choice: ApprovalChoice }> = buttons !== null
-      ? buttons.map((b) => ({ label: b.label, choice: resolveButtonChoice(b) }))
-      // Select options carry no `action` field — never a command.
-      : selectOptions!.map((o) => ({ label: o.label, choice: { value: o.value ?? o.label, isCommand: false } }));
+      ? buttons.map((b) => ({ label: b.label, choice: resolveChoice(b) }))
+      // #R6-9b: select options carry the same action?/value/label shape as
+      // buttons — resolve them the same action-aware way.
+      : selectOptions!.map((o) => ({ label: o.label, choice: resolveChoice(o) }));
 
     const refId = ulid();
     const title = presentation.title?.trim()
@@ -396,7 +401,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
         // button like {label:"Approve", value:"approve:task-42"} lost its
         // value entirely — OpenClaw only ever saw "Approve" as an unrelated
         // turn, breaking any correlation to the pending action.
-        approvalValues?.remember(refId, userId, new Map(buttons.map((b) => [b.label, resolveButtonChoice(b)])));
+        approvalValues?.remember(refId, userId, new Map(buttons.map((b) => [b.label, resolveChoice(b)])));
         hub.sendToUser(userId, env);
         return makeResult(env.id, channel);
       }

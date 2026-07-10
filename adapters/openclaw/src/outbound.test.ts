@@ -568,6 +568,42 @@ describe('createRaccoonOutbound', () => {
     expect(result.messageId).toBe(env.id);
   });
 
+  it('sendPayload resolves a select OPTION\'s command action to a real slash command, not bracket text (#R6-9b)', async () => {
+    // Real SDK 2026.6.11: MessagePresentationOption has action?: like a
+    // button. An exec approval rendered as a SELECT (not buttons) whose
+    // 'Allow' option carries {action:{type:'command',...}} must resolve to
+    // an isCommand choice — otherwise the click degrades to bracket text and
+    // never executes /approve.
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator',
+      approvalValues: { remember, resolve: () => undefined },
+    });
+    await adapter.sendPayload!({
+      ...makeCtx('Approve deploy?', 'user:alice'),
+      payload: {
+        text: 'Approve deploy?',
+        presentation: {
+          blocks: [{
+            type: 'select',
+            options: [
+              { label: 'Allow', action: { type: 'command', command: 'approve req-9 allow-once' } },
+              { label: 'Deny', action: { type: 'callback', value: 'cb:deny' } },
+              { label: 'Legacy', value: 'legacy:val' },
+              { label: 'Bare' },
+            ],
+          }],
+        },
+      },
+    });
+    expect(remember).toHaveBeenCalledTimes(1);
+    const labelToChoice = remember.mock.calls[0]![2];
+    expect(labelToChoice.get('Allow')).toEqual({ value: 'approve req-9 allow-once', isCommand: true });
+    expect(labelToChoice.get('Deny')).toEqual({ value: 'cb:deny', isCommand: false });
+    expect(labelToChoice.get('Legacy')).toEqual({ value: 'legacy:val', isCommand: false });
+    expect(labelToChoice.get('Bare')).toEqual({ value: 'Bare', isCommand: false });
+  });
+
   it('sendPayload with payload.presentation (no buttons/select) renders text/context blocks as plain msg text', async () => {
     mockChunk.mockReturnValueOnce(['Line one.\n\nLine two.']);
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
