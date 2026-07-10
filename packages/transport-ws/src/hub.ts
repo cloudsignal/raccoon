@@ -122,6 +122,15 @@ export class WsHub {
     this.seq += 1;
     return this.seq;
   }
+  // R5-7: count of handleHello calls started but not yet settled. The
+  // pendingConnections cap alone bounds SOCKETS, not verification work: the
+  // hello timeout (and a client disconnect) free a socket's pending slot
+  // while its handleHello — possibly parked forever inside an external
+  // verifySession/validatePairingToken — remains outstanding. Without this
+  // counter, an attacker could accumulate unbounded in-flight verification
+  // tasks one timeout-cycle at a time. Gated at connection accept AND at
+  // hello start; decremented only when handleHello actually settles.
+  private outstandingHellos = 0;
 
   constructor(opts: WsHubOptions) {
     this.instance = opts.instance;
@@ -147,7 +156,14 @@ export class WsHub {
       // so an attacker opening unlimited sockets and never sending hello
       // cannot exhaust server resources — legitimate authenticated sockets
       // (already moved out of pendingConnections by attach()) are unaffected.
-      if (this.pendingConnections.size >= this.maxPendingConnections) {
+      // R5-7: outstandingHellos is part of the same gate — a timed-out
+      // socket frees its pending slot, but its verification may still be
+      // outstanding; accepting new connections against only the socket
+      // count let verification work grow without bound.
+      if (
+        this.pendingConnections.size >= this.maxPendingConnections
+        || this.outstandingHellos >= this.maxPendingConnections
+      ) {
         ws.close(4503, 'server busy');
         return;
       }
@@ -191,12 +207,23 @@ export class WsHub {
         // which crashes the host process by default in modern Node. Contain
         // it: log server-side, close the socket rather than leaving it half-
         // handled.
+        // R5-7: hard bound on hellos in flight, re-checked at hello start
+        // too (a socket accepted while under the cap can reach here after
+        // other hellos have since filled it).
+        if (this.outstandingHellos >= this.maxPendingConnections) {
+          clearTimeout(helloTimer);
+          this.pendingConnections.delete(ws);
+          try { ws.close(4503, 'server busy'); } catch { /* already closing */ }
+          return;
+        }
+        this.outstandingHellos += 1;
         this.handleHello(ws, ip, data.toString())
           .catch((err) => {
             console.error('[raccoon] handleHello failed:', err);
             try { ws.close(1011, 'internal error'); } catch { /* already closing */ }
           })
           .finally(() => {
+            this.outstandingHellos -= 1;
             clearTimeout(helloTimer);
             this.pendingConnections.delete(ws);
           });
@@ -420,6 +447,16 @@ export class WsHub {
       if (set!.size === 0 && this.byUser.get(userId) === set) this.byUser.delete(userId);
     });
     ws.on('message', (data) => {
+      // R5-6: current byUser membership IS the authorization, checked per
+      // frame — not the fact that this listener was once attached.
+      // revokeUser() removes the socket from byUser synchronously but only
+      // STARTS a graceful close; until the close handshake completes, frames
+      // (including ones already buffered in flight) still reach this
+      // listener. Without this gate they were dispatched as the revoked
+      // user: a buffered push.subscribe could recreate a subscription
+      // clearForUser had just removed, and ordinary frames could run whole
+      // agent turns post-revoke.
+      if (!this.byUser.get(userId)?.has(ws)) return;
       let parsed: unknown;
       try { parsed = JSON.parse(data.toString()); } catch { return; }
       const env = tryParseEnvelope(parsed);

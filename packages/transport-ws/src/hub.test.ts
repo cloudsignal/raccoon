@@ -427,4 +427,59 @@ describe('WsHub pairing', () => {
 
     release?.(); // let the now-irrelevant validatePairingToken call settle
   });
+
+  it('a frame arriving after revokeUser is never dispatched as the revoked user (#R5-6)', async () => {
+    hub = new WsHub({ instance: 'test' });
+    const { port } = await hub.start();
+    const received: Array<{ userId: string; kind: string }> = [];
+    hub.onEnvelope((env, userId) => received.push({ userId, kind: env.kind }));
+
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    await nextMessage(ws); // pair.grant — the socket is attached and authorized now
+
+    await hub.revokeUser('u1');
+    // revokeUser started a GRACEFUL close: the server has sent its close
+    // frame but keeps receiving until the client echoes it. The client here
+    // hasn't processed that frame yet, so this send still reaches the
+    // server's (still-registered) per-socket message listener — which
+    // previously dispatched it to handlers as the revoked user. A buffered
+    // push.subscribe here could recreate a subscription clearForUser had
+    // just removed; ordinary frames could run whole agent turns.
+    ws.send(JSON.stringify(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'after revoke' },
+    })));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(received).toEqual([]);
+  });
+
+  it('outstanding verification work is bounded even as timed-out sockets free their pending slots (#R5-7)', async () => {
+    // The pending-connection cap bounds SOCKETS, but each hello can park an
+    // unresolvable external verification. Previously the hello timeout freed
+    // the socket's pending slot while its verification stayed outstanding —
+    // so an attacker could accumulate unbounded in-flight verification work
+    // one timeout-cycle at a time. The cap must bound outstanding
+    // verification tasks until they actually settle.
+    let validatorCalls = 0;
+    hub = new WsHub({
+      instance: 'test',
+      maxPendingConnections: 1,
+      helloTimeoutMs: 50,
+      validatePairingToken: () => { validatorCalls += 1; return new Promise<string | null>(() => { /* never settles */ }); },
+    });
+    const { port } = await hub.start();
+
+    const first = await connect(port);
+    first.send(pairRequest('t1'));
+    expect(await nextClose(first)).toBe(4408); // times out, socket slot freed…
+
+    // …but its verification is STILL outstanding. A new connection must be
+    // refused (4503) rather than allowed to start a second one.
+    const second = await connect(port);
+    second.send(pairRequest('t2'));
+    expect(await nextClose(second)).toBe(4503);
+    expect(validatorCalls).toBe(1); // the hung validator was never re-entered
+  });
 });
