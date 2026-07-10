@@ -102,6 +102,58 @@ describe('outbox', () => {
     }
   });
 
+  it('every mutator is exactly ONE IndexedDB transaction, the property cross-tab safety depends on (#R3-5)', async () => {
+    // The fix's cross-tab guarantee rests on a spec-level fact, not anything
+    // this codebase implements: IndexedDB serializes 'readwrite' transactions
+    // with overlapping store scopes IN THE ORDER THEY WERE CREATED, across
+    // ALL connections to a database — including connections opened by
+    // different browser tabs, since a database's storage is shared per
+    // origin, not per tab. (A module-local promise queue like the old
+    // opChain, by contrast, only orders calls within ONE tab's JS realm —
+    // reproduced 25/25 by a third-party review racing a second tab's own
+    // connection against it.) That spec guarantee only helps if each mutator
+    // is a SINGLE transaction: a get-then-put split across TWO transactions
+    // still has a gap between them for another connection's transaction to
+    // land in, no matter how strictly each individual transaction is
+    // serialized. So the property to verify here is structural: every
+    // mutator opens exactly one transaction, with no way for anything else
+    // to interleave inside it.
+    const seeded = await outbox.enqueue(msg('x'));
+    // Patch the PROTOTYPE, not a specific connection instance: outbox.ts
+    // mutates through its own internal connection (idb.ts's module-scope
+    // dbPromise), which this test has no handle to. Patching the prototype
+    // intercepts .transaction() calls from any IDBDatabase instance.
+    const originalTransaction = IDBDatabase.prototype.transaction;
+    let count = 0;
+    IDBDatabase.prototype.transaction = function (this: IDBDatabase, ...args: Parameters<typeof originalTransaction>) {
+      count += 1;
+      return originalTransaction.apply(this, args);
+    } as typeof IDBDatabase.prototype.transaction;
+    try {
+      count = 0;
+      await outbox.markSending(seeded.id);
+      expect(count).toBe(1);
+
+      count = 0;
+      await outbox.markSendFailed(seeded.id, 'offline');
+      expect(count).toBe(1);
+
+      count = 0;
+      await outbox.retry(seeded.id);
+      expect(count).toBe(1);
+
+      count = 0;
+      await outbox.settle(seeded.id);
+      expect(count).toBe(1);
+
+      count = 0;
+      await outbox.clearAll();
+      expect(count).toBe(1);
+    } finally {
+      IDBDatabase.prototype.transaction = originalTransaction;
+    }
+  });
+
   it('notifies subscribers with the touched channel', async () => {
     const touched: string[] = [];
     const unsub = outbox.subscribe((c) => touched.push(c));

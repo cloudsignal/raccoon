@@ -38,6 +38,51 @@ export async function withStore<T>(
   });
 }
 
+export function promisifyRequest<T>(req: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Run `fn` against a single IndexedDB transaction that stays open across
+ * multiple chained requests (e.g. a get followed by a put computed from its
+ * result), instead of `withStore`'s one-request-per-call. Requests issued
+ * from `fn` via `await promisifyRequest(...)` keep the transaction alive
+ * (modern IndexedDB tolerates microtask-spaced requests within one
+ * transaction; it does not require same-tick synchronous issuance).
+ *
+ * This is the primitive that makes a get-then-put sequence ATOMIC as one
+ * transaction rather than two separate ones — the actual fix for the outbox
+ * cross-tab race (see outbox.ts): IndexedDB serializes 'readwrite'
+ * transactions with overlapping store scopes, INCLUDING across different
+ * browser tabs sharing the same origin's database (it's a single shared
+ * storage engine, not a per-tab one). Two transactions can still interleave
+ * with a third transaction landing between them; ONE transaction cannot be
+ * interleaved by anything.
+ */
+export function withTransaction<T>(
+  store: 'kv' | 'outbox',
+  mode: IDBTransactionMode,
+  fn: (s: IDBObjectStore) => Promise<T>,
+): Promise<T> {
+  return openDb().then((db) => new Promise<T>((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    let result: T;
+    let ran = false;
+    fn(tx.objectStore(store))
+      .then((r) => { result = r; ran = true; })
+      .catch((err) => {
+        reject(err);
+        try { tx.abort(); } catch { /* transaction may already be finishing */ }
+      });
+    tx.oncomplete = () => { if (ran) resolve(result); };
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error('transaction aborted'));
+  }));
+}
+
 export function kvGet<T>(key: string): Promise<T | undefined> {
   return withStore<T | undefined>('kv', 'readonly', (s) => s.get(key) as IDBRequest<T | undefined>);
 }
