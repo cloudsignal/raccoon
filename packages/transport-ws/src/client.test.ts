@@ -114,4 +114,38 @@ describe('WsClientTransport', () => {
     const got = await echoed;
     expect(got.kind).toBe('msg');
   });
+
+  it('reconnects a session-backed client that starts while the hub is down (#4 offline-start)', async () => {
+    // Prime a real session, then take the hub down so the next client starts offline.
+    const first = new WsHub({ instance: 'test' });
+    const { port } = await first.start();
+    const token = first.issuePairingToken('u1');
+    const primer = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest' });
+    let session = '';
+    primer.onGrant((g) => { session = g.payload.sessionToken; });
+    await primer.connect();
+    await primer.close();
+    await first.stop(); // hub is now DOWN
+
+    // A session-backed client that has NEVER opened. Before the fix this never
+    // retried (the handshake-phase close returned before scheduleReconnect, which
+    // itself only ran for wasOpen || everOpened).
+    client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session, maxBackoffMs: 300 });
+    const reopened = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5_000);
+      client.onStatus((s) => { if (s === 'open') { clearTimeout(timer); resolve(true); } });
+    });
+    // The first dial fails (hub down); the reconnect loop must keep trying.
+    await client.connect().catch(() => { /* expected: initial dial fails while offline */ });
+
+    // Bring the hub back up on the same port with a store that knows the session.
+    hub = new WsHub({ instance: 'test', port, store: {
+      createSession: async () => { throw new Error('unused'); },
+      verifySession: async (t) => (t === session ? 'u1' : null),
+      revokeUser: async () => {},
+    }});
+    await hub.start();
+
+    expect(await reopened).toBe(true);
+  });
 });

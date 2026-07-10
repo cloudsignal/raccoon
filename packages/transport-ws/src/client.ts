@@ -142,13 +142,21 @@ export class WsClientTransport implements Transport {
         if (AUTH_CLOSE_CODES.has(event.code)) {
           for (const h of this.authHandlers) h(event.code);
         }
+        // Settle the connect() promise on a handshake-phase close, but do NOT
+        // return early: a transient handshake failure must still schedule a
+        // background reconnect. The old early return killed retries, so an
+        // offline-start never reconnected and an established drop got a single try.
         if (!settled) {
           settled = true;
           reject(new Error(`connection closed during handshake (code ${event.code})`));
-          return;
         }
+        // Terminal closes never reconnect: a user-initiated close, or an auth-coded
+        // close (revoked / expired / bad token).
         if (this.closedByUser || AUTH_CLOSE_CODES.has(event.code)) return;
-        if (wasOpen || this.everOpened) this.scheduleReconnect();
+        // Reconnect any resumable connection: one backed by a session token, or one
+        // that opened at least once (includes the initial offline-start attempt). A
+        // never-opened pairing-only attempt does not loop (the pairing UI surfaces it).
+        if (this.opts.session || this.everOpened || wasOpen) this.scheduleReconnect();
       });
 
       ws.addEventListener('error', () => { /* close event follows */ });
