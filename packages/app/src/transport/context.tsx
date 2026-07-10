@@ -247,9 +247,17 @@ export function TransportProvider(props: TransportProviderProps) {
       setStatus(s);
       if (s === 'open') {
         void drain();
-        // Finding 2: catch up history for the active channel if it was opened while closed
+        // Catch up history on every (re)connect: re-request the active channel AND
+        // every already-loaded channel, so agent replies produced server-side while
+        // we were disconnected appear instead of staying absent until a full reload.
+        // The history reducer merges by id, so re-fetching the latest page is
+        // idempotent (already-shown messages are deduped).
         const active = activeRef.current;
-        if (active && !stateRef.current.historyLoaded[active]) requestHistory(active);
+        const channels = new Set<string>(
+          Object.keys(stateRef.current.historyLoaded).filter((c) => stateRef.current.historyLoaded[c]),
+        );
+        if (active) channels.add(active);
+        for (const c of channels) requestHistory(c);
       }
       if (s === 'closed') void outbox.demoteSending();
     });

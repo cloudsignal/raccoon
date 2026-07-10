@@ -81,6 +81,32 @@ describe('TransportProvider', () => {
     expect(api.session).toBeNull();
   });
 
+  it('re-requests history for loaded channels on reconnect so messages missed while offline appear (#10)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    act(() => { api.openChannel('coordinator'); });
+    await waitFor(() => expect(
+      transport.sent.some((e) => e.kind === 'history.request' && e.channel === 'coordinator'),
+    ).toBe(true));
+    act(() => {
+      transport.emit(createEnvelope('history.page', {
+        from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+        payload: { channel: 'coordinator', messages: [] },
+      }));
+    });
+    await waitFor(() => expect(api.state.historyLoaded['coordinator']).toBe(true));
+    const before = transport.sent.filter((e) => e.kind === 'history.request' && e.channel === 'coordinator').length;
+
+    // Simulate a reconnect: drop, then re-open.
+    act(() => { transport.setStatus('closed'); });
+    act(() => { transport.setStatus('open'); });
+
+    await waitFor(() => {
+      const after = transport.sent.filter((e) => e.kind === 'history.request' && e.channel === 'coordinator').length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
   it('sends optimistically, settles on ack', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
