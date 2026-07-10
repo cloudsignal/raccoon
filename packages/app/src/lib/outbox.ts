@@ -63,14 +63,28 @@ export async function enqueue(env: AnyEnvelope): Promise<OutboxEntry> {
   return entry;
 }
 
+/** Oldest-first by createdAt, with id (a ulid — lexicographically
+ *  time-sortable) as an explicit tiebreaker for same-millisecond entries
+ *  (createEnvelope's ts has millisecond resolution, so two envelopes built
+ *  back-to-back can share one). `a.createdAt < b.createdAt ? -1 : 1` alone
+ *  is not a valid comparator for equal timestamps — it returns 1, never 0,
+ *  for a tie, violating Array.prototype.sort's comparator contract. Fixed
+ *  defensively: no observable misordering was pinned down from this
+ *  specifically (small-array V8 sort tolerated it in the cases tried), but
+ *  the invalid contract is worth not relying on. */
+function byCreatedAt(a: OutboxEntry, b: OutboxEntry): number {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 export async function listPending(): Promise<OutboxEntry[]> {
   const all = await getAll();
-  return all.filter((e) => e.status === 'pending').sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  return all.filter((e) => e.status === 'pending').sort(byCreatedAt);
 }
 
 export async function listForChannel(channel: string): Promise<OutboxEntry[]> {
   const all = await getAll();
-  return all.filter((e) => e.channel === channel).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  return all.filter((e) => e.channel === channel).sort(byCreatedAt);
 }
 
 /** Shared get-then-put: reads the entry, computes the next version via
@@ -89,9 +103,17 @@ async function mutate(id: string, update: (entry: OutboxEntry) => OutboxEntry): 
   });
 }
 
-export async function markSending(id: string): Promise<void> {
+/** Returns true if a row was actually claimed (existed and was updated to
+ *  'sending'), false if there was no row to claim (already cleared, e.g. by
+ *  a concurrent wipe). Callers MUST check this before sending: a stale
+ *  drain() snapshot entry whose row has since been cleared must never be
+ *  sent through whatever transport/session happens to be active by the time
+ *  the send is attempted (#R4-3) — the row being gone is the signal that it
+ *  no longer belongs to the current identity. */
+export async function markSending(id: string): Promise<boolean> {
   const entry = await mutate(id, (entry) => ({ ...entry, attempts: entry.attempts + 1, status: 'sending' }));
   if (entry) notify(entry.channel);
+  return entry !== undefined;
 }
 
 /** Returns the entry's resulting status ('failed' once MAX_ATTEMPTS is

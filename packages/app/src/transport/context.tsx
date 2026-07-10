@@ -129,6 +129,34 @@ export function TransportProvider(props: TransportProviderProps) {
   // are not missed.
   const drainLockRef = useRef(false);
   const drainPendingRef = useRef(false);
+  // R4-3: bumped SYNCHRONOUSLY (before any await) on every identity
+  // transition — wipe/unpair AND successful (re-)pairing — see unpair(),
+  // the auth-error handler, loadSession's success path, and
+  // pairWithPayload below. sendEnvelope captures this at call time and
+  // re-checks it once its enqueue() write commits: if it changed in
+  // between, the identity that queued the message is being (or has been)
+  // torn down, so the row is dropped instead of surviving into whatever
+  // session/transport is active by the time a drain() would otherwise pick
+  // it up. wipeLocal/clearAll alone were not enough — they race the SAME
+  // wipe's own async completion, not a synchronous signal available to code
+  // that runs mid-wipe. Deferred React-state updates that finalize a wipe
+  // (setSession(null) etc.) also compare against a generation captured at
+  // their start, so a since-superseded wipe (a newer wipe, or a newer
+  // successful pairing) skips applying its now-stale transition — the
+  // TOCTOU the original (pre-R4-3) deferral existed to avoid.
+  const sessionGenRef = useRef(0);
+  // R4-3: the userId sendMessage/respondApproval are currently allowed to
+  // send as. A DEDICATED ref, deliberately NOT sessionRef (which is
+  // resynced from `session` STATE on every render — synchronously nulling
+  // sessionRef.current mid-wipe would just get overwritten back to the
+  // stale value by that resync on the next incidental re-render, since
+  // `session` state itself hasn't caught up yet). Nulled synchronously at
+  // wipe-start, set synchronously at session-establish — this is what
+  // actually closes "identity usable until asynchronous cleanup completes":
+  // sendMessage/respondApproval check THIS, not sessionRef.current, so a
+  // call made from the instant the wipe decision is made onward is rejected
+  // outright, before it ever reaches outbox.enqueue().
+  const validUserIdRef = useRef<string | null>(null);
   const ackTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const [activeChannel, setActiveChannel] = useState<string | null>(null);
   // Finding 1: track unsubscribe functions so we can clean them up before re-wiring
@@ -172,7 +200,16 @@ export function TransportProvider(props: TransportProviderProps) {
   const attempt = useCallback(async (entry: outbox.OutboxEntry) => {
     const transport = transportRef.current;
     if (!transport) return;
-    await outbox.markSending(entry.id);
+    // R4-3: drain() iterates a SNAPSHOT of listPending() taken at its start.
+    // If a wipe (unpair/auth-error) clears the outbox WHILE that snapshot is
+    // still being processed, a later entry in it no longer has a row —
+    // markSending() returns false. transportRef.current, meanwhile, may
+    // already point at a DIFFERENT identity's freshly-wired transport (a
+    // re-pair can complete in the same window). Without this check, a stale
+    // entry was sent through whatever transport happened to be active,
+    // reaching the wrong user's session with the wrong user's content.
+    const claimed = await outbox.markSending(entry.id);
+    if (!claimed) return;
     try {
       await transport.send(entry.env);
       // msg and approval.response both get a server ack (bridge.ts) and so both
@@ -295,6 +332,19 @@ export function TransportProvider(props: TransportProviderProps) {
         // just surface the error string and leave phase as 'ready'.
         setAuthError('Authentication error. The host is attempting to reconnect.');
       } else {
+        // R4-3: bump AND null validUserIdRef synchronously, FIRST, before
+        // anything else — see their declaration comments. This handler fires
+        // from a transport event, entirely async-independent from any
+        // in-flight sendEnvelope()/sendMessage() call, so both must happen
+        // before the push-unsubscribe await below to close the window as
+        // early as possible: sendMessage/respondApproval check
+        // validUserIdRef and no-op when it's null, so this alone rejects any
+        // send attempt from this instant onward — "leaves A's identity
+        // usable until asynchronous cleanup completes" is exactly the gap
+        // this closes. myGen is captured for the deferred state updates below.
+        sessionGenRef.current += 1;
+        const myGen = sessionGenRef.current;
+        validUserIdRef.current = null;
         // Default (standalone) path: terminal unpair. Fully wipe local identity
         // state (session, read markers, push flag, queued outbox) and reset chat
         // state so a re-pair as a different user cannot inherit it, then drop back
@@ -309,11 +359,17 @@ export function TransportProvider(props: TransportProviderProps) {
         // store already prunes on).
         void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
 
-        // Defer the transition until the wipe settles: nulling the session and
-        // dropping to setup only after wipeLocal() completes closes a TOCTOU where a
-        // re-pair racing the async wipe could have its freshly-saved session cleared.
+        // The REACT-STATE side of the transition (setSession/setPhase/etc.)
+        // still defers until the wipe settles — but now guarded by the
+        // generation captured above, not by "is this the only in-flight
+        // wipe": if a newer wipe OR a newer successful pairing has already
+        // bumped sessionGenRef past myGen by the time this resolves, skip —
+        // applying it now would clobber a state transition that has already
+        // superseded this one (the original TOCTOU this deferral pattern was
+        // written to avoid: "a re-pair racing the async wipe could have its
+        // freshly-saved session cleared").
         void wipeAndReset().finally(() => {
-          sessionRef.current = null;
+          if (sessionGenRef.current !== myGen) return;
           setSession(null);
           // R2-10: unpair() already clears this; the auth-error path did not,
           // so a stale activeChannel (and the URL's ?c= param, via ChatScreen)
@@ -339,7 +395,9 @@ export function TransportProvider(props: TransportProviderProps) {
       // (delivered asynchronously) but sessionRef.current is authoritative for all
       // imperative code paths (sendMessage, respondApproval, requestHistory).
       if (props.sessionOverride) {
+        sessionGenRef.current += 1;
         sessionRef.current = props.sessionOverride;
+        validUserIdRef.current = props.sessionOverride.userId;
         setSession(props.sessionOverride);
       }
       const override = props.transportOverride;
@@ -370,7 +428,12 @@ export function TransportProvider(props: TransportProviderProps) {
       if (!loaded) { setPhase('setup'); return; }
       // Update the ref immediately so callbacks (sendMessage etc.) can use the
       // session before the setSession re-render fires through the scheduler.
+      // Bumps sessionGenRef too (a real identity transition — see its
+      // declaration comment), so a since-superseded wipe's deferred state
+      // update correctly detects it should no longer apply.
+      sessionGenRef.current += 1;
       sessionRef.current = loaded;
+      validUserIdRef.current = loaded.userId;
       setSession(loaded);
       // R3-8: see the matching comment in the transportOverride branch above —
       // must complete before wireTransport so the boot drain() can't miss rows
@@ -416,6 +479,13 @@ export function TransportProvider(props: TransportProviderProps) {
     wireTransport(transport);
     await transport.connect();
     const next = await granted;
+    // Set the ref synchronously (see loadSession's matching comment) and
+    // bump sessionGenRef — a real identity transition, needed so a
+    // since-superseded wipe's deferred state update (see the auth-error
+    // handler / unpair()) correctly detects it should no longer apply.
+    sessionGenRef.current += 1;
+    sessionRef.current = next;
+    validUserIdRef.current = next.userId;
     setSession(next);
     setPhase('ready');
     void saveSession(next); // persist async; state is already updated
@@ -436,13 +506,24 @@ export function TransportProvider(props: TransportProviderProps) {
     // tx has committed (entry not listed) → enqueue tx commits → .then fires
     // but sees stale 'closed' in statusRef → entry is orphaned until the next
     // reconnect.
+    //
+    // R4-3: capture the session generation now; if a wipe/unpair bumps it
+    // before this enqueue's IDB write commits, the row was written under an
+    // identity that is being (or has been) torn down — settle it away
+    // instead of ever letting drain() see it as pending, so it can never be
+    // sent through a different session's transport.
+    const gen = sessionGenRef.current;
     void outbox.enqueue(env).then(() => {
+      if (sessionGenRef.current !== gen) { void outbox.settle(env.id); return; }
       if (statusNowRef.current === 'open') void drain();
     });
   }, [drain]);
 
   const sendMessage = useCallback((channel: string, text: string) => {
-    const userId = sessionRef.current?.userId;
+    // R4-3: validUserIdRef, not sessionRef — see its declaration comment.
+    // Nulled synchronously the instant a wipe/unpair decision is made, so a
+    // send attempt from that point onward is rejected outright.
+    const userId = validUserIdRef.current;
     if (!userId) return;
     const env = createEnvelope('msg', {
       from: userAddress(userId), to: agentAddress(channel), channel, payload: { text },
@@ -455,7 +536,8 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [sendEnvelope]);
 
   const respondApproval = useCallback((channel: string, refId: string, choice: string, editedText?: string) => {
-    const userId = sessionRef.current?.userId;
+    // R4-3: see sendMessage's matching comment.
+    const userId = validUserIdRef.current;
     if (!userId) return;
     const env = createEnvelope('approval.response', {
       from: userAddress(userId), to: agentAddress(channel), channel,
@@ -527,6 +609,13 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [props.pushRegistrarOverride]);
 
   const unpair = useCallback(async () => {
+    // R4-3: bump FIRST, synchronously, before any await — see sessionGenRef's
+    // declaration comment. Any sendEnvelope() call whose enqueue() commits
+    // after this point (no matter how the wipe's own async work interleaves)
+    // observes the new generation and drops its row instead of leaving it to
+    // be picked up by a later drain() under a different identity.
+    sessionGenRef.current += 1;
+    const myGen = sessionGenRef.current;
     // Tear down THIS device's push registration before closing the transport
     // (still need the connection + userId for the server-side unsubscribe).
     // Without this, only local app state was ever wiped: the server-side
@@ -535,8 +624,15 @@ export function TransportProvider(props: TransportProviderProps) {
     // notifications (message bodies included) after pairing as someone else,
     // until the next 404/410-based prune (or indefinitely, if that never
     // happened). Best-effort: unpair proceeds regardless of outcome.
+    //
+    // Captured into locals BEFORE nulling validUserIdRef below — every
+    // further use in this function reads these locals, never the ref, so
+    // nulling it immediately (rather than only at the very end) closes the
+    // window where a concurrent sendMessage()/respondApproval() call would
+    // still see this (now-terminating) identity as valid.
     const userId = sessionRef.current?.userId;
     const transport = transportRef.current;
+    validUserIdRef.current = null;
     if (props.pushRegistrarOverride) {
       await props.pushRegistrarOverride.disable?.().catch(() => { /* best-effort */ });
     } else if (userId && transport) {
@@ -555,7 +651,9 @@ export function TransportProvider(props: TransportProviderProps) {
     await transportRef.current?.close();
     transportRef.current = null;
     await wipeAndReset();
-    sessionRef.current = null;
+    // Guarded the same way as the auth-error path: skip if a newer wipe or a
+    // newer successful pairing has already superseded this one.
+    if (sessionGenRef.current !== myGen) return;
     setSession(null);
     setActiveChannel(null);
     setPhase('setup');

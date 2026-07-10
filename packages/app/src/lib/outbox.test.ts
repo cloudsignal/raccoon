@@ -20,6 +20,17 @@ describe('outbox', () => {
     expect(pending[0]!.channel).toBe('coordinator');
   });
 
+  it('listPending falls back to id when two entries share the same createdAt, and does not throw', async () => {
+    // See outbox.ts's byCreatedAt comment: the old comparator violated
+    // Array.prototype.sort's contract for a tie (returned 1, never 0). No
+    // observable misordering was pinned down from this specifically, but
+    // exercise the tie path so it stays well-defined going forward.
+    const first = await outbox.enqueue({ ...msg('first, lower id'), id: 'a-lower' });
+    await outbox.enqueue({ ...msg('second, higher id'), id: 'b-higher', ts: first.createdAt });
+    const pending = await outbox.listPending();
+    expect(pending.map((e) => e.id)).toEqual(['a-lower', 'b-higher']);
+  });
+
   it('settle deletes on ack', async () => {
     const e = await outbox.enqueue(msg('x'));
     await outbox.settle(e.id);

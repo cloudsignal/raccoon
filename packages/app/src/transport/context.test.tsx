@@ -149,6 +149,84 @@ describe('TransportProvider', () => {
     });
   });
 
+  it('a stale drain snapshot entry cleared mid-drain is never sent (#R4-3, Part A)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+
+    const env1 = createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'first' },
+    });
+    await outbox.enqueue(env1);
+    await new Promise((r) => setTimeout(r, 2)); // force env2's ts to sort strictly after env1's
+    const env2 = createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'SECOND must never be sent' },
+    });
+    await outbox.enqueue(env2);
+
+    // Gate env1's send so the test can deterministically control exactly
+    // when the wipe lands relative to drain()'s progress — no reliance on
+    // incidental timing (flaky under parallel test-suite load; a fixed
+    // setTimeout margin was not always enough for attempt(env2) to have run
+    // by the time the assertion below fired).
+    const gate: { release?: () => void } = {};
+    const originalSend = transport.send.bind(transport);
+    transport.send = async (env) => {
+      if (env.id === env1.id) await new Promise<void>((resolve) => { gate.release = resolve; });
+      return originalSend(env);
+    };
+
+    // Re-trigger drain() via the 'open' status event (both entries are
+    // 'pending' in the outbox already).
+    act(() => { transport.setStatus('open'); });
+
+    // Wait until drain() has claimed env1 (moved it to 'sending') and is now
+    // blocked on the gated send — i.e. it has NOT yet reached env2.
+    await waitFor(async () => {
+      const entries = await outbox.listForChannel('coordinator');
+      expect(entries.find((e) => e.id === env1.id)?.status).toBe('sending');
+    });
+
+    // Now simulate the wipe: clear the whole outbox — including env2's still
+    // 'pending' row — while drain() is blocked mid-attempt(env1).
+    await outbox.clearAll();
+
+    // Release: attempt(env1)'s send completes, THEN drain()'s loop proceeds
+    // to env2.
+    gate.release?.();
+    await waitFor(() => expect(transport.sent.some((e) => e.id === env1.id)).toBe(true));
+
+    // env2's row was cleared before drain() reached it: markSending() must
+    // report "no row" and attempt() must bail — never calling transport.send
+    // for it, regardless of which transport/session is active by then.
+    await new Promise((r) => setTimeout(r, 20)); // let the drain loop finish processing env2
+    expect(transport.sent.some((e) => e.id === env2.id)).toBe(false);
+    expect(await outbox.listPending()).toEqual([]);
+  });
+
+  it('a send whose enqueue commits after a wipe decision is dropped, not left for a later drain under a different identity (#R4-3, Part B)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+
+    // sendMessage's own outbox.enqueue() IDB write is started here but — being
+    // genuinely async — cannot complete before control returns from this
+    // synchronous act() callback.
+    act(() => { api.sendMessage('coordinator', 'stale — queued right as unpair happens'); });
+
+    // Started IMMEDIATELY after, with no intervening await/yield: unpair()'s
+    // FIRST statement (the synchronous session-generation bump) runs before
+    // the just-started enqueue's IDB callback has any chance to fire — a
+    // realistic stand-in for "a user action races a server-driven
+    // auth-error/unpair decision".
+    await act(async () => { await api.unpair(); });
+
+    await new Promise((r) => setTimeout(r, 20)); // let the stale enqueue's .then() run, if it hadn't already
+
+    // The row must not survive the wipe it raced: settled away rather than
+    // left pending for a future session's drain() to pick up and send.
+    expect(await outbox.listPending()).toEqual([]);
+    expect(transport.sent).toHaveLength(0);
+  });
+
   it('sends optimistically, settles on ack', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
