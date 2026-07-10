@@ -58,6 +58,7 @@ function makeEntry(hub: OutboundHub, channel: string): RunningAccount {
     channel,
     instanceUrl: 'ws://127.0.0.1:8790/',
     stop: async () => {},
+    revoke: async () => {}, // not exercised by this suite (outbound delivery only)
   };
 }
 

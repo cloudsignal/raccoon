@@ -28,7 +28,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AgentRunner } from '@raccoon/bridge';
-import { issuePairing, revokePairing, type PairingHub } from '@raccoon/pairing';
+import { issuePairing, type PairingHub } from '@raccoon/pairing';
 import type {
   ChannelGatewayContext,
   ChannelOutboundAdapter,
@@ -55,6 +55,16 @@ export interface RunningAccount {
   instanceUrl: string;
   /** Tears down the hub + bridge. */
   stop: () => Promise<void>;
+  /**
+   * The channel's own revoke (createRaccoonChannel's — plugin.ts), which
+   * also clears the user's push subscriptions through the serialized
+   * per-user chain (#R4-5). Both raccoonPairDeps.revoke() and
+   * makeRaccoonRevokeHandler call THIS, not revokePairing(entry.hub, ...)
+   * directly — a direct call bypasses that cleanup entirely, since the
+   * SubscriptionStore/serialization queue live only inside the channel's
+   * own closure, unreachable from the registry entry any other way.
+   */
+  revoke: RaccoonAgentChannel['revoke'];
 }
 
 /** Injectable factory + gate for startAccount (tests inject fakes). */
@@ -73,7 +83,7 @@ export interface StartAccountDeps {
     buildId?: string;
     staticDir?: string;
     vapid?: { publicKey: string; privateKey: string; subject: string };
-  }) => Pick<RaccoonAgentChannel, 'hub' | 'start' | 'stop'>;
+  }) => Pick<RaccoonAgentChannel, 'hub' | 'start' | 'stop' | 'revoke'>;
   /**
    * Optional allowlist gate applied to the inbound runner. When it returns
    * false for a userId, the agent is not invoked and no reply is produced.
@@ -218,6 +228,7 @@ async function doStart(
     channel: channelName,
     instanceUrl: account.instanceUrl,
     stop: () => channel.stop(),
+    revoke: (userId: string) => channel.revoke(userId),
   };
   running.set(accountId, entry);
   ctx.log?.info(`raccoon: account "${accountId}" started (channel ${channelName})`);
@@ -344,7 +355,9 @@ export function raccoonPairDeps(_cfg: OpenClawConfig, accountId = 'default'): Ra
     },
     async revoke(userId: string) {
       const entry = requireRunning();
-      await revokePairing(entry.hub as unknown as PairingHub, userId);
+      // R4-5: entry.revoke (the channel's own), not revokePairing(entry.hub,
+      // ...) directly — the latter skips push-subscription cleanup entirely.
+      await entry.revoke(userId);
     },
   };
 }
@@ -504,7 +517,9 @@ export function makeRaccoonRevokeHandler(
       });
     }
     try {
-      await revokePairing(entry.hub as unknown as PairingHub, userId);
+      // R4-5: entry.revoke (the channel's own), not revokePairing(entry.hub,
+      // ...) directly — the latter skips push-subscription cleanup entirely.
+      await entry.revoke(userId);
     } catch (err) {
       console.error('[raccoon] revokePairing failed:', err);
       return sendJson(res, 500, { error: { message: 'pairing failed', type: 'internal' } });

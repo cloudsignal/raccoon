@@ -1,7 +1,7 @@
 import { WsHub } from '@raccoon/transport-ws';
 import { InMemoryMessageStore, RaccoonBridge, type AgentRunner } from '@raccoon/bridge';
 import { issuePairing, revokePairing } from '@raccoon/pairing';
-import { InMemorySubscriptionStore, VapidPushSender, withPushFallback, type SubscriptionStore } from '@raccoon/push';
+import { InMemorySubscriptionStore, VapidPushSender, withPushFallback } from '@raccoon/push';
 
 export interface RaccoonChannelOptions {
   instance: string;
@@ -49,15 +49,17 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
 
   let stopPush: (() => void) | null = null;
   let bridgeHub: Pick<WsHub, 'sendToUser' | 'onEnvelope'> = hub;
-  let subscriptionStore: SubscriptionStore | null = null;
+  let clearPushForUser: ((userId: string) => Promise<void>) | null = null;
   if (opts.vapid) {
-    subscriptionStore = new InMemorySubscriptionStore();
     const wrapped = withPushFallback(hub, {
-      store: subscriptionStore,
+      store: new InMemorySubscriptionStore(),
       sender: new VapidPushSender(opts.vapid),
     });
     bridgeHub = wrapped.hub;
     stopPush = wrapped.stop;
+    // R4-5: clearForUser (not a direct store.clear() call) — see its
+    // doc comment in fallback.ts for why the serialization matters.
+    clearPushForUser = wrapped.clearForUser;
   }
 
   const bridge = new RaccoonBridge({ hub: bridgeHub, runner: opts.runner, store: new InMemoryMessageStore() });
@@ -87,7 +89,7 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
     // live sockets are gone.
     revoke: async (userId: string) => {
       await revokePairing(hub, userId);
-      await subscriptionStore?.clear(userId);
+      await clearPushForUser?.(userId);
     },
     buildId: opts.buildId ?? 'dev',
   };

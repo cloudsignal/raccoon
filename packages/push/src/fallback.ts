@@ -20,7 +20,7 @@ function defaultNotify(env: AnyEnvelope): PushPayload | null {
 export function withPushFallback(
   hub: PushCapableHub,
   opts: { store: SubscriptionStore; sender: PushSender; notify?: (env: AnyEnvelope) => PushPayload | null },
-): { hub: PushCapableHub; stop(): void } {
+): { hub: PushCapableHub; stop(): void; clearForUser(userId: string): Promise<void> } {
   const notify = opts.notify ?? defaultNotify;
 
   const pushOut = (userId: string, payload: PushPayload): void => {
@@ -70,11 +70,12 @@ export function withPushFallback(
   // interleaving, matching the atomicity the cap-check already relied on for
   // concurrent subscribes.
   const opChains = new Map<string, Promise<void>>();
-  const enqueue = (userId: string, op: () => Promise<void>): void => {
+  const enqueue = (userId: string, op: () => Promise<void>): Promise<void> => {
     const prev = opChains.get(userId) ?? Promise.resolve();
     const next = prev.then(op).catch(() => { /* best-effort */ });
     opChains.set(userId, next);
     void next.finally(() => { if (opChains.get(userId) === next) opChains.delete(userId); });
+    return next;
   };
 
   const stopCapture = hub.onEnvelope((env, userId) => {
@@ -96,5 +97,16 @@ export function withPushFallback(
     /** Stops capturing new push.subscribe registrations. Handlers already
      *  registered via the wrapped hub remain attached to the inner hub. */
     stop: stopCapture,
+    /**
+     * Clear all of a user's subscriptions through the SAME per-user FIFO
+     * chain subscribe/unsubscribe use (#R4-5) — not an unserialized side
+     * call. Without this, an in-flight subscribe already past its
+     * list()/cap-check snapshot (about to call store.add()) could land
+     * AFTER an unserialized clear() and resurrect a subscription for a
+     * user whose revocation was meant to remove it — reproduced by
+     * blocking add(), completing revoke, then releasing add(), which left
+     * one subscription behind.
+     */
+    clearForUser: (userId: string) => enqueue(userId, () => opts.store.clear(userId)),
   };
 }

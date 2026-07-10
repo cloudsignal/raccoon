@@ -43,6 +43,7 @@ const {
 } = await import('./gateway.js');
 
 import { EventEmitter } from 'node:events';
+import { revokePairing } from '@raccoon/pairing';
 import type { RaccoonResolvedAccount } from './channel-plugin.js';
 import type { RunningAccount, StartAccountDeps } from './gateway.js';
 
@@ -283,6 +284,8 @@ describe('raccoonPairDeps', () => {
         hub: hub as any,
         start: vi.fn(async () => ({ port: 8790 })),
         stop: vi.fn(async () => {}),
+        // Mirrors createRaccoonChannel's real revoke (plugin.ts).
+        revoke: (userId: string) => revokePairing(hub as any, userId),
       };
     });
     await startAccount(makeCtx(account), { createChannel: factory });
@@ -320,6 +323,26 @@ describe('raccoonPairDeps', () => {
   it('pair throws a clear error when no account is running', async () => {
     const deps = raccoonPairDeps(fakeCfg);
     await expect(deps.pair('alice')).rejects.toThrow(/no running raccoon account/i);
+  });
+
+  it('revoke calls the CHANNEL\'s own revoke (not a bare hub-level revokePairing) so push cleanup is not skipped (#R4-5)', async () => {
+    // A revoke that only touches the hub (revokeUser) — mirroring the OLD,
+    // buggy call site (revokePairing(entry.hub, userId) directly) — would
+    // never invoke this spy, since createRaccoonChannel's real revoke also
+    // clears push subscriptions, a step entirely outside the hub object.
+    const channelRevoke = vi.fn(async () => {});
+    const factory = vi.fn(() => ({
+      hub: { issuePairingToken: () => 't', revokeUser: async () => {} } as any,
+      start: vi.fn(async () => ({ port: 8790 })),
+      stop: vi.fn(async () => {}),
+      revoke: channelRevoke,
+    }));
+    await startAccount(makeCtx(makeAccount()), { createChannel: factory });
+
+    const deps = raccoonPairDeps(fakeCfg);
+    await deps.revoke('bob');
+
+    expect(channelRevoke).toHaveBeenCalledWith('bob');
   });
 });
 
@@ -369,7 +392,13 @@ function fakePairHub() {
 }
 
 function runningEntry(hub: RunningAccount['hub']): RunningAccount {
-  return { hub, channel: 'coordinator', instanceUrl: 'ws://127.0.0.1:8790/', stop: async () => {} };
+  return {
+    hub, channel: 'coordinator', instanceUrl: 'ws://127.0.0.1:8790/', stop: async () => {},
+    // Mirrors createRaccoonChannel's real revoke (plugin.ts): revokePairing
+    // against the hub. These fakes have no push store, so there's nothing
+    // else to clear — the point of these tests is the hub-level revocation.
+    revoke: (userId: string) => revokePairing(hub as unknown as Parameters<typeof revokePairing>[0], userId),
+  };
 }
 
 describe('makeRaccoonPairHandler (POST /raccoon/pair)', () => {
@@ -472,5 +501,20 @@ describe('makeRaccoonRevokeHandler (POST /raccoon/revoke)', () => {
     expect(status).toBe(500);
     expect((body as any).error).toEqual({ message: 'pairing failed', type: 'internal' });
     expect(JSON.stringify(body)).not.toMatch(/revoke-boom-internal/);
+  });
+
+  it('calls the CHANNEL\'s own revoke (not a bare hub-level revokePairing) so push cleanup is not skipped (#R4-5)', async () => {
+    const channelRevoke = vi.fn(async () => {});
+    const entry: RunningAccount = {
+      hub: { issuePairingToken: () => 't', revokeUser: async () => {} } as any,
+      channel: 'coordinator',
+      instanceUrl: 'ws://127.0.0.1:8790/',
+      stop: async () => {},
+      revoke: channelRevoke,
+    };
+    const handler = makeRaccoonRevokeHandler(() => entry);
+    const { res } = fakeRes();
+    await handler(fakeReq('POST', JSON.stringify({ userId: 'bob' })), res);
+    expect(channelRevoke).toHaveBeenCalledWith('bob');
   });
 });

@@ -166,6 +166,48 @@ describe('withPushFallback', () => {
     expect(await originalList('u1')).toHaveLength(0);
   });
 
+  it('clearForUser (revoke) is serialized after an in-flight subscribe, not left resurrected (#R4-5)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/1';
+
+    // Gate store.list() so the subscribe's list -> cap-check -> add sequence
+    // stays in flight while revoke's clearForUser() races it. Without
+    // serialization, clearForUser's store.clear() (which doesn't depend on
+    // list()) could complete BEFORE the gated subscribe's add() runs,
+    // leaving one subscription behind for a user who was just revoked —
+    // reproduced by blocking add(), completing revoke, then releasing add().
+    const gate: { release?: () => void } = {};
+    const originalList = store.list.bind(store);
+    let listCalls = 0;
+    store.list = async (userId: string) => {
+      listCalls += 1;
+      if (listCalls === 1) await new Promise<void>((resolve) => { gate.release = resolve; });
+      return originalList(userId);
+    };
+
+    const { clearForUser } = withPushFallback(inner, { store, sender: new FakeSender() });
+
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system', payload: { subscription: sub(endpoint) },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 10)); // let the subscribe reach the gated list() call
+    expect(listCalls).toBe(1); // sanity: the gate actually engaged
+
+    const revoked = clearForUser('u1'); // races the in-flight subscribe
+    await new Promise((r) => setTimeout(r, 10)); // clear must NOT run yet — queued behind the subscribe
+    expect(await originalList('u1')).toHaveLength(0); // store.add() hasn't landed yet either
+
+    gate.release?.();
+    await revoked;
+    await new Promise((r) => setTimeout(r, 20)); // let the (now-unblocked) subscribe's own add() land, if it hasn't already
+
+    // clearForUser was the later-arriving op: once properly serialized, it
+    // runs AFTER the subscribe's add() completes, so the user ends up with
+    // ZERO subscriptions — not one resurrected by the race.
+    expect(await originalList('u1')).toHaveLength(0);
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();
