@@ -138,11 +138,11 @@ envelopes, one per chunk, order preserved:
    container's `~/.openclaw`). It needs THREE files:
    - `index.js` (the bundle)
    - `package.json` (`"openclaw": { "extensions": ["./index.js"] }`)
-   - `openclaw.plugin.json`: REQUIRED by current OpenClaw. `configSchema`
-     mirrors `raccoonChannelPlugin.configSchema.schema` (port / instanceUrl /
-     channels / instance / staticDir; `additionalProperties: true` so the
-     allowFrom / dmPolicy fields the security + setup adapters read pass
-     through):
+   - `openclaw.plugin.json`: REQUIRED by current OpenClaw. Copy the one shipped
+     at `adapters/openclaw/openclaw.plugin.json`; its `configSchema` mirrors
+     `raccoonChannelPlugin.configSchema.schema` (port / instanceUrl / channels /
+     instance / staticDir; `additionalProperties: true` so the allowFrom /
+     dmPolicy fields the security + setup adapters read pass through):
 
      ```json
      { "id": "raccoon", "activation": { "onStartup": true },

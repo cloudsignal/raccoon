@@ -34,4 +34,11 @@ branding config, update architecture, and push setup.
 | `@raccoon/transport-ws` | Built-in WebSocket hub (`WsHub`) |
 | `@raccoon/bridge` | Agent framework adapters (OpenClaw, NanoClaw) |
 | `@raccoon/push` | VAPID key generation, Web Push delivery, subscription store |
+| `@raccoon/transport-mqtt` | MQTT transport (any broker, pluggable codec) |
+| `@raccoon/transport-cloudsignal` | CloudSignal transport (identity-secured, managed push) |
 | `@raccoon/app` | Installable push-capable chat PWA (static build) |
+| `adapters/openclaw` | OpenClaw channel-native plugin |
+
+Packages are consumed from the workspace (clone and build, as under "Try it");
+they are not yet published to npm, so `main` points at TypeScript source. npm
+publishing with compiled outputs lands in a later release.
