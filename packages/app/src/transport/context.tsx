@@ -176,6 +176,13 @@ export function TransportProvider(props: TransportProviderProps) {
   // call made from the instant the wipe decision is made onward is rejected
   // outright, before it ever reaches outbox.enqueue().
   const validUserIdRef = useRef<string | null>(null);
+  // #R6-3: the FULL identity scope (`<instanceUrl>::<user address>`) this
+  // tab is currently allowed to send as — stamped onto every outbox row at
+  // enqueue and required verbatim by the claim CAS. userId alone is not an
+  // identity: user ids are instance-local, so a stale row queued against
+  // instance A's u1 must never transmit through instance B's u1 session.
+  // Managed in lockstep with validUserIdRef at every identity transition.
+  const identityScopeRef = useRef<string | null>(null);
   const ackTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const [activeChannel, setActiveChannel] = useState<string | null>(null);
   // Finding 1: track unsubscribe functions so we can clean them up before re-wiring
@@ -226,14 +233,15 @@ export function TransportProvider(props: TransportProviderProps) {
   const attempt = useCallback(async (entry: outbox.OutboxEntry) => {
     const transport = transportRef.current;
     if (!transport) return;
-    // R5-3: the identity this tab is CURRENTLY allowed to send as. Rows are
-    // shared per-origin across tabs, so a row written by a stale tab still
-    // running a since-wiped identity can appear in this tab's listPending()
-    // snapshot. The claim below is scoped to this identity inside the same
-    // atomic transaction — a row whose envelope was written as anyone else
-    // is never claimed, and therefore never transmitted, by this tab.
-    const from = validUserIdRef.current ? userAddress(validUserIdRef.current) : null;
-    if (!from) return;
+    // R5-3/R6-3: the identity scope this tab is CURRENTLY allowed to send
+    // as. Rows are shared per-origin across tabs, so a row written by a
+    // stale tab (a since-wiped identity, or the same userId against a
+    // DIFFERENT instance) can appear in this tab's listPending() snapshot.
+    // The claim below requires this exact scope inside the same atomic
+    // transaction — such a row is never claimed, and therefore never
+    // transmitted, by this tab.
+    const scope = identityScopeRef.current;
+    if (!scope) return;
     // R4-3: drain() iterates a SNAPSHOT of listPending() taken at its start.
     // If a wipe (unpair/auth-error) clears the outbox WHILE that snapshot is
     // still being processed, a later entry in it no longer has a row —
@@ -257,7 +265,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // background-throttled past its lease and the row is re-claimed
     // elsewhere, their delayed writes no-op instead of clobbering the newer
     // owner's in-flight send.
-    const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, from);
+    const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, scope);
     if (!claimToken) return;
     try {
       await transport.send(entry.env);
@@ -272,8 +280,12 @@ export function TransportProvider(props: TransportProviderProps) {
         if (prior) clearTimeout(prior);
         const timer = setTimeout(() => {
           ackTimers.current.delete(entry.id);
-          void outbox.markFailed(entry.id, 'no ack', claimToken);
-          dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
+          // #R6-7: only drive UI state when the token-gated write actually
+          // applied — a stale claim's timeout (row since re-claimed by
+          // another tab) must not mark a live in-flight send failed.
+          void outbox.markFailed(entry.id, 'no ack', claimToken).then((applied) => {
+            if (applied) dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
+          });
         }, ACK_TIMEOUT_MS);
         ackTimers.current.set(entry.id, timer);
       } else {
@@ -307,15 +319,16 @@ export function TransportProvider(props: TransportProviderProps) {
       do {
         drainPendingRef.current = false;
         const pending = await outbox.listPending();
-        // R5-3: attempt()'s identity-scoped claim is the authoritative guard —
-        // it can never transmit a foreign-identity row. This pass additionally
-        // PURGES such rows: with sessions shared per-origin, a row written
-        // under an identity other than the current one can never legitimately
-        // be sent later (that identity's session is gone — the row is debris a
-        // wipe raced past), and leaving it would re-surface it on every drain.
-        const from = validUserIdRef.current ? userAddress(validUserIdRef.current) : null;
+        // R5-3/R6-3: attempt()'s scope-gated claim is the authoritative
+        // guard — it can never transmit a foreign-identity row. This pass
+        // additionally PURGES such rows (including pre-scope legacy rows,
+        // whose scope is undefined): with sessions shared per-origin, a row
+        // written under any other identity scope can never legitimately be
+        // sent later — it is debris a wipe raced past — and leaving it
+        // would re-surface it on every drain.
+        const scope = identityScopeRef.current;
         for (const entry of pending) {
-          if (from && entry.env.from !== from) { await outbox.settle(entry.id); continue; }
+          if (scope && entry.scope !== scope) { await outbox.settle(entry.id); continue; }
           await attempt(entry);
         }
       } while (drainPendingRef.current);
@@ -332,21 +345,31 @@ export function TransportProvider(props: TransportProviderProps) {
   // triggers another look. The sweep reschedules itself until nothing is
   // left to wait on.
   const leaseSweepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const leaseSweepDueRef = useRef<number>(Infinity);
   const sweepLeasesRef = useRef<() => void>(() => {});
+  // #R6-5: single coalescing scheduler — keep whichever pending sweep is
+  // due EARLIEST. Fed from two sources: a sweep's own scan results (a
+  // skipped still-valid foreign lease) and other tabs' claim broadcasts
+  // (see the raccoon-outbox listener in the boot effect), which cover
+  // claims made AFTER this tab's boot/close sweeps already ran.
+  const scheduleSweepAt = useCallback((at: number) => {
+    if (leaseSweepTimerRef.current !== null && leaseSweepDueRef.current <= at) return;
+    if (leaseSweepTimerRef.current !== null) clearTimeout(leaseSweepTimerRef.current);
+    leaseSweepDueRef.current = at;
+    leaseSweepTimerRef.current = setTimeout(() => {
+      leaseSweepTimerRef.current = null;
+      leaseSweepDueRef.current = Infinity;
+      void sweepLeasesRef.current();
+    }, Math.max(at - Date.now(), 0));
+  }, []);
   const sweepLeases = useCallback((): Promise<void> => {
-    if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
     return outbox.demoteSending(tabIdRef.current!).then((nextForeignExpiry) => {
       // Anything requeued only actually retransmits via drain — but never
       // drain over a closed transport (it would burn retry attempts).
       if (statusNowRef.current === 'open') void drain();
-      if (nextForeignExpiry !== null) {
-        leaseSweepTimerRef.current = setTimeout(
-          () => sweepLeasesRef.current(),
-          Math.max(nextForeignExpiry - Date.now(), 0) + 100,
-        );
-      }
+      if (nextForeignExpiry !== null) scheduleSweepAt(nextForeignExpiry + 100);
     });
-  }, [drain]);
+  }, [drain, scheduleSweepAt]);
   sweepLeasesRef.current = sweepLeases;
 
   // Full local-identity wipe, used on unpair and on a terminal auth-error: cancel
@@ -428,11 +451,15 @@ export function TransportProvider(props: TransportProviderProps) {
         // this closes. myGen is captured for the deferred state updates below.
         sessionGenRef.current += 1;
         const myGen = sessionGenRef.current;
+        const wiped = sessionRef.current;
         validUserIdRef.current = null;
+        identityScopeRef.current = null;
         // R5-3: tell every OTHER open tab this identity is gone, so none of
         // them keeps enqueueing/acting as it (their in-memory refs are their
-        // own — the IDB wipe below alone would never reach them).
-        bcRef.current?.postMessage({ type: 'identity-wiped' });
+        // own — the IDB wipe below alone would never reach them). Scoped to
+        // the exact identity (#R6-8) so a delayed event can't log out an
+        // unrelated newer session.
+        if (wiped) bcRef.current?.postMessage({ type: 'identity-wiped', url: wiped.url, userId: wiped.userId });
         // Default (standalone) path: terminal unpair. Fully wipe local identity
         // state (session, read markers, push flag, queued outbox) and reset chat
         // state so a re-pair as a different user cannot inherit it, then drop back
@@ -474,6 +501,32 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [drain, handleEnvelope, requestHistory, wipeAndReset, sweepLeases]);
 
   useEffect(() => {
+    // #R6-5: recovery-sweep coordination, in BOTH modes. Boot-time and
+    // close-time sweeps cannot cover a claim made AFTER they ran by a tab
+    // that then crashes — on a stable connection nothing would ever sweep
+    // again, leaving that row 'sending' forever. Every markSending()
+    // broadcasts its lease expiry on 'raccoon-outbox'; schedule a sweep for
+    // that moment. Without BroadcastChannel, fall back to a coarse
+    // SEND_LEASE_MS interval.
+    let outboxBc: BroadcastChannel | null = null;
+    let sweepInterval: ReturnType<typeof setInterval> | null = null;
+    if (typeof BroadcastChannel !== 'undefined') {
+      outboxBc = new BroadcastChannel('raccoon-outbox');
+      outboxBc.addEventListener('message', (ev) => {
+        const data = (ev as MessageEvent).data as { type?: string; leaseExpiresAt?: number } | undefined;
+        if (data?.type !== 'claimed' || typeof data.leaseExpiresAt !== 'number') return;
+        scheduleSweepAt(data.leaseExpiresAt + 100);
+      });
+    } else {
+      sweepInterval = setInterval(() => { void sweepLeasesRef.current(); }, outbox.SEND_LEASE_MS);
+    }
+    const stopSweepCoordination = (): void => {
+      outboxBc?.close();
+      if (sweepInterval !== null) clearInterval(sweepInterval);
+      if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
+      leaseSweepDueRef.current = Infinity;
+    };
+
     // Host-embedding fast path: a pre-constructed, already-authenticated transport
     // was injected — skip IDB session loading and go straight to ready.
     if (props.transportOverride) {
@@ -486,6 +539,7 @@ export function TransportProvider(props: TransportProviderProps) {
         sessionGenRef.current += 1;
         sessionRef.current = props.sessionOverride;
         validUserIdRef.current = props.sessionOverride.userId;
+        identityScopeRef.current = `${props.sessionOverride.url}::${userAddress(props.sessionOverride.userId)}`;
         setSession(props.sessionOverride);
       }
       const override = props.transportOverride;
@@ -510,7 +564,7 @@ export function TransportProvider(props: TransportProviderProps) {
       });
       return () => {
         overrideCancelled = true;
-        if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
+        stopSweepCoordination();
         for (const unsub of unsubsRef.current) unsub();
         unsubsRef.current = [];
         for (const timer of ackTimers.current.values()) clearTimeout(timer);
@@ -529,12 +583,20 @@ export function TransportProvider(props: TransportProviderProps) {
       const bc = new BroadcastChannel('raccoon-identity');
       bcRef.current = bc;
       bc.addEventListener('message', (ev) => {
-        if (cancelled || (ev as MessageEvent).data?.type !== 'identity-wiped') return;
+        const data = (ev as MessageEvent).data as { type?: string; url?: string; userId?: string } | undefined;
+        if (cancelled || data?.type !== 'identity-wiped') return;
+        // #R6-8: only act when the wiped identity IS this tab's current
+        // identity. A delayed or unrelated event (another instance, another
+        // user — e.g. this tab re-paired as someone new since the event was
+        // posted) must not log the newer session out.
+        const current = sessionRef.current;
+        if (!current || current.url !== data.url || current.userId !== data.userId) return;
         // Same synchronous-first discipline as the auth-error handler: kill
         // the identity before any async work, so in-flight sendMessage /
         // sendEnvelope calls are rejected from this instant on.
         sessionGenRef.current += 1;
         validUserIdRef.current = null;
+        identityScopeRef.current = null;
         for (const timer of ackTimers.current.values()) clearTimeout(timer);
         ackTimers.current.clear();
         for (const unsub of unsubsRef.current) unsub();
@@ -557,8 +619,10 @@ export function TransportProvider(props: TransportProviderProps) {
       // declaration comment), so a since-superseded wipe's deferred state
       // update correctly detects it should no longer apply.
       sessionGenRef.current += 1;
+      const bootGen = sessionGenRef.current;
       sessionRef.current = loaded;
       validUserIdRef.current = loaded.userId;
+      identityScopeRef.current = `${loaded.url}::${userAddress(loaded.userId)}`;
       setSession(loaded);
       // R3-8: see the matching comment in the transportOverride branch above —
       // must complete before wireTransport so the boot drain() can't miss rows
@@ -572,7 +636,12 @@ export function TransportProvider(props: TransportProviderProps) {
       // to close) and will never run again. Without this check, wiring and
       // connecting a transport here would leak it forever: nothing would
       // ever call close() on it.
-      if (cancelled) return;
+      // #R6-4: the generation check catches what `cancelled` cannot — a
+      // cross-tab identity-wiped (or any other identity transition) landing
+      // during that await on a still-mounted provider. Wiring + connecting
+      // the captured `loaded` session here would resurrect an identity that
+      // was just torn down.
+      if (cancelled || sessionGenRef.current !== bootGen) return;
       const transport = makeTransport({ url: loaded.url, session: loaded.sessionToken, device: 'raccoon-app' });
       wireTransport(transport);
       setPhase('ready');
@@ -582,7 +651,7 @@ export function TransportProvider(props: TransportProviderProps) {
       cancelled = true;
       bcRef.current?.close();
       bcRef.current = null;
-      if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
+      stopSweepCoordination();
       // Finding 1: clean up all subscriptions on unmount
       for (const unsub of unsubsRef.current) unsub();
       unsubsRef.current = [];
@@ -623,6 +692,7 @@ export function TransportProvider(props: TransportProviderProps) {
     sessionGenRef.current += 1;
     sessionRef.current = next;
     validUserIdRef.current = next.userId;
+    identityScopeRef.current = `${next.url}::${userAddress(next.userId)}`;
     setSession(next);
     setPhase('ready');
     void saveSession(next); // persist async; state is already updated
@@ -650,7 +720,9 @@ export function TransportProvider(props: TransportProviderProps) {
     // instead of ever letting drain() see it as pending, so it can never be
     // sent through a different session's transport.
     const gen = sessionGenRef.current;
-    void outbox.enqueue(env).then(() => {
+    const scope = identityScopeRef.current;
+    if (!scope) return; // no identity: sendMessage/respondApproval already gate, this is belt-and-braces
+    void outbox.enqueue(env, scope).then(() => {
       if (sessionGenRef.current !== gen) { void outbox.settle(env.id); return; }
       if (statusNowRef.current === 'open') void drain();
     });
@@ -709,7 +781,11 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [requestHistory]);
 
   const retryMessage = useCallback((channel: string, id: string) => {
-    void outbox.retry(id).then(async () => {
+    void outbox.retry(id).then(async (applied) => {
+      // #R6-7: retry() is a failed-only CAS — if the row is gone or another
+      // tab holds a live claim on it, do nothing (no phantom 'pending' UI,
+      // no drain that could double-send).
+      if (!applied) return;
       dispatch({ type: 'delivery', channel, id, delivery: 'pending' });
       await drain();
     });
@@ -753,9 +829,10 @@ export function TransportProvider(props: TransportProviderProps) {
     // be picked up by a later drain() under a different identity.
     sessionGenRef.current += 1;
     const myGen = sessionGenRef.current;
-    // R5-3: tell every OTHER open tab this identity is gone — see the
-    // auth-error handler's matching comment.
-    bcRef.current?.postMessage({ type: 'identity-wiped' });
+    // R5-3/#R6-8: tell every OTHER open tab this exact identity is gone —
+    // see the auth-error handler's matching comment.
+    const wiped = sessionRef.current;
+    if (wiped) bcRef.current?.postMessage({ type: 'identity-wiped', url: wiped.url, userId: wiped.userId });
     // Tear down THIS device's push registration before closing the transport
     // (still need the connection + userId for the server-side unsubscribe).
     // Without this, only local app state was ever wiped: the server-side
@@ -773,6 +850,7 @@ export function TransportProvider(props: TransportProviderProps) {
     const userId = sessionRef.current?.userId;
     const transport = transportRef.current;
     validUserIdRef.current = null;
+    identityScopeRef.current = null;
     if (props.pushRegistrarOverride) {
       await props.pushRegistrarOverride.disable?.().catch(() => { /* best-effort */ });
     } else if (userId && transport) {

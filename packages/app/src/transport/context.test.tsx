@@ -63,7 +63,7 @@ describe('TransportProvider', () => {
     // Seed prior-user local state: a queued outbox entry + a read marker.
     await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'A private draft' },
-    }));
+    }), 'ws://x/::user:u1');
     await kvSet('lastread:coordinator', new Date(0).toISOString());
     expect((await outbox.listPending()).length).toBe(1);
 
@@ -105,14 +105,14 @@ describe('TransportProvider', () => {
     await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
     const stranded = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'stranded' },
-    }));
+    }), 'ws://x/::user:u1');
     // Owned by a DIFFERENT (now-crashed) tab — this boot's fresh tabIdRef
     // cannot match it. #R4-4: demoteSending() only reclaims a row it doesn't
     // own once its lease has expired, so simulate real staleness (rather
     // than a still-possibly-alive claim) by backdating Date.now() for just
     // this one markSending() call, landing leaseExpiresAt safely in the past.
     const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - outbox.SEND_LEASE_MS - 1000);
-    await outbox.markSending(stranded.id, 'crashed-prior-tab', 'user:u1');
+    await outbox.markSending(stranded.id, 'crashed-prior-tab', 'ws://x/::user:u1');
     dateNowSpy.mockRestore();
     expect(await outbox.listPending()).toEqual([]); // excluded from listPending while 'sending'
 
@@ -130,6 +130,76 @@ describe('TransportProvider', () => {
     expect(await outbox.listPending()).toEqual([]); // moved to 'sending' again by the successful attempt
   });
 
+  it('a cross-tab wipe arriving during boot recovery prevents the wiped session from connecting (#R6-4)', async () => {
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+
+    // Park the boot inside its lease-sweep await, deliver identity-wiped
+    // from "another tab" while parked, then release. The boot continuation
+    // previously checked only the unmount flag — not the session generation
+    // the wipe handler bumps — and wired + connected the wiped session.
+    let releaseDemote!: () => void;
+    const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
+    const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; return null; });
+
+    const transport = new FakeTransport();
+    render(
+      <TransportProvider makeTransport={() => transport}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(demoteSpy).toHaveBeenCalled());
+
+    const otherTab = new BroadcastChannel('raccoon-identity');
+    otherTab.postMessage({ type: 'identity-wiped', url: 'ws://x/', userId: 'u1' });
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('setup'));
+    otherTab.close();
+
+    releaseDemote();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(transport.connected).toBe(false);
+    expect(screen.getByTestId('phase').textContent).toBe('setup');
+    demoteSpy.mockRestore();
+  });
+
+  it('an identity-wiped for a DIFFERENT identity does not log this tab out (#R6-8)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport); // u1 @ ws://x/
+
+    // A delayed/unrelated wipe event — different user, and separately a
+    // different instance URL — must not tear down this session.
+    const otherTab = new BroadcastChannel('raccoon-identity');
+    otherTab.postMessage({ type: 'identity-wiped', url: 'ws://x/', userId: 'someone-else' });
+    otherTab.postMessage({ type: 'identity-wiped', url: 'wss://another-instance/', userId: 'u1' });
+    await new Promise((r) => setTimeout(r, 30));
+    otherTab.close();
+
+    expect(api.phase).toBe('ready');
+    expect(api.session?.userId).toBe('u1');
+  });
+
+  it('a row claimed by a tab that crashes AFTER this tab booted is still recovered (#R6-5)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport); // boot sweep already ran and found nothing
+
+    // Another tab claims a row and "crashes": nothing on this tab's side —
+    // no boot, no transport event — would ever sweep again. The claim
+    // broadcast (posted by markSending itself) is what schedules one at the
+    // lease's expiry.
+    const row = await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'claimed then crashed' },
+    }), 'ws://x/::user:u1');
+    const realNow = Date.now();
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow - outbox.SEND_LEASE_MS + 400);
+    await outbox.markSending(row.id, 'crashed-late-tab', 'ws://x/::user:u1'); // lease expires ~400ms from now
+    dateNowSpy.mockRestore();
+
+    await waitFor(
+      () => expect(transport.sent.some((e) => e.id === row.id)).toBe(true),
+      { timeout: 5000 },
+    );
+  }, 10_000);
+
   it('never sends — and purges — a pending row written under a different identity (#R5-3)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport); // current identity: u1
@@ -138,11 +208,11 @@ describe('TransportProvider', () => {
     // was still running as user:other (e.g. its enqueue raced a wipe).
     await outbox.enqueue(createEnvelope('msg', {
       from: 'user:other', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'someone else\'s message' },
-    }));
+    }), 'ws://x/::user:other');
     // A legitimate row for the current identity, to prove drain still works.
     const mine = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'mine' },
-    }));
+    }), 'ws://x/::user:u1');
 
     act(() => { transport.setStatus('open'); }); // trigger drain
 
@@ -193,13 +263,13 @@ describe('TransportProvider', () => {
     await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
     const stranded = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'crashed mid-send' },
-    }));
+    }), 'ws://x/::user:u1');
     // The owning tab crashed MOMENTS ago: its lease is still valid at boot
     // (expires ~1.5s from now), so the one-shot boot demote must skip it.
     // Backdate Date.now() during the claim so leaseExpiresAt lands there.
     const realNow = Date.now();
     const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow - outbox.SEND_LEASE_MS + 1500);
-    await outbox.markSending(stranded.id, 'crashed-tab', 'user:u1');
+    await outbox.markSending(stranded.id, 'crashed-tab', 'ws://x/::user:u1');
     dateNowSpy.mockRestore();
 
     const transport = new FakeTransport();
@@ -285,12 +355,12 @@ describe('TransportProvider', () => {
     const env1 = createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'first' },
     });
-    await outbox.enqueue(env1);
+    await outbox.enqueue(env1, 'ws://x/::user:u1');
     await new Promise((r) => setTimeout(r, 2)); // force env2's ts to sort strictly after env1's
     const env2 = createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'SECOND must never be sent' },
     });
-    await outbox.enqueue(env2);
+    await outbox.enqueue(env2, 'ws://x/::user:u1');
 
     // Gate env1's send so the test can deterministically control exactly
     // when the wipe lands relative to drain()'s progress — no reliance on

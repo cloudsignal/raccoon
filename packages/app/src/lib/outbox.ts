@@ -7,6 +7,14 @@ export interface OutboxEntry {
   id: string;
   channel: string;
   env: AnyEnvelope;
+  /** Full identity scope this row was enqueued under (#R5-3/#R6-3):
+   *  `<instanceUrl>::<user address>`. env.from alone is NOT enough — user
+   *  ids are instance-local, so instance A's user:u1 and instance B's
+   *  user:u1 are different people with identical from addresses. The claim
+   *  CAS compares this persisted scope against the caller's current one.
+   *  Rows from before this field existed have scope undefined and are never
+   *  claimable; drain() purges them. */
+  scope?: string;
   createdAt: string;
   attempts: number;
   status: OutboxStatus;
@@ -35,6 +43,19 @@ export const MAX_ATTEMPTS = 5;
 // tab treat the row as abandoned. Exported so tests can advance exactly past
 // it rather than hardcoding a duplicate magic number.
 export const SEND_LEASE_MS = 20_000;
+
+// #R6-5: every successful claim is broadcast (with its lease expiry) so
+// every OTHER tab can schedule a recovery sweep for the moment the lease
+// lapses. Boot-time and close-time sweeps can't cover a claim made AFTER
+// they ran by a tab that then crashes — without this, such a row stayed
+// 'sending' forever on any tab with a stable connection. Safe even for the
+// poster's own rows: a legitimately in-flight send always settles (ack) or
+// fails (ack timeout, 10s) well inside SEND_LEASE_MS, so a sweep at expiry
+// only ever touches genuinely abandoned claims.
+const claimChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('raccoon-outbox') : null;
+// Node's BroadcastChannel would otherwise hold the process open; browser
+// and jsdom implementations don't have unref.
+(claimChannel as { unref?: () => void } | null)?.unref?.();
 
 const listeners = new Set<(channel: string) => void>();
 
@@ -68,11 +89,12 @@ function getAll(): Promise<OutboxEntry[]> {
 // one transaction removes the "in between" for anything to land in, in any
 // tab, with no in-memory coordination needed at all.
 
-export async function enqueue(env: AnyEnvelope): Promise<OutboxEntry> {
+export async function enqueue(env: AnyEnvelope, scope: string): Promise<OutboxEntry> {
   const entry: OutboxEntry = {
     id: env.id,
     channel: env.channel,
     env,
+    scope,
     createdAt: env.ts,
     attempts: 0,
     status: 'pending',
@@ -147,15 +169,18 @@ async function mutate(
  * markSendFailed/markFailed so a stale claim's delayed failure paths can't
  * touch a newer claim (#R5-5).
  */
-export async function markSending(id: string, ownerId: string, expectedFrom: string): Promise<string | null> {
+export async function markSending(id: string, ownerId: string, expectedScope: string): Promise<string | null> {
   const claimToken = crypto.randomUUID();
   const entry = await mutate(id, (entry) => (
-    entry.status === 'pending' && entry.env.from === expectedFrom
+    entry.status === 'pending' && entry.scope === expectedScope
       ? { ...entry, attempts: entry.attempts + 1, status: 'sending', ownerId, claimToken, leaseExpiresAt: Date.now() + SEND_LEASE_MS }
       : undefined
   ));
   if (!entry) return null;
   notify(entry.channel);
+  // #R6-5: let every other tab schedule a recovery sweep at this claim's
+  // lease expiry, in case this tab crashes mid-send.
+  claimChannel?.postMessage({ type: 'claimed', leaseExpiresAt: entry.leaseExpiresAt });
   return claimToken;
 }
 
@@ -187,18 +212,30 @@ export async function markSendFailed(id: string, error: string, claimToken: stri
 /** Claim-scoped like markSendFailed (#R5-5): a stale owner's long-delayed
  *  ack-timeout must not flip a row a newer owner is actively sending to
  *  'failed'. No-ops unless the presented token is the row's current claim. */
-export async function markFailed(id: string, error: string, claimToken: string): Promise<void> {
+/** Returns whether the write actually applied (#R6-7): a stale claim's
+ *  timeout must not drive UI state (or anything else) off a no-op. */
+export async function markFailed(id: string, error: string, claimToken: string): Promise<boolean> {
   const entry = await mutate(id, (entry) => (
     entry.claimToken === claimToken
       ? { ...entry, status: 'failed', lastError: error, ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
       : undefined
   ));
   if (entry) notify(entry.channel);
+  return entry !== undefined;
 }
 
-export async function retry(id: string): Promise<void> {
-  const entry = await mutate(id, (entry) => ({ ...entry, status: 'pending', attempts: 0, lastError: undefined }));
+/** Revive a TERMINALLY FAILED row for another attempt. Failed-only CAS
+ *  (#R6-7): an unconditional reset could yank a row another tab is actively
+ *  sending ('sending', live claim) back to 'pending', queueing a duplicate
+ *  transmission. Returns whether it applied. */
+export async function retry(id: string): Promise<boolean> {
+  const entry = await mutate(id, (entry) => (
+    entry.status === 'failed'
+      ? { ...entry, status: 'pending', attempts: 0, lastError: undefined }
+      : undefined
+  ));
   if (entry) notify(entry.channel);
+  return entry !== undefined;
 }
 
 export async function settle(id: string): Promise<void> {
