@@ -11,10 +11,24 @@ export class RaccoonBridge {
   private readonly store: MessageStore;
   private readonly cap: number;
   private readonly dedupCap: number;
-  // `${userId}:${envelopeId}` of turns already processed, so a redelivered
-  // envelope (e.g. the client retried after a lost ack) does not re-run the
-  // agent. Bounded FIFO — insertion-ordered Set, oldest evicted past the cap.
-  private readonly processed = new Set<string>();
+  // `${userId}:${envelopeId}` -> the in-flight/settled persistence outcome for
+  // that message, so a redelivered envelope (a sequential retry OR a genuinely
+  // CONCURRENT duplicate arriving while the first attempt is still pending)
+  // never re-runs the agent, and — the R3-6 fix — never sends a false "success"
+  // ack before the real outcome is known. A boolean "seen" Set could only
+  // distinguish before/after; it could not make a concurrent duplicate WAIT for
+  // an in-flight attempt's actual result, so a duplicate arriving while the
+  // first append() was still pending sent a bare ack immediately, and if that
+  // append then failed, the duplicate had already told the client it
+  // succeeded (reproduced: blocking the original append, injecting a
+  // duplicate, then rejecting the append produced an ack with zero runs).
+  // Bounded FIFO — insertion-ordered Map, oldest evicted past the cap.
+  private readonly persisted = new Map<string, Promise<boolean>>();
+  // approval.response has no persistence step to gate the ack on (the ack
+  // there just means "the server received this envelope", which is always
+  // true once we're running this code) — a plain seen-Set is sufficient for
+  // its dedup-only need.
+  private readonly approvalSeen = new Set<string>();
 
   constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; historyLimitCap?: number; dedupCap?: number }) {
     this.hub = opts.hub;
@@ -42,58 +56,76 @@ export class RaccoonBridge {
     // ack / typing / presence / pairing kinds are inbound-irrelevant to the agent.
   }
 
-  /** Mark a (userId, envelopeId) processed. Returns true if it was ALREADY seen. */
-  private markSeen(key: string): boolean {
-    if (this.processed.has(key)) return true;
-    this.processed.add(key);
-    if (this.processed.size > this.dedupCap) {
-      const oldest = this.processed.values().next().value;
-      if (oldest !== undefined) this.processed.delete(oldest);
+  /** Mark a (userId, envelopeId) seen for approval.response's simple, always-
+   *  succeeds dedup. Returns true if it was ALREADY seen. */
+  private markApprovalSeen(key: string): boolean {
+    if (this.approvalSeen.has(key)) return true;
+    this.approvalSeen.add(key);
+    if (this.approvalSeen.size > this.dedupCap) {
+      const oldest = this.approvalSeen.values().next().value;
+      if (oldest !== undefined) this.approvalSeen.delete(oldest);
     }
     return false;
   }
 
-  /** Revert a markSeen() call. Used when the durable step that "seen" is meant
-   *  to guarantee (persisting the inbound message) fails, so a subsequent
-   *  retry gets a clean attempt instead of being silently swallowed as an
-   *  already-processed duplicate. */
-  private unmarkSeen(key: string): void {
-    this.processed.delete(key);
+  /**
+   * Runs `run()` (the durable-persistence step) AT MOST ONCE per key.
+   * A concurrent OR later duplicate for the SAME key awaits the SAME promise
+   * instead of starting its own attempt — critical for a truly concurrent
+   * duplicate, which must see the REAL eventual outcome rather than assuming
+   * success. A failed outcome is NOT remembered: the key is removed so a
+   * later, genuinely-new retry (not a duplicate of an in-flight attempt)
+   * gets a clean attempt, matching R2-3. Returns `isOriginal: true` only for
+   * the call that actually invoked `run()` — callers use this to gate
+   * "proceed to run the agent turn" (which must happen exactly once).
+   */
+  private async claim(key: string, run: () => Promise<boolean>): Promise<{ succeeded: boolean; isOriginal: boolean }> {
+    const existing = this.persisted.get(key);
+    if (existing) return { succeeded: await existing, isOriginal: false };
+
+    const promise = run();
+    this.persisted.set(key, promise);
+    const succeeded = await promise.catch(() => false);
+    if (!succeeded) {
+      this.persisted.delete(key);
+    } else if (this.persisted.size > this.dedupCap) {
+      const oldest = this.persisted.keys().next().value;
+      if (oldest !== undefined) this.persisted.delete(oldest);
+    }
+    return { succeeded, isOriginal: true };
   }
 
   private async handleMsg(env: Extract<AnyEnvelope, { kind: 'msg' }>, userId: string): Promise<void> {
     const channel = env.channel;
     const agent = agentAddress(channel);
     const to = userAddress(userId);
-
-    // Idempotency: a redelivered message must re-ack (so the client settles its
-    // outbox) but must NOT re-run the agent turn (double LLM/tool execution).
-    // markSeen() is called EAGERLY (before the append below) so a genuinely
-    // concurrent duplicate delivery is caught immediately rather than racing
-    // into a double append. If the append then fails, unmarkSeen() rolls this
-    // back: without that, marking-then-persisting meant a transient store
-    // failure silently discarded the message forever — a later retry would
-    // find it already "seen" and get nothing but a bare ack, with no append
-    // and no agent run.
     const dedupKey = `${userId}:${env.id}`;
-    if (this.markSeen(dedupKey)) {
+
+    // Single-flight: only the FIRST caller for this key actually appends; a
+    // sequential retry OR a genuinely concurrent duplicate both await the
+    // same outcome instead of assuming success. The ack is gated on the real
+    // persistence result — a duplicate arriving while the original append()
+    // is still pending must NOT ack before that append settles, since if it
+    // then fails, an early ack would have already told the client the
+    // message was received when it was not (reproduced: blocking the
+    // original append, injecting a duplicate, then rejecting the append
+    // produced an ack with zero runs under the old boolean-Set design).
+    const { succeeded, isOriginal } = await this.claim(dedupKey, async () => {
+      const ts = new Date().toISOString();
+      await this.store.append({ id: env.id, channel, userId, role: 'user', text: env.payload.text, ts });
+      return true;
+    });
+
+    if (succeeded) {
       this.hub.sendToUser(userId, createEnvelope('ack', {
         from: agent, to, channel, payload: { refId: env.id, status: 'received' },
       }));
-      return;
     }
+    // Only the original attempt runs the agent turn (never a duplicate, and
+    // never after a failed append — a failed append means nothing durable
+    // happened, so there is no acked message to act on).
+    if (!isOriginal || !succeeded) return;
 
-    const ts = new Date().toISOString();
-    try {
-      await this.store.append({ id: env.id, channel, userId, role: 'user', text: env.payload.text, ts });
-    } catch (err) {
-      this.unmarkSeen(dedupKey);
-      throw err;
-    }
-
-    this.hub.sendToUser(userId, createEnvelope('ack', {
-      from: agent, to, channel, payload: { refId: env.id, status: 'received' },
-    }));
     this.hub.sendToUser(userId, createEnvelope('typing', {
       from: agent, to, channel, payload: { state: 'start' },
     }));
@@ -132,7 +164,7 @@ export class RaccoonBridge {
       from: agent, to, channel, payload: { refId: env.id, status: 'received' },
     }));
 
-    if (this.markSeen(`${userId}:${env.id}`)) return;
+    if (this.markApprovalSeen(`${userId}:${env.id}`)) return;
 
     this.hub.sendToUser(userId, createEnvelope('typing', {
       from: agent, to, channel, payload: { state: 'start' },

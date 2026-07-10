@@ -197,6 +197,48 @@ describe('RaccoonBridge', () => {
     ]);
   });
 
+  it('a duplicate arriving while the original append is still pending does not get a premature ack when that append then fails (#R3-6)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const gate: { release?: () => void } = {};
+    let appendCalls = 0;
+    const originalAppend = store.append.bind(store);
+    store.append = async (m) => {
+      appendCalls += 1;
+      if (appendCalls === 1) {
+        // Block the FIRST append (the original attempt) until the test releases it.
+        await new Promise<void>((resolve) => { gate.release = resolve; });
+        throw new Error('store failure after the duplicate arrived');
+      }
+      return originalAppend(m);
+    };
+    let runs = 0;
+    const counting: AgentRunner = { async *run() { runs += 1; yield `r${runs}`; } };
+    const bridge = new RaccoonBridge({ hub, runner: counting, store });
+    bridge.start();
+
+    const inbound = userMsg('race me');
+    hub.inject(inbound, 'u1'); // original: append() called, now blocked
+    await Promise.resolve(); // let the handler reach and await store.append()
+
+    hub.inject(inbound, 'u1'); // genuinely concurrent duplicate: SAME envelope id
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Neither delivery may have acked yet: the real outcome (failure) isn't
+    // known. The old boolean-Set design acked the duplicate immediately here.
+    expect(hub.sent).toHaveLength(0);
+
+    gate.release?.();
+    await settle();
+
+    // Once the original append rejects, NEITHER delivery acks, and the agent
+    // never runs for a message that was never durably persisted.
+    expect(hub.sent).toHaveLength(0);
+    expect(runs).toBe(0);
+    expect(appendCalls).toBe(1); // the duplicate awaited the SAME in-flight attempt, no second append call
+  });
+
   it('routes approval.response to the runner and replies (#6)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
