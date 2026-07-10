@@ -447,6 +447,10 @@ export function TransportProvider(props: TransportProviderProps) {
     // Without this, a stale `?c=<channel>` URL param (ChatScreen reads it on
     // mount/popstate) could reopen a channel left over from a PRIOR user's
     // session after a fresh pairing on the same device/browser tab.
+    // NOTE for host embeddings (transportOverride/sessionOverride): this makes
+    // openChannel a silent no-op for any channel not in sessionOverride.channels.
+    // Populate that list before the user can call openChannel, or every open
+    // call will be silently dropped.
     if (channel && sessionRef.current && !sessionRef.current.channels.includes(channel)) return;
     setActiveChannel(channel);
     if (!channel) return;

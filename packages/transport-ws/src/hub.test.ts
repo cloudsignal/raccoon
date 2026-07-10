@@ -112,20 +112,33 @@ describe('WsHub pairing', () => {
     ws1.send(pairRequest(token1));
     await nextMessage(ws1); // pair.grant
 
+    // Deterministically force ws1's SERVER-side close handshake to complete
+    // AFTER ws2 re-pairs (rather than hoping real network timing lands that
+    // way, which a prior version of this test did — it passed even with the
+    // bug reverted, because ws1's close handshake reliably completed before
+    // ws2 attached). Pausing ws1's underlying socket stops it from reading (and
+    // so from acking) the server's close frame, which holds the SERVER's own
+    // close handshake — and therefore attach()'s server-side close handler —
+    // open until we resume() it below.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ws-internal socket handle, no public type
+    (ws1 as any)._socket.pause();
+
     // Revoke deletes byUser['u1'] SYNCHRONOUSLY (before ws1's own close event
-    // has fired — ws1.close() only INITIATES the close handshake).
+    // has fired — ws1.close() only INITIATES the close handshake, now paused).
     const closed1 = nextClose(ws1);
     await hub.revokeUser('u1');
 
-    // Re-pair as the SAME user BEFORE ws1's close event has finished — attach()
-    // creates a brand-new Set for 'u1'.
+    // Re-pair as the SAME user WHILE ws1's close handshake is held open —
+    // attach() creates a brand-new Set for 'u1'.
     const token2 = hub.issuePairingToken('u1');
     const ws2 = await connect(port);
     ws2.send(pairRequest(token2));
     await nextMessage(ws2); // pair.grant
 
-    // Now let ws1's close handshake actually complete (its close handler runs
-    // on the server as part of this).
+    // Now release ws1's close handshake so its (server-side) close handler
+    // actually runs, with ws2 already registered.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ws-internal socket handle, no public type
+    (ws1 as any)._socket.resume();
     expect(await closed1).toBe(4403);
 
     // The old code unconditionally deleted byUser['u1'] once ws1's (now

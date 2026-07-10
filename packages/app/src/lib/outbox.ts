@@ -26,13 +26,29 @@ function notify(channel: string): void {
   for (const l of listeners) l(channel);
 }
 
+// EVERY mutating operation below (enqueue/markSending/markSendFailed/markFailed/
+// retry/settle/demoteSending/clearAll) is routed through this single total-order
+// queue. Each is a get-then-put (or scan-then-mutate, or clear) sequence spanning
+// one or more separate IDB transactions, so two of them can otherwise interleave:
+// a status-transition write (e.g. markSending, fired from an in-flight drain())
+// landing AFTER a concurrent clearAll() (fired from unpair()'s wipe) resurrects a
+// prior user's row into the store post-wipe — a cross-user data leak. Earlier
+// serialization covered only demoteSending()/clearAll(); a third-party review
+// proved by execution that a revoke-during-drain sequence (onStatus('closed') +
+// onAuthError firing while attempt()->markSending() was in flight) still
+// resurrected a row, because markSending wasn't on the chain. Every writer must
+// be on the SAME chain, not just the two the first repro happened to name.
+let opChain: Promise<unknown> = Promise.resolve();
+function serialize<T>(fn: () => Promise<T>): Promise<T> {
+  const result = opChain.then(fn, fn);
+  opChain = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 function getAll(): Promise<OutboxEntry[]> {
   return withStore<OutboxEntry[]>('outbox', 'readonly', (s) => s.getAll() as IDBRequest<OutboxEntry[]>);
 }
 
-/** Mutations are get-then-put across two transactions — callers must not
- *  overlap mutations of the same entry (the provider drains sequentially).
- *  Overlapping writers would be last-writer-wins. */
 function getOne(id: string): Promise<OutboxEntry | undefined> {
   return withStore<OutboxEntry | undefined>('outbox', 'readonly', (s) => s.get(id) as IDBRequest<OutboxEntry | undefined>);
 }
@@ -43,16 +59,18 @@ async function put(entry: OutboxEntry): Promise<void> {
 }
 
 export async function enqueue(env: AnyEnvelope): Promise<OutboxEntry> {
-  const entry: OutboxEntry = {
-    id: env.id,
-    channel: env.channel,
-    env,
-    createdAt: env.ts,
-    attempts: 0,
-    status: 'pending',
-  };
-  await put(entry);
-  return entry;
+  return serialize(async () => {
+    const entry: OutboxEntry = {
+      id: env.id,
+      channel: env.channel,
+      env,
+      createdAt: env.ts,
+      attempts: 0,
+      status: 'pending',
+    };
+    await put(entry);
+    return entry;
+  });
 }
 
 export async function listPending(): Promise<OutboxEntry[]> {
@@ -66,49 +84,45 @@ export async function listForChannel(channel: string): Promise<OutboxEntry[]> {
 }
 
 export async function markSending(id: string): Promise<void> {
-  const entry = await getOne(id);
-  if (!entry) return;
-  await put({ ...entry, attempts: entry.attempts + 1, status: 'sending' });
+  return serialize(async () => {
+    const entry = await getOne(id);
+    if (!entry) return;
+    await put({ ...entry, attempts: entry.attempts + 1, status: 'sending' });
+  });
 }
 
 export async function markSendFailed(id: string, error: string): Promise<void> {
-  const entry = await getOne(id);
-  if (!entry) return;
-  const status: OutboxStatus = entry.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
-  await put({ ...entry, status, lastError: error });
+  return serialize(async () => {
+    const entry = await getOne(id);
+    if (!entry) return;
+    const status: OutboxStatus = entry.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+    await put({ ...entry, status, lastError: error });
+  });
 }
 
 export async function markFailed(id: string, error: string): Promise<void> {
-  const entry = await getOne(id);
-  if (!entry) return;
-  await put({ ...entry, status: 'failed', lastError: error });
+  return serialize(async () => {
+    const entry = await getOne(id);
+    if (!entry) return;
+    await put({ ...entry, status: 'failed', lastError: error });
+  });
 }
 
 export async function retry(id: string): Promise<void> {
-  const entry = await getOne(id);
-  if (!entry) return;
-  await put({ ...entry, status: 'pending', attempts: 0, lastError: undefined });
+  return serialize(async () => {
+    const entry = await getOne(id);
+    if (!entry) return;
+    await put({ ...entry, status: 'pending', attempts: 0, lastError: undefined });
+  });
 }
 
 export async function settle(id: string): Promise<void> {
-  const entry = await getOne(id);
-  if (!entry) return;
-  await withStore('outbox', 'readwrite', (s) => { s.delete(id); });
-  notify(entry.channel);
-}
-
-// demoteSending() and clearAll() are serialized through this chain so a
-// status-transition write can never interleave with (and resurrect rows
-// after) a wipe. Each is a snapshot-then-mutate sequence spanning multiple
-// IDB transactions, so without serialization a clearAll() commit landing
-// between two of demoteSending()'s individual put() calls would leave a
-// stale 'sending' row rewritten back into the store post-wipe. Reproduced:
-// 20 'sending' rows left 1 resurrected 'pending' row after a concurrent wipe.
-let opChain: Promise<unknown> = Promise.resolve();
-function serialize<T>(fn: () => Promise<T>): Promise<T> {
-  const result = opChain.then(fn, fn);
-  opChain = result.then(() => undefined, () => undefined);
-  return result;
+  return serialize(async () => {
+    const entry = await getOne(id);
+    if (!entry) return;
+    await withStore('outbox', 'readwrite', (s) => { s.delete(id); });
+    notify(entry.channel);
+  });
 }
 
 /** Fires one subscriber notification per demoted entry — subscribers that
@@ -123,8 +137,8 @@ export async function demoteSending(): Promise<void> {
   });
 }
 
-/** Clear the entire outbox. Serialized against demoteSending() so an
- *  in-flight status-transition write cannot resurrect a row after the clear. */
+/** Clear the entire outbox. Serialized against every other mutator above so
+ *  none of them can resurrect a row after the clear. */
 export async function clearAll(): Promise<void> {
   return serialize(async () => {
     await withStore('outbox', 'readwrite', (s) => { s.clear(); });

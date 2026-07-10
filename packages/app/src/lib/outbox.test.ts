@@ -80,6 +80,28 @@ describe('outbox', () => {
     expect(await outbox.listForChannel('coordinator')).toEqual([]);
   });
 
+  it('clearAll is serialized against EVERY mutator, not only demoteSending (#R2-1 follow-up)', async () => {
+    // A third-party review proved by execution that the original fix only
+    // serialized demoteSending()/clearAll(): a markSending() call (fired from
+    // an in-flight drain()'s attempt()) racing a concurrent clearAll() (fired
+    // from unpair()'s wipe) still resurrected a row. Exercise each remaining
+    // mutator the same way: fire it unawaited, then immediately clearAll(),
+    // and confirm no row survives regardless of interleaving.
+    const mutators: Array<(id: string) => Promise<unknown>> = [
+      (id) => outbox.markSending(id),
+      (id) => outbox.markSendFailed(id, 'offline'),
+      (id) => outbox.markFailed(id, 'no ack'),
+      (id) => outbox.retry(id),
+    ];
+    for (const mutate of mutators) {
+      const e = await outbox.enqueue(msg('x'));
+      const op = mutate(e.id);
+      await outbox.clearAll();
+      await op;
+      expect(await outbox.listForChannel('coordinator')).toEqual([]);
+    }
+  });
+
   it('notifies subscribers with the touched channel', async () => {
     const touched: string[] = [];
     const unsub = outbox.subscribe((c) => touched.push(c));

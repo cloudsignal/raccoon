@@ -217,6 +217,15 @@ export class WsHub {
     const env = tryParseEnvelope(hello);
     if (!env || env.kind !== 'pair.request') { ws.close(4401, 'expected pair.request'); return; }
 
+    // NOTE (residual, host-integration-only exposure): when validatePairingToken
+    // is supplied, grantUserId isn't known until this external await resolves, so
+    // a revoke landing DURING it cannot be captured by an epoch snapshot below —
+    // there is no user to key the snapshot on until this call returns. This repo
+    // does not wire validatePairingToken anywhere (grep confirms), so the gap is
+    // not currently reachable. A host that supplies it MUST keep its own
+    // revocation atomic with token invalidation (e.g. reject the token lookup
+    // itself once the user is revoked), since this hub cannot retroactively
+    // detect a revoke that completed before grantUserId was even known.
     let grantUserId: string | null = null;
     if (this.validatePairingToken) {
       grantUserId = await this.validatePairingToken(env.payload.token).catch(() => null);
