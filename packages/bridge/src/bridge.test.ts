@@ -124,4 +124,57 @@ describe('RaccoonBridge', () => {
     await settle();
     expect(hub.sent).toHaveLength(0);
   });
+
+  it('does not send a msg (or crash) when the agent yields an empty reply (#3)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const empty: AgentRunner = { async *run() { /* yields nothing */ } };
+    const bridge = new RaccoonBridge({ hub, runner: empty, store });
+    bridge.start();
+    hub.inject(userMsg('hi'), 'u1');
+    await settle();
+    // ack + typing start/stop, but NO trailing empty 'msg' (which would be a
+    // protocol-invalid envelope and, unawaited, crash the process).
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing']);
+    const page = await store.page('coordinator', { userId: 'u1', limit: 10 });
+    expect(page.messages.map((m) => m.role)).toEqual(['user']); // no empty agent row
+  });
+
+  it('re-acks but does not re-run the agent on a redelivered message (#5)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let runs = 0;
+    const counting: AgentRunner = { async *run() { runs += 1; yield `r${runs}`; } };
+    const bridge = new RaccoonBridge({ hub, runner: counting, store });
+    bridge.start();
+    const inbound = userMsg('once');
+    hub.inject(inbound, 'u1');
+    await settle();
+    hub.inject(inbound, 'u1'); // redelivery: identical envelope id
+    await settle();
+    expect(runs).toBe(1); // the agent turn ran exactly once
+    // first turn: ack, typing, typing, msg ; redelivery: just a re-ack.
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg', 'ack']);
+  });
+
+  it('routes approval.response to the runner and replies (#6)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const seen: AgentContext[] = [];
+    const capture: AgentRunner = { async *run(ctx) { seen.push(ctx); yield `handled ${ctx.text}`; } };
+    const bridge = new RaccoonBridge({ hub, runner: capture, store });
+    bridge.start();
+    hub.inject(createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'edit', editedText: 'Better draft' },
+    }), 'u1');
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.text).toBe('Better draft'); // editedText preferred over raw choice
+    expect(seen[0]!.approval).toEqual({ refId: 'req-1', choice: 'edit', editedText: 'Better draft' });
+    // Fire-and-forget: no ack, just typing + the agent reply.
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['typing', 'typing', 'msg']);
+    const reply = hub.sent[2]!.env;
+    if (reply.kind === 'msg') expect(reply.payload.text).toBe('handled Better draft');
+  });
 });

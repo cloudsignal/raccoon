@@ -12,6 +12,11 @@ export interface AgentContext {
   channel: string;
   text: string;
   messageId: string;
+  /** Present when this turn is the user's response to an approval.request.
+   *  `text` carries the edited text (if any) or the chosen option; `approval`
+   *  gives the runner the original request id and the raw choice. Runners that
+   *  do not model approvals can ignore it and treat the turn as plain text. */
+  approval?: { refId: string; choice: string; editedText?: string };
 }
 
 /** The framework seam. An implementation runs one user turn and yields
