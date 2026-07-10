@@ -112,7 +112,11 @@ function buildApprovalText(
   resolved: ApprovalChoice | undefined,
 ): string {
   if (resolved?.isCommand && approval.editedText === undefined) {
-    return `/${resolved.value}`;
+    // Normalize to EXACTLY one leading slash (#R5-2): OpenClaw supplies
+    // action.command WITH its slash, and the store preserves values
+    // verbatim, so blindly prepending '/' produced '//approve …' — which
+    // OpenClaw's command parser does not recognize as a command at all.
+    return `/${resolved.value.replace(/^\/+/, '')}`;
   }
   const tag = `[approval.response refId=${approval.refId} choice=${resolved?.value ?? approval.choice}]`;
   return approval.editedText !== undefined ? `${tag} ${approval.editedText}` : tag;

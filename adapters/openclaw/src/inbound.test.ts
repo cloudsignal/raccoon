@@ -142,6 +142,32 @@ describe('buildRaccoonInboundRunner', () => {
     expect(capturedBody).toBe('/approve req-2 allow-once');
   });
 
+  it('a command value that already carries its leading slash is not double-slashed (#R5-2)', async () => {
+    let capturedBody: string | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      capturedBody = (arg.ctxPayload as { Body: string }).Body;
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    // OpenClaw supplies action.command WITH its leading slash; the stored
+    // value preserves it verbatim. Building the outgoing turn must normalize
+    // to exactly one '/', or the result ('//approve …') never matches
+    // OpenClaw's command parser and the approval silently becomes an
+    // ordinary message.
+    const store = createApprovalValueStore();
+    store.remember('req-4', ctx.userId, new Map([
+      ['Approve', { value: '/approve req-4 allow-once', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-4', choice: 'Approve' } };
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+
+    expect(capturedBody).toBe('/approve req-4 allow-once');
+  });
+
   it('does NOT send a command-type choice as a slash command when the user edited the text instead (#R4-2)', async () => {
     let capturedBody: string | undefined;
     mockDispatch.mockImplementation(async (arg) => {
