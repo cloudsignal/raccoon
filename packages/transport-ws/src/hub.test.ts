@@ -369,4 +369,34 @@ describe('WsHub pairing', () => {
     ws.send('x'.repeat(1000));
     expect(await nextClose(ws)).toBe(1009); // ws library's own "message too big" code
   });
+
+  it('a connection blocked mid-verification stays pending (cap) and on the clock (timeout) — sending one frame does not escape either (#R4-6)', async () => {
+    // validatePairingToken never resolves until the test releases it,
+    // simulating a slow/blocked external verification step.
+    let release: (() => void) | undefined;
+    hub = new WsHub({
+      instance: 'test',
+      maxPendingConnections: 1,
+      helloTimeoutMs: 50,
+      validatePairingToken: () => new Promise<string | null>((resolve) => { release = () => resolve(null); }),
+    });
+    const { port } = await hub.start();
+
+    const blocked = await connect(port);
+    blocked.send(pairRequest('any-token')); // reaches validatePairingToken and blocks there
+    await new Promise((r) => setTimeout(r, 10)); // let the hub dispatch into validatePairingToken
+
+    // A second connection while the first's hello is still unresolved must
+    // still be rejected: the pending slot was not freed just because the
+    // first connection sent its one frame — it is not yet authenticated.
+    const rejected = await connect(port);
+    expect(await nextClose(rejected)).toBe(4503);
+
+    // The blocked connection itself is still on the clock: once
+    // helloTimeoutMs elapses — even mid-verification, having already sent a
+    // frame — it gets closed for timing out, not left open indefinitely.
+    expect(await nextClose(blocked)).toBe(4408);
+
+    release?.(); // let the now-irrelevant validatePairingToken call settle
+  });
 });

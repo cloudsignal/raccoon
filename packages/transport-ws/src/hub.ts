@@ -152,18 +152,36 @@ export class WsHub {
         this.pendingConnections.delete(ws);
       });
       ws.once('message', (data) => {
-        clearTimeout(helloTimer);
-        this.pendingConnections.delete(ws);
+        // R4-6: do NOT clear the timer or drop pre-auth accounting here —
+        // handleHello is itself async (verifySession / validatePairingToken
+        // / createSession can all await an external store), so a connection
+        // that has merely sent ONE frame is not yet authenticated. Clearing
+        // the timer and pendingConnections membership at this point let a
+        // connection escape BOTH protections for the entire duration of that
+        // async work: with cap 1, a 50ms timeout, and a blocked verifySession,
+        // two sockets stayed open past 120ms while pendingConnections counted
+        // zero. The socket now stays pending AND on the clock until
+        // handleHello actually settles (granted, rejected, or errored) —
+        // matching "keep the socket pending and timed until authentication
+        // succeeds or it closes". A still-blocked verification past the
+        // deadline is now correctly caught by the SAME helloTimer, which is
+        // only cleared in the .finally() below.
+        //
         // handleHello is async; a bare `void` call discards its promise with
         // no rejection handler. A store failure (verifySession/createSession
         // rejecting, e.g. a DB outage) then becomes an unhandled rejection,
         // which crashes the host process by default in modern Node. Contain
         // it: log server-side, close the socket rather than leaving it half-
         // handled.
-        this.handleHello(ws, ip, data.toString()).catch((err) => {
-          console.error('[raccoon] handleHello failed:', err);
-          try { ws.close(1011, 'internal error'); } catch { /* already closing */ }
-        });
+        this.handleHello(ws, ip, data.toString())
+          .catch((err) => {
+            console.error('[raccoon] handleHello failed:', err);
+            try { ws.close(1011, 'internal error'); } catch { /* already closing */ }
+          })
+          .finally(() => {
+            clearTimeout(helloTimer);
+            this.pendingConnections.delete(ws);
+          });
       });
     });
     // Reject on listen failures (EADDRINUSE, EACCES) — without this the
@@ -303,6 +321,14 @@ export class WsHub {
         ws.close(4401, 'revoked during resume');
         return;
       }
+      // R4-6: the socket may have closed WHILE this awaited (e.g. the
+      // client disconnected, or the pre-auth helloTimer fired because this
+      // took longer than helloTimeoutMs — that timer is no longer cleared
+      // early, see the 'message' handler in start()). attach() on a dead
+      // socket would register close/message listeners AFTER 'close' already
+      // fired, leaving a stale entry in byUser that nothing ever cleans up
+      // — and the unguarded ws.send() right after would throw synchronously.
+      if (ws.readyState !== ws.OPEN) return;
       this.attach(ws, userId);
       ws.send(JSON.stringify({ ok: true, userId }));
       return;
@@ -342,6 +368,8 @@ export class WsHub {
       ws.close(4401, 'revoked during redemption');
       return;
     }
+    // R4-6: see the matching guard in the session-resume path above.
+    if (ws.readyState !== ws.OPEN) return;
     this.attach(ws, grantUserId);
     ws.send(JSON.stringify(createEnvelope('pair.grant', {
       from: 'system',
