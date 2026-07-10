@@ -193,6 +193,67 @@ describe('buildRaccoonInboundRunner', () => {
     expect(capturedBody).toContain('my custom reply');
   });
 
+  it('a transient dispatch failure does not burn the approval — the retry still resolves the command (#R5-8)', async () => {
+    let capturedBody: string | undefined;
+    mockDispatch
+      .mockImplementationOnce(async () => { throw new Error('transient dispatch outage'); })
+      .mockImplementationOnce(async (arg) => {
+        capturedBody = (arg.ctxPayload as { Body: string }).Body;
+        arg.dispatcher.sendFinalReply({ text: 'ok' });
+        arg.dispatcher.markComplete();
+        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+      });
+
+    const store = createApprovalValueStore();
+    store.remember('req-5', ctx.userId, new Map([
+      ['Approve', { value: 'approve req-5 allow-once', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-5', choice: 'Approve' } };
+    // First attempt: dispatch throws. The store entry must NOT have been
+    // consumed — nothing was actually delivered to OpenClaw.
+    await expect(async () => {
+      for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+    }).rejects.toThrow('transient dispatch outage');
+
+    // Retry (the bridge redelivers / the user clicks again): still resolves
+    // to the real slash command instead of degrading to the bracket tag.
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+    expect(capturedBody).toBe('/approve req-5 allow-once');
+  });
+
+  it('an edited response does not consume the command mapping — a later real click still resolves it (#R5-8)', async () => {
+    const bodies: string[] = [];
+    mockDispatch.mockImplementation(async (arg) => {
+      bodies.push((arg.ctxPayload as { Body: string }).Body);
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    const store = createApprovalValueStore();
+    store.remember('req-6', ctx.userId, new Map([
+      ['Approve', { value: 'approve req-6 allow-once', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    // The user types a free-text reply first — delivered as the bracket-tag
+    // fallback, which does NOT act on the still-pending OpenClaw approval.
+    const edited = {
+      ...ctx, text: 'tell me more first',
+      approval: { refId: 'req-6', choice: 'Approve', editedText: 'tell me more first' },
+    };
+    for await (const _chunk of runner.run(edited)) { /* drain */ }
+
+    // Then actually clicks Approve. The mapping must still be there.
+    const clicked = { ...ctx, text: 'Approve', approval: { refId: 'req-6', choice: 'Approve' } };
+    for await (const _chunk of runner.run(clicked)) { /* drain */ }
+
+    expect(bodies[0]).not.toMatch(/^\//);
+    expect(bodies[1]).toBe('/approve req-6 allow-once');
+  });
+
   it('skips sendBlockReply and sendToolResult payloads', async () => {
     mockDispatch.mockImplementation(async ({ dispatcher }) => {
       dispatcher.sendToolResult({ text: 'tool-output' });

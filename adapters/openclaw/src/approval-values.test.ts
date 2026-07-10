@@ -16,7 +16,7 @@ describe('createApprovalValueStore', () => {
   it('resolves a remembered choice for the correct (refId, userId, label)', () => {
     const store = createApprovalValueStore();
     store.remember('req-1', 'alice', new Map([['Approve', approve], ['Skip', skip]]));
-    expect(store.resolve('req-1', 'alice', 'Approve')).toEqual(approve);
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve);
   });
 
   it('returns undefined for an unknown refId', () => {
@@ -36,7 +36,7 @@ describe('createApprovalValueStore', () => {
     const store = createApprovalValueStore();
     store.remember('req-1', 'alice', new Map([['Approve', approve]]));
     expect(store.resolve('req-1', 'mallory', 'Approve')).toBeUndefined(); // probe by a non-owner
-    expect(store.resolve('req-1', 'alice', 'Approve')).toEqual(approve); // owner still resolves it
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // owner still resolves it
   });
 
   // ---- exact-choice validation --------------------------------------------
@@ -53,16 +53,42 @@ describe('createApprovalValueStore', () => {
     const store = createApprovalValueStore();
     store.remember('req-1', 'alice', new Map([['Approve', approve]]));
     expect(store.resolve('req-1', 'alice', 'not-a-real-choice')).toBeUndefined();
-    expect(store.resolve('req-1', 'alice', 'Approve')).toEqual(approve);
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve);
   });
 
-  // ---- one-shot consumption ------------------------------------------------
+  // ---- one-shot consumption (two-phase, #R4-9 + #R5-8) ----------------------
 
-  it('a successful resolve consumes the entry — a replay of the same response cannot resolve it again (#R4-9)', () => {
+  it('commit() consumes the entry — a replay after commit cannot resolve it again (#R4-9/#R5-8)', () => {
     const store = createApprovalValueStore();
     store.remember('req-1', 'alice', new Map([['Approve', approve]]));
-    expect(store.resolve('req-1', 'alice', 'Approve')).toEqual(approve);
+    const resolved = store.resolve('req-1', 'alice', 'Approve');
+    expect(resolved?.choice).toEqual(approve);
+    resolved!.commit();
     expect(store.resolve('req-1', 'alice', 'Approve')).toBeUndefined(); // replay: already consumed
+  });
+
+  it('resolve() alone does NOT consume — a transient dispatch failure can retry the same response (#R5-8)', () => {
+    // Consumption must wait for the choice to have actually been dispatched
+    // (commit()). Consuming eagerly on resolve meant a transient OpenClaw
+    // dispatch failure permanently burned the approval: the retry's resolve
+    // came back undefined, degraded to the bracket-tag fallback, and the
+    // real pending approval could never be acted on again.
+    const store = createApprovalValueStore();
+    store.remember('req-1', 'alice', new Map([['Approve', approve]]));
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // dispatch then fails; no commit
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve); // retry still resolves
+  });
+
+  it('commit() is a no-op if the entry was already re-consumed or replaced (idempotent, keyed to its own resolve)', () => {
+    const store = createApprovalValueStore();
+    store.remember('req-1', 'alice', new Map([['Approve', approve]]));
+    const first = store.resolve('req-1', 'alice', 'Approve');
+    first!.commit();
+    // Same refId legitimately re-remembered later (refIds are ulids in
+    // practice, but the store must not blow up either way).
+    store.remember('req-1', 'alice', new Map([['Approve', skip]]));
+    first!.commit(); // stale handle: must NOT delete the new entry
+    expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(skip);
   });
 
   // ---- expiry ---------------------------------------------------------------
@@ -85,7 +111,7 @@ describe('createApprovalValueStore', () => {
       const store = createApprovalValueStore(200, 1000);
       store.remember('req-1', 'alice', new Map([['Approve', approve]]));
       vi.advanceTimersByTime(999);
-      expect(store.resolve('req-1', 'alice', 'Approve')).toEqual(approve);
+      expect(store.resolve('req-1', 'alice', 'Approve')?.choice).toEqual(approve);
     } finally {
       vi.useRealTimers();
     }
@@ -99,7 +125,7 @@ describe('createApprovalValueStore', () => {
     store.remember('req-2', 'alice', new Map([['A', approve]]));
     store.remember('req-3', 'alice', new Map([['A', approve]])); // evicts req-1
     expect(store.resolve('req-1', 'alice', 'A')).toBeUndefined();
-    expect(store.resolve('req-2', 'alice', 'A')).toEqual(approve);
-    expect(store.resolve('req-3', 'alice', 'A')).toEqual(approve);
+    expect(store.resolve('req-2', 'alice', 'A')?.choice).toEqual(approve);
+    expect(store.resolve('req-3', 'alice', 'A')?.choice).toEqual(approve);
   });
 });

@@ -66,19 +66,40 @@ export interface ApprovalChoice {
   isCommand: boolean;
 }
 
+/** A successful resolve: the choice plus a commit() performing the one-shot
+ *  consumption. #R5-8: consumption is SPLIT from resolution — the caller
+ *  commits only after the resolved choice has actually been dispatched to
+ *  OpenClaw successfully (and only when the command path was really used).
+ *  Consuming eagerly on resolve meant a transient dispatch failure — or an
+ *  edited free-text response, which never sends the command at all —
+ *  permanently burned the approval: every later attempt resolved undefined
+ *  and degraded to the bracket-tag fallback, so the real pending OpenClaw
+ *  approval could never be acted on again. */
+export interface ResolvedApproval {
+  choice: ApprovalChoice;
+  /** Consume the entry (one-shot). Call ONLY after the choice was
+   *  successfully delivered. Keyed to the resolve that produced it: a stale
+   *  handle whose entry was since replaced no-ops instead of deleting the
+   *  replacement. */
+  commit(): void;
+}
+
 export interface ApprovalValueStore {
   /** Record the label -> choice mapping for one approval.request, scoped to
    *  the userId it was sent to. */
   remember(refId: string, userId: string, labelToChoice: ReadonlyMap<string, ApprovalChoice>): void;
   /**
-   * Resolve AND CONSUME (one-shot, on success only) the choice for a
-   * (refId, userId, label) triple. Returns undefined — the caller must treat
-   * the response as unresolved/untrusted, never as a command — when the
-   * refId is unknown/expired/already consumed, `userId` does not match who
-   * the request was issued to, or `label` was not one of the choices
-   * actually offered for that refId.
+   * Resolve the choice for a (refId, userId, label) triple. Returns
+   * undefined — the caller must treat the response as unresolved/untrusted,
+   * never as a command — when the refId is unknown/expired/already
+   * consumed, `userId` does not match who the request was issued to, or
+   * `label` was not one of the choices actually offered for that refId.
+   * Does NOT consume the entry — call the returned commit() after a
+   * successful dispatch (#R5-8). Replay between resolve and commit is
+   * suppressed one layer up (RaccoonBridge dedups approval responses by
+   * refId); commit() closes the long-term replay window.
    */
-  resolve(refId: string, userId: string, label: string): ApprovalChoice | undefined;
+  resolve(refId: string, userId: string, label: string): ResolvedApproval | undefined;
 }
 
 interface StoredApproval {
@@ -112,8 +133,14 @@ export function createApprovalValueStore(cap = DEFAULT_CAP, ttlMs = DEFAULT_TTL_
       // Unknown/unlisted label: do NOT delete — a legitimate retry with the
       // correct label (e.g. after a client-side bug) must still work.
       if (!choice) return undefined;
-      byRefId.delete(refId); // one-shot: consumed on a fully successful resolve
-      return choice;
+      return {
+        choice,
+        // #R5-8: one-shot consumption happens HERE, on the caller's signal
+        // that the choice was actually delivered — not eagerly on resolve.
+        // Identity-keyed so a stale handle (its entry since replaced by a
+        // fresh remember() for the same refId) cannot delete the new entry.
+        commit: () => { if (byRefId.get(refId) === stored) byRefId.delete(refId); },
+      };
     },
   };
 }

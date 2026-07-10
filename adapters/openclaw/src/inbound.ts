@@ -156,13 +156,23 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
   // reached OpenClaw as an unstructured, unrelated-looking message. Resolve
   // the label back to its ApprovalChoice via the same store the outbound
   // adapter recorded it into, scoped to THIS user (ctx.userId) — see
-  // approval-values.ts for the ownership/expiry/one-shot/exact-choice
-  // validation this performs. buildApprovalText then either sends a REAL
-  // OpenClaw slash command (isCommand) or the descriptive bracket-tag
-  // fallback carrying the refId, so OpenClaw/the agent can correlate this
-  // turn to the specific pending approval either way.
+  // approval-values.ts for the ownership/expiry/exact-choice validation
+  // this performs. buildApprovalText then either sends a REAL OpenClaw
+  // slash command (isCommand) or the descriptive bracket-tag fallback
+  // carrying the refId, so OpenClaw/the agent can correlate this turn to
+  // the specific pending approval either way.
+  //
+  // #R5-8: resolve() no longer consumes — resolvedApproval.commit() below
+  // (after a successful dispatch, non-edited path only) does. Consuming
+  // here burned the approval on any transient dispatch failure, and the
+  // edited-text path consumed the command mapping without ever sending the
+  // command, so a later real click could never act on the still-pending
+  // OpenClaw approval.
+  const resolvedApproval = ctx.approval
+    ? opts.approvalValues?.resolve(ctx.approval.refId, ctx.userId, ctx.approval.choice)
+    : undefined;
   const approvalText = ctx.approval
-    ? buildApprovalText(ctx.approval, opts.approvalValues?.resolve(ctx.approval.refId, ctx.userId, ctx.approval.choice))
+    ? buildApprovalText(ctx.approval, resolvedApproval?.choice)
     : ctx.text;
 
   // Build a minimal FinalizedMsgContext from the Raccoon AgentContext.
@@ -253,6 +263,15 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
 
     // Await the dispatch promise to propagate any errors thrown by OpenClaw.
     await dispatchPromise;
+
+    // #R5-8: the turn dispatched successfully — NOW consume the approval
+    // mapping (one-shot), and only for a real click. An edited free-text
+    // response never sent the command, so its mapping stays resolvable for
+    // the click that eventually acts on the still-pending approval; a
+    // failed dispatch never reaches this line, so a retry can re-resolve.
+    if (resolvedApproval && ctx.approval?.editedText === undefined) {
+      resolvedApproval.commit();
+    }
   } finally {
     // Guard: if the consumer exits early (break / return), suppress any
     // subsequent rejection from dispatchPromise so it cannot become an
