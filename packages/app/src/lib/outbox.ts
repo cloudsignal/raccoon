@@ -19,6 +19,13 @@ export interface OutboxEntry {
    *  IndexedDB rows themselves. */
   ownerId?: string;
   leaseExpiresAt?: number;
+  /** Set while status is 'sending' (#R5-5): a fresh unique token minted by
+   *  the markSending() that claimed this row. markSendFailed/markFailed only
+   *  apply when the caller presents the CURRENT token — so a stale owner's
+   *  long-delayed ack-timeout or send rejection (e.g. a background-throttled
+   *  tab waking up after its lease expired and the row was re-claimed)
+   *  cannot flip a row that now belongs to a newer owner. Cleared on demote. */
+  claimToken?: string;
 }
 
 export const MAX_ATTEMPTS = 5;
@@ -125,41 +132,67 @@ async function mutate(
 
 /**
  * Pending-only compare-and-set: claims the row for `ownerId` (this tab) ONLY
- * if its status is currently 'pending'. Returns true if claimed, false if
- * there was no row to claim (already cleared, e.g. by a concurrent wipe —
- * see #R4-3) OR it was already claimed by someone else (already 'sending' —
- * #R4-4: two tabs racing listPending() could otherwise BOTH unconditionally
- * flip the same row to 'sending' and both transmit it, observed as attempts
- * incrementing to 2 for one logical send). Callers MUST check this before
- * sending: only a true claim may proceed to transport.send().
+ * if its status is currently 'pending' AND its envelope was written under
+ * the identity the caller is currently sending as (`expectedFrom`, an OAM
+ * address like 'user:u1' — #R5-3: rows are shared per-origin across tabs,
+ * and a stale tab still running a since-wiped identity can write rows a
+ * newer tab's drain would otherwise pick up and transmit through the WRONG
+ * user's session; the identity check inside the same atomic transaction as
+ * the claim makes that impossible regardless of how the row got here).
+ *
+ * Returns a fresh unique claim token when the row was claimed, or null when
+ * there was no row (already cleared, e.g. by a concurrent wipe — #R4-3), it
+ * was already claimed ('sending' — #R4-4), or its identity didn't match
+ * (#R5-3). Callers MUST hold a token before sending, and MUST present it to
+ * markSendFailed/markFailed so a stale claim's delayed failure paths can't
+ * touch a newer claim (#R5-5).
  */
-export async function markSending(id: string, ownerId: string): Promise<boolean> {
+export async function markSending(id: string, ownerId: string, expectedFrom: string): Promise<string | null> {
+  const claimToken = crypto.randomUUID();
   const entry = await mutate(id, (entry) => (
-    entry.status === 'pending'
-      ? { ...entry, attempts: entry.attempts + 1, status: 'sending', ownerId, leaseExpiresAt: Date.now() + SEND_LEASE_MS }
+    entry.status === 'pending' && entry.env.from === expectedFrom
+      ? { ...entry, attempts: entry.attempts + 1, status: 'sending', ownerId, claimToken, leaseExpiresAt: Date.now() + SEND_LEASE_MS }
       : undefined
   ));
-  if (entry) notify(entry.channel);
-  return entry !== undefined;
+  if (!entry) return null;
+  notify(entry.channel);
+  return claimToken;
 }
 
 /** Returns the entry's resulting status ('failed' once MAX_ATTEMPTS is
  *  reached, 'pending' if it will still be retried), or undefined if there
- *  was no entry to update. Callers use this to distinguish a terminal
- *  failure (UI should stop showing "pending" and offer retry) from a
- *  transient one that will be retried automatically. */
-export async function markSendFailed(id: string, error: string): Promise<OutboxStatus | undefined> {
-  const entry = await mutate(id, (entry) => ({
-    ...entry,
-    status: entry.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending',
-    lastError: error,
-  }));
+ *  was no entry to update — or the caller's claim is stale (#R5-5: the row
+ *  was demoted and possibly re-claimed since this caller's markSending();
+ *  its delayed rejection must not demote the newer owner's in-flight send
+ *  to 'pending', which would queue yet another transmission). Callers use
+ *  the status to distinguish a terminal failure (UI should stop showing
+ *  "pending" and offer retry) from a transient one retried automatically. */
+export async function markSendFailed(id: string, error: string, claimToken: string): Promise<OutboxStatus | undefined> {
+  const entry = await mutate(id, (entry) => (
+    entry.claimToken === claimToken
+      ? {
+          ...entry,
+          status: entry.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending',
+          lastError: error,
+          ownerId: undefined,
+          claimToken: undefined,
+          leaseExpiresAt: undefined,
+        }
+      : undefined
+  ));
   if (entry) notify(entry.channel);
   return entry?.status;
 }
 
-export async function markFailed(id: string, error: string): Promise<void> {
-  const entry = await mutate(id, (entry) => ({ ...entry, status: 'failed', lastError: error }));
+/** Claim-scoped like markSendFailed (#R5-5): a stale owner's long-delayed
+ *  ack-timeout must not flip a row a newer owner is actively sending to
+ *  'failed'. No-ops unless the presented token is the row's current claim. */
+export async function markFailed(id: string, error: string, claimToken: string): Promise<void> {
+  const entry = await mutate(id, (entry) => (
+    entry.claimToken === claimToken
+      ? { ...entry, status: 'failed', lastError: error, ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
+      : undefined
+  ));
   if (entry) notify(entry.channel);
 }
 
@@ -196,23 +229,40 @@ export async function settle(id: string): Promise<void> {
  * trigger drains must tolerate bursts (the provider drains on status
  * transitions, not per notification). All demotions happen within ONE
  * transaction (see the module comment above).
+ *
+ * Returns the EARLIEST leaseExpiresAt among rows it skipped (foreign-owned,
+ * lease still valid), or null if nothing was skipped (#R5-4). A one-shot
+ * boot-time call is not enough on its own: a reload seconds after a crash
+ * sees the dead tab's still-unexpired lease, skips the row, and — on a
+ * stable connection, where no 'closed' event ever fires — nothing would
+ * ever call this again, leaving the row 'sending' forever. The caller uses
+ * this to schedule a re-check just past that expiry (see context.tsx's
+ * sweepLeases).
  */
-export async function demoteSending(myTabId: string): Promise<void> {
-  const demoted = await withTransaction('outbox', 'readwrite', async (s) => {
+export async function demoteSending(myTabId: string): Promise<number | null> {
+  const { touched, nextForeignExpiry } = await withTransaction('outbox', 'readwrite', async (s) => {
     const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
-    const touched: string[] = [];
+    const result = { touched: [] as string[], nextForeignExpiry: null as number | null };
     const now = Date.now();
     for (const entry of all) {
       if (entry.status !== 'sending') continue;
       const ownedByMe = entry.ownerId === myTabId;
       const leaseExpired = entry.leaseExpiresAt === undefined || entry.leaseExpiresAt <= now;
-      if (!ownedByMe && !leaseExpired) continue; // another tab is actively (and still validly) sending this
-      await promisifyRequest(s.put({ ...entry, status: 'pending', ownerId: undefined, leaseExpiresAt: undefined }));
-      touched.push(entry.channel);
+      if (!ownedByMe && !leaseExpired) {
+        // Another tab is actively (and still validly) sending this — but
+        // record when its claim lapses so the caller can look again then.
+        if (result.nextForeignExpiry === null || entry.leaseExpiresAt! < result.nextForeignExpiry) {
+          result.nextForeignExpiry = entry.leaseExpiresAt!;
+        }
+        continue;
+      }
+      await promisifyRequest(s.put({ ...entry, status: 'pending', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
+      result.touched.push(entry.channel);
     }
-    return touched;
+    return result;
   });
-  for (const channel of demoted) notify(channel);
+  for (const channel of touched) notify(channel);
+  return nextForeignExpiry;
 }
 
 /** Clear the entire outbox, in one transaction — see the module comment. */

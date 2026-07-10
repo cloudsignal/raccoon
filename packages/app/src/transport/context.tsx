@@ -137,6 +137,17 @@ export function TransportProvider(props: TransportProviderProps) {
   // see outbox.ts's demoteSending() for the full reasoning.
   const tabIdRef = useRef<string | undefined>(undefined);
   if (!tabIdRef.current) tabIdRef.current = crypto.randomUUID();
+  // R5-3: cross-tab identity coordination. IndexedDB rows are shared
+  // per-origin but every tab's in-memory identity (validUserIdRef,
+  // sessionRef) is its own — so a wipe/unpair in one tab left other
+  // still-open tabs running the wiped identity, free to keep enqueueing
+  // rows as it. Wipe paths post 'identity-wiped' here; every other tab
+  // tears itself down to setup on receipt (see the boot effect's listener).
+  // Feature-detected: absent BroadcastChannel (very old engines), the
+  // claim-time identity scoping in attempt()/markSending() still prevents
+  // any cross-identity transmission — this coordination just stops the
+  // stale tab from acting at all.
+  const bcRef = useRef<BroadcastChannel | null>(null);
   // R4-3: bumped SYNCHRONOUSLY (before any await) on every identity
   // transition — wipe/unpair AND successful (re-)pairing — see unpair(),
   // the auth-error handler, loadSession's success path, and
@@ -208,10 +219,18 @@ export function TransportProvider(props: TransportProviderProps) {
   const attempt = useCallback(async (entry: outbox.OutboxEntry) => {
     const transport = transportRef.current;
     if (!transport) return;
+    // R5-3: the identity this tab is CURRENTLY allowed to send as. Rows are
+    // shared per-origin across tabs, so a row written by a stale tab still
+    // running a since-wiped identity can appear in this tab's listPending()
+    // snapshot. The claim below is scoped to this identity inside the same
+    // atomic transaction — a row whose envelope was written as anyone else
+    // is never claimed, and therefore never transmitted, by this tab.
+    const from = validUserIdRef.current ? userAddress(validUserIdRef.current) : null;
+    if (!from) return;
     // R4-3: drain() iterates a SNAPSHOT of listPending() taken at its start.
     // If a wipe (unpair/auth-error) clears the outbox WHILE that snapshot is
     // still being processed, a later entry in it no longer has a row —
-    // markSending() returns false. transportRef.current, meanwhile, may
+    // markSending() returns null. transportRef.current, meanwhile, may
     // already point at a DIFFERENT identity's freshly-wired transport (a
     // re-pair can complete in the same window). Without this check, a stale
     // entry was sent through whatever transport happened to be active,
@@ -222,11 +241,17 @@ export function TransportProvider(props: TransportProviderProps) {
     // snapshot; only the FIRST to actually commit its markSending()
     // transaction wins the claim (IndexedDB serializes the two 'readwrite'
     // transactions, and the second sees status already 'sending', not
-    // 'pending' — so it fails the CAS and gets false back). Without this,
+    // 'pending' — so it fails the CAS and gets null back). Without this,
     // both tabs unconditionally flipped the row to 'sending' and both
     // transmitted it.
-    const claimed = await outbox.markSending(entry.id, tabIdRef.current!);
-    if (!claimed) return;
+    //
+    // R5-5: the returned token names THIS claim specifically. The failure
+    // paths below (ack timer, send rejection) present it, so if this tab is
+    // background-throttled past its lease and the row is re-claimed
+    // elsewhere, their delayed writes no-op instead of clobbering the newer
+    // owner's in-flight send.
+    const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, from);
+    if (!claimToken) return;
     try {
       await transport.send(entry.env);
       // msg and approval.response both get a server ack (bridge.ts) and so both
@@ -240,7 +265,7 @@ export function TransportProvider(props: TransportProviderProps) {
         if (prior) clearTimeout(prior);
         const timer = setTimeout(() => {
           ackTimers.current.delete(entry.id);
-          void outbox.markFailed(entry.id, 'no ack');
+          void outbox.markFailed(entry.id, 'no ack', claimToken);
           dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
         }, ACK_TIMEOUT_MS);
         ackTimers.current.set(entry.id, timer);
@@ -257,7 +282,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // the message/response stayed shown as pending forever once outbox
       // retries were exhausted, with no "tap to retry" affordance (gated on
       // delivery === 'failed' — see message-bubble.tsx / approval-card.tsx).
-      const status = await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed');
+      const status = await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed', claimToken);
       if (status === 'failed') {
         dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
       }
@@ -275,12 +300,47 @@ export function TransportProvider(props: TransportProviderProps) {
       do {
         drainPendingRef.current = false;
         const pending = await outbox.listPending();
-        for (const entry of pending) await attempt(entry);
+        // R5-3: attempt()'s identity-scoped claim is the authoritative guard —
+        // it can never transmit a foreign-identity row. This pass additionally
+        // PURGES such rows: with sessions shared per-origin, a row written
+        // under an identity other than the current one can never legitimately
+        // be sent later (that identity's session is gone — the row is debris a
+        // wipe raced past), and leaving it would re-surface it on every drain.
+        const from = validUserIdRef.current ? userAddress(validUserIdRef.current) : null;
+        for (const entry of pending) {
+          if (from && entry.env.from !== from) { await outbox.settle(entry.id); continue; }
+          await attempt(entry);
+        }
       } while (drainPendingRef.current);
     } finally {
       drainLockRef.current = false;
     }
   }, [attempt]);
+
+  // R5-4: one-shot timer for re-running demoteSending() once a foreign
+  // (other-tab) lease it had to skip lapses. Boot's single demoteSending()
+  // call alone strands a row forever when the owning tab crashed moments
+  // before this one loaded: the lease is still valid at boot, the row is
+  // (correctly) skipped — and on a stable connection no 'closed' event ever
+  // triggers another look. The sweep reschedules itself until nothing is
+  // left to wait on.
+  const leaseSweepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sweepLeasesRef = useRef<() => void>(() => {});
+  const sweepLeases = useCallback((): Promise<void> => {
+    if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
+    return outbox.demoteSending(tabIdRef.current!).then((nextForeignExpiry) => {
+      // Anything requeued only actually retransmits via drain — but never
+      // drain over a closed transport (it would burn retry attempts).
+      if (statusNowRef.current === 'open') void drain();
+      if (nextForeignExpiry !== null) {
+        leaseSweepTimerRef.current = setTimeout(
+          () => sweepLeasesRef.current(),
+          Math.max(nextForeignExpiry - Date.now(), 0) + 100,
+        );
+      }
+    });
+  }, [drain]);
+  sweepLeasesRef.current = sweepLeases;
 
   // Full local-identity wipe, used on unpair and on a terminal auth-error: cancel
   // pending ack timers, clear the kv store (session, read markers, push flag) AND the
@@ -339,7 +399,7 @@ export function TransportProvider(props: TransportProviderProps) {
         if (active) channels.add(active);
         for (const c of channels) requestHistory(c);
       }
-      if (s === 'closed') void outbox.demoteSending(tabIdRef.current!);
+      if (s === 'closed') void sweepLeases();
     });
     const isOverride = !!props.transportOverride;
     const u3 = transport.onAuthError(() => {
@@ -362,6 +422,10 @@ export function TransportProvider(props: TransportProviderProps) {
         sessionGenRef.current += 1;
         const myGen = sessionGenRef.current;
         validUserIdRef.current = null;
+        // R5-3: tell every OTHER open tab this identity is gone, so none of
+        // them keeps enqueueing/acting as it (their in-memory refs are their
+        // own — the IDB wipe below alone would never reach them).
+        bcRef.current?.postMessage({ type: 'identity-wiped' });
         // Default (standalone) path: terminal unpair. Fully wipe local identity
         // state (session, read markers, push flag, queued outbox) and reset chat
         // state so a re-pair as a different user cannot inherit it, then drop back
@@ -400,7 +464,7 @@ export function TransportProvider(props: TransportProviderProps) {
     });
     // Finding 1: store all three unsubscribe functions
     unsubsRef.current = [u1, u2, u3];
-  }, [drain, handleEnvelope, requestHistory, wipeAndReset]);
+  }, [drain, handleEnvelope, requestHistory, wipeAndReset, sweepLeases]);
 
   useEffect(() => {
     // Host-embedding fast path: a pre-constructed, already-authenticated transport
@@ -424,8 +488,9 @@ export function TransportProvider(props: TransportProviderProps) {
       // 'closed' event, which a killed tab never gets to fire. Must complete
       // BEFORE wireTransport so the first drain() this boot (triggered by the
       // 'open' status event) is guaranteed to see the requeued rows as 'pending',
-      // not race against them still being 'sending'.
-      void outbox.demoteSending(tabIdRef.current!).finally(() => {
+      // not race against them still being 'sending'. Via sweepLeases (#R5-4)
+      // so a skipped still-leased foreign row gets re-checked when it lapses.
+      void sweepLeases().finally(() => {
         // R4-10: if the provider unmounted while demoteSending() was in
         // flight, the cleanup below already ran and will never run again —
         // wiring now would leave zombie subscriptions bound to this dead
@@ -438,6 +503,7 @@ export function TransportProvider(props: TransportProviderProps) {
       });
       return () => {
         overrideCancelled = true;
+        if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
         for (const unsub of unsubsRef.current) unsub();
         unsubsRef.current = [];
         for (const timer of ackTimers.current.values()) clearTimeout(timer);
@@ -448,6 +514,33 @@ export function TransportProvider(props: TransportProviderProps) {
     }
 
     let cancelled = false;
+    // R5-3: listen for another tab's wipe/unpair and tear this tab down too.
+    // Without this, a tab left open across another tab's unpair kept its
+    // in-memory identity live indefinitely — still able to enqueue outbox
+    // rows (and show chat UI) as a user whose local state was already wiped.
+    if (typeof BroadcastChannel !== 'undefined') {
+      const bc = new BroadcastChannel('raccoon-identity');
+      bcRef.current = bc;
+      bc.addEventListener('message', (ev) => {
+        if (cancelled || (ev as MessageEvent).data?.type !== 'identity-wiped') return;
+        // Same synchronous-first discipline as the auth-error handler: kill
+        // the identity before any async work, so in-flight sendMessage /
+        // sendEnvelope calls are rejected from this instant on.
+        sessionGenRef.current += 1;
+        validUserIdRef.current = null;
+        for (const timer of ackTimers.current.values()) clearTimeout(timer);
+        ackTimers.current.clear();
+        for (const unsub of unsubsRef.current) unsub();
+        unsubsRef.current = [];
+        void transportRef.current?.close();
+        transportRef.current = null;
+        dispatch({ type: 'reset' });
+        setSession(null);
+        setActiveChannel(null);
+        setAuthError('This device was unpaired in another tab. Scan a new QR code to reconnect.');
+        setPhase('setup');
+      });
+    }
     void loadSession().then(async (loaded) => {
       if (cancelled) return;
       if (!loaded) { setPhase('setup'); return; }
@@ -463,7 +556,9 @@ export function TransportProvider(props: TransportProviderProps) {
       // R3-8: see the matching comment in the transportOverride branch above —
       // must complete before wireTransport so the boot drain() can't miss rows
       // stranded in 'sending' by a crash/reload in the previous session.
-      await outbox.demoteSending(tabIdRef.current!);
+      // Via sweepLeases (#R5-4) so a skipped still-leased foreign row gets
+      // re-checked when its lease lapses instead of stranding forever.
+      await sweepLeases();
       // R4-10: re-check after the await above — if the provider unmounted
       // while demoteSending() was in flight, the cleanup below already ran
       // (transportRef was still null/stale at that point, so it had nothing
@@ -478,6 +573,9 @@ export function TransportProvider(props: TransportProviderProps) {
     });
     return () => {
       cancelled = true;
+      bcRef.current?.close();
+      bcRef.current = null;
+      if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
       // Finding 1: clean up all subscriptions on unmount
       for (const unsub of unsubsRef.current) unsub();
       unsubsRef.current = [];
@@ -648,6 +746,9 @@ export function TransportProvider(props: TransportProviderProps) {
     // be picked up by a later drain() under a different identity.
     sessionGenRef.current += 1;
     const myGen = sessionGenRef.current;
+    // R5-3: tell every OTHER open tab this identity is gone — see the
+    // auth-error handler's matching comment.
+    bcRef.current?.postMessage({ type: 'identity-wiped' });
     // Tear down THIS device's push registration before closing the transport
     // (still need the connection + userId for the server-side unsubscribe).
     // Without this, only local app state was ever wiped: the server-side

@@ -112,7 +112,7 @@ describe('TransportProvider', () => {
     // than a still-possibly-alive claim) by backdating Date.now() for just
     // this one markSending() call, landing leaseExpiresAt safely in the past.
     const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - outbox.SEND_LEASE_MS - 1000);
-    await outbox.markSending(stranded.id, 'crashed-prior-tab');
+    await outbox.markSending(stranded.id, 'crashed-prior-tab', 'user:u1');
     dateNowSpy.mockRestore();
     expect(await outbox.listPending()).toEqual([]); // excluded from listPending while 'sending'
 
@@ -130,6 +130,96 @@ describe('TransportProvider', () => {
     expect(await outbox.listPending()).toEqual([]); // moved to 'sending' again by the successful attempt
   });
 
+  it('never sends — and purges — a pending row written under a different identity (#R5-3)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport); // current identity: u1
+
+    // A row surviving in the shared per-origin store from a stale tab that
+    // was still running as user:other (e.g. its enqueue raced a wipe).
+    await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:other', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'someone else\'s message' },
+    }));
+    // A legitimate row for the current identity, to prove drain still works.
+    const mine = await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'mine' },
+    }));
+
+    act(() => { transport.setStatus('open'); }); // trigger drain
+
+    await waitFor(() => expect(transport.sent.some((e) => e.id === mine.id)).toBe(true));
+    // The foreign row was neither transmitted through u1's session…
+    expect(transport.sent.some((e) => e.from === 'user:other')).toBe(false);
+    // …nor left behind to re-surface on every future drain.
+    expect((await outbox.listForChannel('coordinator')).filter((e) => e.env.from === 'user:other')).toEqual([]);
+  });
+
+  it('a wipe in one tab tears down other tabs running the same identity (#R5-3 cross-tab)', async () => {
+    interface Sink { api?: ChatApi }
+    function ProbeInto({ sink }: { sink: Sink }) {
+      sink.api = useChat();
+      return <div>{sink.api.phase}</div>;
+    }
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    const a: Sink = {};
+    const b: Sink = {};
+    const tA = new FakeTransport();
+    const tB = new FakeTransport();
+    render(<TransportProvider makeTransport={() => tA}><ProbeInto sink={a} /></TransportProvider>);
+    render(<TransportProvider makeTransport={() => tB}><ProbeInto sink={b} /></TransportProvider>);
+    await waitFor(() => {
+      expect(a.api?.phase).toBe('ready');
+      expect(b.api?.phase).toBe('ready');
+    });
+
+    // "Tab" A unpairs. Without the identity-wiped broadcast, tab B kept its
+    // in-memory identity live indefinitely — still enqueueing rows (and
+    // showing chat UI) as a user whose local state was already wiped.
+    await act(async () => { await a.api!.unpair(); });
+
+    await waitFor(() => expect(b.api!.phase).toBe('setup'));
+
+    // Tab B can no longer act as the wiped identity. Its api surface drops
+    // sendMessage outside phase 'ready' (hence ?.()), and even a stale UI
+    // closure that captured the pre-teardown function is rejected by the
+    // synchronously-nulled validUserIdRef — either way, nothing reaches the
+    // outbox or the transport.
+    act(() => { b.api!.sendMessage?.('coordinator', 'stale message from a dead identity'); });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await outbox.listPending()).toEqual([]);
+    expect(tB.sent.filter((e) => e.kind === 'msg')).toHaveLength(0);
+  });
+
+  it('a foreign row whose lease is still valid at boot is requeued and sent once that lease lapses (#R5-4)', async () => {
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    const stranded = await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'crashed mid-send' },
+    }));
+    // The owning tab crashed MOMENTS ago: its lease is still valid at boot
+    // (expires ~1.5s from now), so the one-shot boot demote must skip it.
+    // Backdate Date.now() during the claim so leaseExpiresAt lands there.
+    const realNow = Date.now();
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow - outbox.SEND_LEASE_MS + 1500);
+    await outbox.markSending(stranded.id, 'crashed-tab', 'user:u1');
+    dateNowSpy.mockRestore();
+
+    const transport = new FakeTransport();
+    render(
+      <TransportProvider makeTransport={() => transport}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+    // Still leased right after boot — correctly not requeued yet.
+    expect(await outbox.listPending()).toEqual([]);
+
+    // Once the lease lapses, the scheduled sweep (not any transport event —
+    // the connection stays stably open throughout) must requeue and send it.
+    await waitFor(
+      () => expect(transport.sent.some((e) => e.id === stranded.id)).toBe(true),
+      { timeout: 5000 },
+    );
+  }, 10_000);
+
   it('does not wire/connect a transport if the provider unmounts during boot recovery (#R4-10)', async () => {
     await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
 
@@ -138,7 +228,7 @@ describe('TransportProvider', () => {
     // in flight, mid-way through the loadSession().then(...) chain.
     let releaseDemote!: () => void;
     const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
-    const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; });
+    const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; return null; });
 
     const transport = new FakeTransport();
     const { unmount } = render(
@@ -433,7 +523,7 @@ describe('TransportProvider', () => {
     it('does not wire/connect the override transport if the provider unmounts during boot recovery (#R4-10)', async () => {
       let releaseDemote!: () => void;
       const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
-      const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; });
+      const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; return null; });
 
       const transport = new FakeTransport();
       const { unmount } = render(
