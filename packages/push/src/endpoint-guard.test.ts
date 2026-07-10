@@ -2,10 +2,24 @@ import { describe, it, expect } from 'vitest';
 import { isSafeWebPushEndpoint } from './endpoint-guard.js';
 
 describe('isSafeWebPushEndpoint', () => {
-  it('accepts normal public https push endpoints', () => {
+  it('accepts known-vendor https push endpoints, including a vendor subdomain', () => {
     expect(isSafeWebPushEndpoint('https://fcm.googleapis.com/fcm/send/abc')).toBe(true);
     expect(isSafeWebPushEndpoint('https://updates.push.services.mozilla.com/wpush/v2/xyz')).toBe(true);
-    expect(isSafeWebPushEndpoint('https://8.8.8.8/x')).toBe(true);
+    expect(isSafeWebPushEndpoint('https://web.push.apple.com/x')).toBe(true);
+    // Subdomain of a known vendor suffix must also match.
+    expect(isSafeWebPushEndpoint('https://region1.fcm.googleapis.com/x')).toBe(true);
+  });
+
+  it('rejects a hostname that is not a known push vendor, even if it is a benign public host (#R2-7)', () => {
+    // Closes the DNS-hostname SSRF gap the IP-literal guard alone left open:
+    // an attacker-registered or rebinding-capable hostname is never a known
+    // vendor domain, so it is rejected regardless of what it resolves to.
+    expect(isSafeWebPushEndpoint('https://8.8.8.8/x')).toBe(false);
+    expect(isSafeWebPushEndpoint('https://evil.example.com/x')).toBe(false);
+    expect(isSafeWebPushEndpoint('https://fake-fcm.googleapis.com.evil.com/x')).toBe(false);
+    // Not a subdomain of the vendor suffix (evil-fcm.googleapis.com does not
+    // end with '.fcm.googleapis.com') — must not be confused for one.
+    expect(isSafeWebPushEndpoint('https://evilfcm.googleapis.com/x')).toBe(false);
   });
 
   it('rejects non-https schemes', () => {
@@ -37,10 +51,13 @@ describe('isSafeWebPushEndpoint', () => {
     expect(isSafeWebPushEndpoint('https://[::ffff:127.0.0.1]/x')).toBe(false);
   });
 
-  it('allows public IPs just outside the private ranges', () => {
-    expect(isSafeWebPushEndpoint('https://172.15.0.1/x')).toBe(true);
-    expect(isSafeWebPushEndpoint('https://172.32.0.1/x')).toBe(true);
-    expect(isSafeWebPushEndpoint('https://11.0.0.1/x')).toBe(true);
+  it('still rejects public IPs just outside the private ranges (not a known vendor)', () => {
+    // isPrivateIp's own range-boundary logic is correct here (these are NOT
+    // flagged as private) — but the vendor allowlist still rejects them, since
+    // no real push vendor is ever a bare IP literal.
+    expect(isSafeWebPushEndpoint('https://172.15.0.1/x')).toBe(false);
+    expect(isSafeWebPushEndpoint('https://172.32.0.1/x')).toBe(false);
+    expect(isSafeWebPushEndpoint('https://11.0.0.1/x')).toBe(false);
   });
 
   it('rejects malformed input', () => {

@@ -50,7 +50,7 @@ describe('withPushFallback', () => {
     hub.onEnvelope((env) => seen.push(env));
     inner.emit(createEnvelope('push.subscribe', {
       from: 'user:u1', to: 'system', channel: 'system',
-      payload: { subscription: sub('https://push.example/1') },
+      payload: { subscription: sub('https://fcm.googleapis.com/fcm/send/1') },
     }), 'u1');
     await new Promise((r) => setTimeout(r, 10));
     expect(await store.list('u1')).toHaveLength(1);
@@ -76,7 +76,7 @@ describe('withPushFallback', () => {
     for (let i = 0; i < MAX_SUBSCRIPTIONS_PER_USER + 5; i++) {
       inner.emit(createEnvelope('push.subscribe', {
         from: 'user:u1', to: 'system', channel: 'system',
-        payload: { subscription: sub(`https://push.example/${i}`) },
+        payload: { subscription: sub(`https://fcm.googleapis.com/fcm/send/${i}`) },
       }), 'u1');
       await new Promise((r) => setTimeout(r, 1)); // serialise the fire-and-forget adds
     }

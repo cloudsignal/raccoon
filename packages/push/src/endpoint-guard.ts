@@ -5,12 +5,34 @@
 // hosts (server-side request forgery), and could be made to hold unbounded
 // subscriptions for fan-out amplification.
 //
-// isSafeWebPushEndpoint is a best-effort SYNTACTIC guard: it requires https and
-// rejects literal private / loopback / link-local / metadata / ULA addresses and
-// localhost. It does NOT resolve DNS, so a hostname that resolves to a private IP
-// at request time (DNS rebinding) is out of scope; a network egress policy on the
-// sending host is the complete mitigation. This guard closes the direct case
-// (a client registering `https://169.254.169.254/...` or `https://127.0.0.1/...`).
+// isSafeWebPushEndpoint rejects literal private / loopback / link-local /
+// metadata / ULA addresses and localhost, AND requires the host to match a
+// known standard web-push vendor (below). The vendor allowlist is what
+// actually closes DNS-hostname-based SSRF: an IP-literal check alone still
+// accepts an attacker-controlled hostname that resolves to an internal
+// address (including via DNS rebinding, after this check runs) — real
+// standard web-push endpoints only ever come from this small, fixed set of
+// registrable domains, so restricting to them is not overly narrow.
+
+/**
+ * Registrable domains of known standard web-push vendors (Chrome/Edge/FCM,
+ * Firefox, Safari, legacy WNS). An endpoint's host must equal one of these or
+ * be a subdomain of one to be accepted. If you operate a push vendor not
+ * listed here, extend this list for your deployment.
+ */
+export const KNOWN_PUSH_VENDOR_SUFFIXES = [
+  'fcm.googleapis.com',
+  'android.googleapis.com',
+  'updates.push.services.mozilla.com',
+  'push.services.mozilla.com',
+  'notify.windows.com',
+  'wns.windows.com',
+  'web.push.apple.com',
+] as const;
+
+function matchesKnownPushVendor(host: string): boolean {
+  return KNOWN_PUSH_VENDOR_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
 
 /** Max stored push subscriptions per user (bounds fan-out amplification). */
 export const MAX_SUBSCRIPTIONS_PER_USER = 20;
@@ -56,10 +78,10 @@ function isPrivateIp(rawHost: string): boolean {
 
 /**
  * True if `endpoint` is a plausible, non-internal standard web-push endpoint:
- * a well-formed https URL whose host is not localhost and not a literal private /
- * loopback / link-local / metadata / ULA IP. Vendor-scheme endpoints (e.g.
- * `cloudsignal:<id>`) are NOT web-push URLs and must be validated by their vendor,
- * not here.
+ * a well-formed https URL whose host matches a known push vendor and is not
+ * localhost or a literal private / loopback / link-local / metadata / ULA IP.
+ * Vendor-scheme endpoints (e.g. `cloudsignal:<id>`) are NOT web-push URLs and
+ * must be validated by their vendor, not here.
  */
 export function isSafeWebPushEndpoint(endpoint: string): boolean {
   let url: URL;
@@ -72,5 +94,6 @@ export function isSafeWebPushEndpoint(endpoint: string): boolean {
   const host = url.hostname.toLowerCase();
   if (host === '' || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return false;
   if (isPrivateIp(host)) return false;
+  if (!matchesKnownPushVendor(host)) return false;
   return true;
 }
