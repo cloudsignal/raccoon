@@ -159,6 +159,7 @@ export function TransportProvider(props: TransportProviderProps) {
           messages: env.payload.messages,
           nextBefore: env.payload.nextBefore,
           lastRead,
+          active: isActive(env.payload.channel),
         });
       });
     }
@@ -273,11 +274,15 @@ export function TransportProvider(props: TransportProviderProps) {
         // state (session, read markers, push flag, queued outbox) and reset chat
         // state so a re-pair as a different user cannot inherit it, then drop back
         // to setup so the user can scan a new QR code.
-        void wipeAndReset();
-        sessionRef.current = null;
-        setSession(null);
-        setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
-        setPhase('setup');
+        // Defer the transition until the wipe settles: nulling the session and
+        // dropping to setup only after wipeLocal() completes closes a TOCTOU where a
+        // re-pair racing the async wipe could have its freshly-saved session cleared.
+        void wipeAndReset().finally(() => {
+          sessionRef.current = null;
+          setSession(null);
+          setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
+          setPhase('setup');
+        });
       }
     });
     // Finding 1: store all three unsubscribe functions

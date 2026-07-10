@@ -31,6 +31,36 @@ describe('chatReducer', () => {
     expect(state.historyLoaded['coordinator']).toBe(true);
   });
 
+  it('bumps unread for agent messages caught up on a background reconnect, not while viewing (#4/#10)', () => {
+    // First load while active: establishes the channel with no unread.
+    let state = chatReducer(emptyChatState, {
+      type: 'history', channel: 'coordinator', agentId: 'coordinator',
+      messages: [{ id: 'h1', role: 'agent', text: 'seen', ts: '2026-07-04T08:00:00.000Z' }],
+      lastRead: '2026-07-04T08:00:00.000Z', active: true,
+    });
+    expect(state.unread['coordinator'] ?? 0).toBe(0);
+
+    // Reconnect catch-up on a BACKGROUND channel surfaces a newer agent message
+    // that was missed while offline -> it counts toward the unread badge.
+    state = chatReducer(state, {
+      type: 'history', channel: 'coordinator', agentId: 'coordinator',
+      messages: [
+        { id: 'h1', role: 'agent', text: 'seen', ts: '2026-07-04T08:00:00.000Z' }, // deduped
+        { id: 'h2', role: 'agent', text: 'missed', ts: '2026-07-04T09:00:00.000Z' },
+      ],
+      lastRead: '2026-07-04T08:00:00.000Z', active: false,
+    });
+    expect(state.unread['coordinator']).toBe(1);
+
+    // The same catch-up while the channel is ACTIVE (being viewed) must not bump.
+    state = chatReducer(state, {
+      type: 'history', channel: 'coordinator', agentId: 'coordinator',
+      messages: [{ id: 'h3', role: 'agent', text: 'while-viewing', ts: '2026-07-04T09:30:00.000Z' }],
+      lastRead: '2026-07-04T08:00:00.000Z', active: true,
+    });
+    expect(state.unread['coordinator']).toBe(1);
+  });
+
   it('appends live agent messages, dedupes, clears typing, counts unread when inactive', () => {
     const env = agentMsg('hello');
     let state: ChatState = { ...emptyChatState, typing: { coordinator: true } };

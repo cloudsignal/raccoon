@@ -32,7 +32,7 @@ export const emptyChatState: ChatState = {
 };
 
 export type ChatAction =
-  | { type: 'history'; channel: string; agentId: string; messages: HistoryMessage[]; nextBefore?: string; lastRead?: string }
+  | { type: 'history'; channel: string; agentId: string; messages: HistoryMessage[]; nextBefore?: string; lastRead?: string; active?: boolean }
   | { type: 'message'; env: Envelope<'msg'>; active: boolean }
   | { type: 'approval'; env: Envelope<'approval.request'>; active: boolean }
   | { type: 'optimistic'; msg: ChatMessage }
@@ -86,9 +86,22 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       }
       const merged = [...existing, ...incoming].sort(byTs);
       const firstLoad = !state.historyLoaded[action.channel];
-      const unread = firstLoad && action.lastRead
-        ? merged.filter((m) => m.role === 'agent' && m.ts > action.lastRead!).length
-        : state.unread[action.channel] ?? 0;
+      let unread: number;
+      if (firstLoad) {
+        unread = action.lastRead
+          ? merged.filter((m) => m.role === 'agent' && m.ts > action.lastRead!).length
+          : state.unread[action.channel] ?? 0;
+      } else if (action.active) {
+        // The user is viewing this channel; catch-up messages are seen, not unread.
+        unread = state.unread[action.channel] ?? 0;
+      } else {
+        // Background catch-up (#10): count newly-arrived agent messages missed while
+        // disconnected toward the unread badge.
+        const missed = incoming.filter(
+          (m) => m.role === 'agent' && (!action.lastRead || m.ts > action.lastRead!),
+        ).length;
+        unread = (state.unread[action.channel] ?? 0) + missed;
+      }
       return {
         ...patch(state, action.channel, merged),
         unread: { ...state.unread, [action.channel]: unread },

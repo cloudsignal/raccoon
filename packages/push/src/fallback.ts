@@ -60,9 +60,20 @@ export function withPushFallback(
     await opts.store.add(userId, sub);
   };
 
+  // Serialise adds per user so the list -> cap-check -> add sequence is atomic for
+  // a given user; concurrent distinct-endpoint subscribes then cannot each pass the
+  // cap check before any write and overshoot MAX_SUBSCRIPTIONS_PER_USER.
+  const addChains = new Map<string, Promise<void>>();
+  const enqueueAdd = (userId: string, sub: PushSubscriptionJson): void => {
+    const prev = addChains.get(userId) ?? Promise.resolve();
+    const next = prev.then(() => addSubscription(userId, sub)).catch(() => { /* best-effort */ });
+    addChains.set(userId, next);
+    void next.finally(() => { if (addChains.get(userId) === next) addChains.delete(userId); });
+  };
+
   const stopCapture = hub.onEnvelope((env, userId) => {
     if (env.kind !== 'push.subscribe') return;
-    void addSubscription(userId, env.payload.subscription);
+    enqueueAdd(userId, env.payload.subscription);
   });
 
   return {

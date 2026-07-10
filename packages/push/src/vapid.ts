@@ -41,7 +41,13 @@ export class VapidPushSender implements PushSender {
       webpush.sendNotification(
         { endpoint: sub.endpoint, keys: sub.keys },
         JSON.stringify(payload),
-        { vapidDetails: { subject: this.opts.subject, publicKey: this.opts.publicKey, privateKey: this.opts.privateKey } },
+        {
+          vapidDetails: { subject: this.opts.subject, publicKey: this.opts.publicKey, privateKey: this.opts.privateKey },
+          // Socket timeout: web-push destroys (aborts) the request on inactivity so a
+          // hung endpoint does not leak the connection. withTimeout below bounds total
+          // wall-clock as a backstop for a slow-drip response.
+          timeout: PUSH_SEND_TIMEOUT_MS,
+        },
       ),
       PUSH_SEND_TIMEOUT_MS,
     );
