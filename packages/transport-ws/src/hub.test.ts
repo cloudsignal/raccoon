@@ -102,6 +102,43 @@ describe('WsHub pairing', () => {
     expect(await nextClose(resumed)).toBe(4401);
   });
 
+  it('a stale close handler for a revoked socket does not disconnect a same-user re-pair (#R2-8)', async () => {
+    hub = new WsHub({ instance: 'test' });
+    const { port } = await hub.start();
+
+    // Pair the first time.
+    const token1 = hub.issuePairingToken('u1');
+    const ws1 = await connect(port);
+    ws1.send(pairRequest(token1));
+    await nextMessage(ws1); // pair.grant
+
+    // Revoke deletes byUser['u1'] SYNCHRONOUSLY (before ws1's own close event
+    // has fired — ws1.close() only INITIATES the close handshake).
+    const closed1 = nextClose(ws1);
+    await hub.revokeUser('u1');
+
+    // Re-pair as the SAME user BEFORE ws1's close event has finished — attach()
+    // creates a brand-new Set for 'u1'.
+    const token2 = hub.issuePairingToken('u1');
+    const ws2 = await connect(port);
+    ws2.send(pairRequest(token2));
+    await nextMessage(ws2); // pair.grant
+
+    // Now let ws1's close handshake actually complete (its close handler runs
+    // on the server as part of this).
+    expect(await closed1).toBe(4403);
+
+    // The old code unconditionally deleted byUser['u1'] once ws1's (now
+    // orphaned) Set emptied, wiping out ws2's registration. Confirm ws2 is
+    // still registered: a message sent to 'u1' must still reach it.
+    const received = nextMessage(ws2);
+    const delivered = hub.sendToUser('u1', createEnvelope('typing', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator', payload: { state: 'start' },
+    }));
+    expect(delivered).toBe(true);
+    expect((await received).kind).toBe('typing');
+  });
+
   it('a revoke racing an in-flight token redemption does not leave a live session (#R2-2)', async () => {
     // A store whose createSession() pauses until released, so we can revoke
     // the user WHILE a redemption for them is mid-flight — the reviewer's

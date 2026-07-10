@@ -260,7 +260,17 @@ export class WsHub {
     let set = this.byUser.get(userId);
     if (!set) { set = new Set(); this.byUser.set(userId, set); }
     set.add(ws);
-    ws.on('close', () => { set!.delete(ws); if (set!.size === 0) this.byUser.delete(userId); });
+    ws.on('close', () => {
+      set!.delete(ws);
+      // Only delete the map entry if it STILL points at THIS closure's Set. A
+      // revoke (or any path that removes the map entry synchronously, e.g.
+      // revokeUser) can be followed by a fresh attach() for the same userId
+      // before this socket's delayed close event fires; that attach() creates
+      // a NEW Set. Without this check, this stale close handler emptying its
+      // OWN (now-orphaned) Set would still `byUser.delete(userId)` and wipe
+      // out the replacement Set, disconnecting the just-reconnected user.
+      if (set!.size === 0 && this.byUser.get(userId) === set) this.byUser.delete(userId);
+    });
     ws.on('message', (data) => {
       let parsed: unknown;
       try { parsed = JSON.parse(data.toString()); } catch { return; }
