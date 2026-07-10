@@ -1,6 +1,8 @@
 import { parseAddress, type AnyEnvelope } from '@raccoon/protocol';
-import type { PushCapableHub, PushPayload, PushSender, SubscriptionStore } from './types.js';
+import type { PushCapableHub, PushPayload, PushSender, PushSubscriptionJson, SubscriptionStore } from './types.js';
 import { sendPushToUser } from './delivery.js';
+import { vendorOf } from './vendor.js';
+import { isSafeWebPushEndpoint, MAX_SUBSCRIPTIONS_PER_USER } from './endpoint-guard.js';
 
 function defaultNotify(env: AnyEnvelope): PushPayload | null {
   if (env.kind === 'msg') {
@@ -42,9 +44,25 @@ export function withPushFallback(
     },
   };
 
+  // Subscribe boundary: apply the SSRF guard and a per-user cap before storing a
+  // client-supplied subscription. A standard web-push endpoint must be a safe https
+  // URL; vendor-scheme endpoints are validated by their vendor. Re-subscribing the
+  // same endpoint is always allowed; the cap only blocks growth of distinct ones.
+  const addSubscription = async (userId: string, sub: PushSubscriptionJson): Promise<void> => {
+    if (vendorOf(sub) === 'webpush' && !isSafeWebPushEndpoint(sub.endpoint)) return;
+    try {
+      const existing = await opts.store.list(userId);
+      const already = existing.some((s) => s.endpoint === sub.endpoint);
+      if (!already && existing.length >= MAX_SUBSCRIPTIONS_PER_USER) return;
+    } catch {
+      /* store list failure: fall through to a best-effort add */
+    }
+    await opts.store.add(userId, sub);
+  };
+
   const stopCapture = hub.onEnvelope((env, userId) => {
     if (env.kind !== 'push.subscribe') return;
-    void opts.store.add(userId, env.payload.subscription);
+    void addSubscription(userId, env.payload.subscription);
   });
 
   return {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createEnvelope, type AnyEnvelope } from '@raccoon/protocol';
 import { InMemorySubscriptionStore } from './memory-store.js';
 import { withPushFallback } from './fallback.js';
+import { MAX_SUBSCRIPTIONS_PER_USER } from './endpoint-guard.js';
 import type { PushPayload, PushSubscriptionJson } from './types.js';
 
 class FakeHub {
@@ -54,6 +55,33 @@ describe('withPushFallback', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(await store.list('u1')).toHaveLength(1);
     expect(seen).toHaveLength(0);
+  });
+
+  it('rejects an unsafe (internal) web-push endpoint at subscribe (SSRF guard, #9)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    withPushFallback(inner, { store, sender: new FakeSender() });
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system',
+      payload: { subscription: sub('https://169.254.169.254/latest/meta-data/') },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await store.list('u1')).toHaveLength(0);
+  });
+
+  it('caps stored subscriptions per user (#9 fan-out limit)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    withPushFallback(inner, { store, sender: new FakeSender() });
+    for (let i = 0; i < MAX_SUBSCRIPTIONS_PER_USER + 5; i++) {
+      inner.emit(createEnvelope('push.subscribe', {
+        from: 'user:u1', to: 'system', channel: 'system',
+        payload: { subscription: sub(`https://push.example/${i}`) },
+      }), 'u1');
+      await new Promise((r) => setTimeout(r, 1)); // serialise the fire-and-forget adds
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    expect((await store.list('u1')).length).toBe(MAX_SUBSCRIPTIONS_PER_USER);
   });
 
   it('delivers over socket when online, pushes when offline', async () => {
