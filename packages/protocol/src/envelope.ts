@@ -32,7 +32,10 @@ const msgPayload = z.object({
   attachments: z.array(z.object({ url: z.string().url(), mime: z.string() })).optional(),
 });
 
-const ackPayload = z.object({ refId: z.string().min(1), status: z.enum(['received', 'delivered', 'read']) });
+// 'failed' (#R6-2): the server received the envelope but the turn it drives
+// failed terminally on the server side — the client should surface a retry
+// affordance instead of showing success. Sent AFTER a 'received' ack.
+const ackPayload = z.object({ refId: z.string().min(1), status: z.enum(['received', 'delivered', 'read', 'failed']) });
 
 const typingPayload = z.object({ state: z.enum(['start', 'stop']) });
 

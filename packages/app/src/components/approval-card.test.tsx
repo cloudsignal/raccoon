@@ -57,6 +57,48 @@ describe('ApprovalCard', () => {
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
   });
 
+  it('a server-side failed ack re-enables retry, and tapping it re-sends the same decision (#R6-2)', async () => {
+    const transport = await mount();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const box = await screen.findByRole('textbox');
+    await user.clear(box);
+    await user.type(box, 'Better draft');
+    await user.click(screen.getByRole('button', { name: /send edit/i }));
+    let first: Envelope<'approval.response'> | undefined;
+    await waitFor(() => {
+      first = transport.sent.find((e) => e.kind === 'approval.response') as Envelope<'approval.response'> | undefined;
+      expect(first).toBeTruthy();
+    });
+
+    // The server received the response (settles the outbox row)… then its
+    // approval turn failed terminally, surfaced as a second, FAILED ack.
+    const ackWith = (status: 'received' | 'failed') => createEnvelope('ack', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: first!.id, status },
+    });
+    act(() => { transport.emit(ackWith('received')); });
+    act(() => { transport.emit(ackWith('failed')); });
+
+    // The card must come back out of "Responded" into a retry affordance —
+    // without this, the user was shown success forever while the server had
+    // dropped their decision.
+    const retry = await screen.findByRole('button', { name: /tap to retry/i });
+    await user.click(retry);
+
+    // The retry re-sends the SAME decision as a FRESH envelope (the old
+    // outbox row was settled by the received ack and cannot be revived).
+    await waitFor(() => {
+      const responses = transport.sent.filter((e) => e.kind === 'approval.response');
+      expect(responses).toHaveLength(2);
+      const second = responses[1]!;
+      expect(second.id).not.toBe(first!.id);
+      if (second.kind === 'approval.response') {
+        expect(second.payload).toMatchObject({ refId: 'task-9', choice: 'edit', editedText: 'Better draft' });
+      }
+    });
+  });
+
   it('edit opens an inline editor and sends editedText', async () => {
     const transport = await mount();
     const user = userEvent.setup();

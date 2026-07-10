@@ -337,6 +337,47 @@ describe('RaccoonBridge', () => {
     for (const a of acks) if (a.env.kind === 'ack') expect(a.env.payload.refId).toBe(env.id);
   });
 
+  it('a failed approval turn emits a machine-readable failed ack and permits a retry to re-run (#R6-2)', async () => {
+    // Previously the bridge acked 'received' and marked the envelope seen
+    // BEFORE dispatch, then converted the runner's exception into a generic
+    // error text — so the client had settled its outbox row and hidden the
+    // approval controls, the redelivery was dropped as already-seen, and the
+    // retained approval mapping (R5-8/R6-1) was unreachable in production.
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let runs = 0;
+    const flaky: AgentRunner = {
+      async *run() {
+        runs += 1;
+        if (runs === 1) throw new Error('transient dispatch outage');
+        yield 'approved!';
+      },
+    };
+    const bridge = new RaccoonBridge({ hub, runner: flaky, store });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'Approve' },
+    });
+    hub.inject(env, 'u1');
+    await settle();
+
+    // The failure is surfaced as a FAILED ack for this envelope — the
+    // client's approval card keys respondedDelivery off exactly this, which
+    // re-enables its controls ("Tap to retry").
+    const failedAcks = hub.sent.filter((s) => s.env.kind === 'ack' && s.env.payload.status === 'failed');
+    expect(failedAcks).toHaveLength(1);
+    if (failedAcks[0]!.env.kind === 'ack') expect(failedAcks[0]!.env.payload.refId).toBe(env.id);
+
+    // And the envelope is no longer "seen": a redelivery (or the client's
+    // retry re-sending it) actually re-runs the turn, which now succeeds.
+    hub.inject(env, 'u1');
+    await settle();
+    expect(runs).toBe(2);
+    const reply = hub.sent.filter((s) => s.env.kind === 'msg').at(-1)!.env;
+    if (reply.kind === 'msg') expect(reply.payload.text).toBe('approved!');
+  });
+
   it('approval dedup eviction never removes a key whose agent turn is still running, even at cap 1 (#R4-7)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();

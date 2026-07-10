@@ -87,12 +87,20 @@ export class RaccoonBridge {
   /** Mark a (userId, envelopeId) seen for approval.response's simple, always-
    *  succeeds dedup. Returns true if it was ALREADY seen, plus a
    *  markTurnDone() the caller invokes once ITS turn (only when this was
-   *  NOT already seen) finishes — see evictCompleted / #R4-7. */
-  private markApprovalSeen(key: string): { alreadySeen: boolean; markTurnDone: () => void } {
-    if (this.approvalSeen.has(key)) return { alreadySeen: true, markTurnDone: () => {} };
+   *  NOT already seen) finishes — see evictCompleted / #R4-7 — and an
+   *  unmark() for a FAILED turn (#R6-2): a failed turn must forget the key
+   *  entirely (mirroring claim()'s failed-append semantics), so a
+   *  redelivery/retry of the same envelope gets a clean re-run instead of
+   *  being dropped as a duplicate of an attempt that never happened. */
+  private markApprovalSeen(key: string): { alreadySeen: boolean; markTurnDone: () => void; unmark: () => void } {
+    if (this.approvalSeen.has(key)) return { alreadySeen: true, markTurnDone: () => {}, unmark: () => {} };
     this.approvalSeen.set(key, false);
     this.evictCompleted(this.approvalSeen, this.dedupCap, (done) => done);
-    return { alreadySeen: false, markTurnDone: () => { this.approvalSeen.set(key, true); } };
+    return {
+      alreadySeen: false,
+      markTurnDone: () => { if (this.approvalSeen.has(key)) this.approvalSeen.set(key, true); },
+      unmark: () => { this.approvalSeen.delete(key); },
+    };
   }
 
   /**
@@ -205,7 +213,7 @@ export class RaccoonBridge {
       from: agent, to, channel, payload: { refId: env.id, status: 'received' },
     }));
 
-    const { alreadySeen, markTurnDone } = this.markApprovalSeen(`${userId}:${env.id}`);
+    const { alreadySeen, markTurnDone, unmark } = this.markApprovalSeen(`${userId}:${env.id}`);
     if (alreadySeen) return;
 
     // R4-7: see handleMsg's matching comment — markTurnDone() only after the
@@ -225,6 +233,17 @@ export class RaccoonBridge {
       }));
 
       if (failed) {
+        // #R6-2: a failed approval turn must remain retryable END TO END.
+        // Forget the envelope (a redelivery re-runs, matching claim()'s
+        // failed-append semantics) and tell the client machine-readably —
+        // the 'received' ack above already settled its outbox row and hid
+        // the approval controls, so without this second, FAILED ack the
+        // client showed "Responded" forever while the runner-side approval
+        // mapping (released by its rollback, #R6-1) sat unreachable.
+        unmark();
+        this.hub.sendToUser(userId, createEnvelope('ack', {
+          from: agent, to, channel, payload: { refId: env.id, status: 'failed' },
+        }));
         this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
         return;
       }

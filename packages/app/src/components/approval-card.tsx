@@ -11,7 +11,7 @@ function label(option: string): string {
 }
 
 export function ApprovalCard(props: { msg: ChatMessage }) {
-  const { respondApproval, retryMessage } = useChat();
+  const { respondApproval } = useChat();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(props.msg.approval?.description ?? '');
   const approval = props.msg.approval;
@@ -69,7 +69,11 @@ export function ApprovalCard(props: { msg: ChatMessage }) {
             Responded {responded}, not sent.{' '}
             <button
               type="button"
-              onClick={() => retryMessage(props.msg.channel, props.msg.responseEnvId!)}
+              // #R6-2: re-send the SAME decision as a FRESH envelope rather
+              // than reviving the old outbox row — a server-side turn
+              // failure arrives AFTER the 'received' ack settled (deleted)
+              // that row, so retryMessage() would silently do nothing.
+              onClick={() => respond(responded, props.msg.respondedEditedText)}
               className="font-medium underline"
             >
               Tap to retry

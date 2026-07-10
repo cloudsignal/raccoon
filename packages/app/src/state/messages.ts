@@ -21,6 +21,10 @@ export interface ChatMessage {
    *  ack/delivery-timeout events that confirm/fail it reference THIS id, not
    *  the approval-request message's own id. */
   responseEnvId?: string;
+  /** The editedText that accompanied respondedChoice, if any (#R6-2) — kept
+   *  so a failed response's retry can re-send the SAME decision as a fresh
+   *  envelope (the settled outbox row can no longer be revived). */
+  respondedEditedText?: string;
 }
 
 export interface ChatState {
@@ -45,16 +49,19 @@ export type ChatAction =
   | { type: 'approval'; env: Envelope<'approval.request'>; active: boolean }
   | { type: 'optimistic'; msg: ChatMessage }
   | { type: 'delivery'; channel: string; id: string; delivery: Delivery }
-  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' }
+  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' }
   | { type: 'typing'; channel: string; on: boolean }
-  | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string }
+  | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string; editedText?: string }
   | { type: 'read-channel'; channel: string }
   | { type: 'reset' };
 
-const ACK_DELIVERY: Record<'received' | 'delivered' | 'read', Delivery> = {
+// 'failed' (#R6-2): the server received the envelope but the turn it drives
+// failed terminally server-side — surfaces the retry affordance.
+const ACK_DELIVERY: Record<'received' | 'delivered' | 'read' | 'failed', Delivery> = {
   received: 'sent',
   delivered: 'delivered',
   read: 'read',
+  failed: 'failed',
 };
 
 function byTs(a: ChatMessage, b: ChatMessage): number {
@@ -185,7 +192,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'responded': {
       const list = (state.messages[action.channel] ?? []).map((m) =>
         m.kind === 'approval' && m.approval?.refId === action.refId
-          ? { ...m, respondedChoice: action.choice, respondedDelivery: 'pending' as const, responseEnvId: action.responseId }
+          ? { ...m, respondedChoice: action.choice, respondedDelivery: 'pending' as const, responseEnvId: action.responseId, respondedEditedText: action.editedText }
           : m,
       );
       return patch(state, action.channel, list);

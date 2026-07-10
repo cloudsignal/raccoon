@@ -197,9 +197,16 @@ export function TransportProvider(props: TransportProviderProps) {
       if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
     }
     else if (env.kind === 'ack') {
-      const timer = ackTimers.current.get(env.payload.refId);
-      if (timer) { clearTimeout(timer); ackTimers.current.delete(env.payload.refId); }
-      void outbox.settle(env.payload.refId);
+      // #R6-2: a FAILED ack means the server received the envelope but its
+      // turn failed terminally. Don't settle (in the normal flow the earlier
+      // 'received' ack already did; if that one was lost, the still-armed
+      // ack timer finishes the row's bookkeeping with its claim token) —
+      // just surface the failure so the approval card re-enables retry.
+      if (env.payload.status !== 'failed') {
+        const timer = ackTimers.current.get(env.payload.refId);
+        if (timer) { clearTimeout(timer); ackTimers.current.delete(env.payload.refId); }
+        void outbox.settle(env.payload.refId);
+      }
       dispatch({ type: 'ack', channel: env.channel, refId: env.payload.refId, status: env.payload.status });
     } else if (env.kind === 'history.page') {
       void kvGet<string>(`lastread:${env.payload.channel}`).then((lastRead) => {
@@ -673,7 +680,7 @@ export function TransportProvider(props: TransportProviderProps) {
       from: userAddress(userId), to: agentAddress(channel), channel,
       payload: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
     });
-    dispatch({ type: 'responded', channel, refId, choice, responseId: env.id });
+    dispatch({ type: 'responded', channel, refId, choice, responseId: env.id, ...(editedText !== undefined ? { editedText } : {}) });
     sendEnvelope(env);
   }, [sendEnvelope]);
 
