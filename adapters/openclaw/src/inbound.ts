@@ -24,7 +24,7 @@ import {
   type ReplyDispatcher,
   type ReplyPayload,
 } from 'openclaw/plugin-sdk/channel-inbound';
-import type { ApprovalValueStore } from './approval-values.js';
+import type { ApprovalChoice, ApprovalValueStore } from './approval-values.js';
 
 export interface InboundRunnerOpts {
   /** The loaded OpenClaw config object (passed through from gateway context). */
@@ -84,15 +84,37 @@ export function buildRaccoonInboundRunner(
   };
 }
 
-/** Render an approval decision as text carrying its refId and resolved value,
- *  so OpenClaw sees which pending request this turn answers instead of an
- *  unrelated-looking message. `resolvedValue` is the button's real value
- *  (falling back to its label) — see approval-values.ts. */
+/**
+ * Render an approval decision as text OpenClaw can act on.
+ *
+ * R4-2: when `resolved` is a REAL OpenClaw slash command (isCommand: true —
+ * e.g. an exec-approval action, {type:'command', command:'approve <id>
+ * allow-once'}), it must be sent back as a STANDALONE message starting with
+ * `/` — confirmed contract: "commands sent as standalone messages starting
+ * with /". The previous implementation always wrapped the choice in a
+ * `[approval.response ...]` bracket tag, which never starts with `/`, so
+ * OpenClaw's command parser never recognized it and treated exec-approval
+ * clicks as ordinary agent text — the approval itself never actually
+ * resolved.
+ *
+ * A free-text edit is never sent as a command, regardless of what the
+ * clicked button's action was — appending user-authored text to a command
+ * line would be both nonsensical and unsafe.
+ *
+ * When `resolved` is absent (the refId was never remembered here, resolution
+ * failed exact-choice/ownership/expiry validation — see approval-values.ts)
+ * or is a non-command choice, falls back to the descriptive bracket-tag text
+ * carrying the refId, so OpenClaw still sees which pending request this turn
+ * answers instead of an unrelated-looking message.
+ */
 function buildApprovalText(
   approval: NonNullable<AgentContext['approval']>,
-  resolvedValue: string,
+  resolved: ApprovalChoice | undefined,
 ): string {
-  const tag = `[approval.response refId=${approval.refId} choice=${resolvedValue}]`;
+  if (resolved?.isCommand && approval.editedText === undefined) {
+    return `/${resolved.value}`;
+  }
+  const tag = `[approval.response refId=${approval.refId} choice=${resolved?.value ?? approval.choice}]`;
   return approval.editedText !== undefined ? `${tag} ${approval.editedText}` : tag;
 }
 
@@ -127,14 +149,16 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
 
   // When this turn is a response to an approval.request, ctx.text is already
   // editedText ?? choice (set by RaccoonBridge), but that alone previously
-  // reached OpenClaw as an unstructured, unrelated-looking message: the refId
-  // and the button's real value (as opposed to its display label) were both
-  // silently dropped. Resolve the label back to its value via the same store
-  // the outbound adapter recorded it into, and prefix with the refId so
-  // OpenClaw/the agent can correlate this turn to the specific pending
-  // approval, instead of treating it as an arbitrary new chat message.
+  // reached OpenClaw as an unstructured, unrelated-looking message. Resolve
+  // the label back to its ApprovalChoice via the same store the outbound
+  // adapter recorded it into, scoped to THIS user (ctx.userId) — see
+  // approval-values.ts for the ownership/expiry/one-shot/exact-choice
+  // validation this performs. buildApprovalText then either sends a REAL
+  // OpenClaw slash command (isCommand) or the descriptive bracket-tag
+  // fallback carrying the refId, so OpenClaw/the agent can correlate this
+  // turn to the specific pending approval either way.
   const approvalText = ctx.approval
-    ? buildApprovalText(ctx.approval, opts.approvalValues?.resolve(ctx.approval.refId, ctx.approval.choice) ?? ctx.approval.choice)
+    ? buildApprovalText(ctx.approval, opts.approvalValues?.resolve(ctx.approval.refId, ctx.userId, ctx.approval.choice))
     : ctx.text;
 
   // Build a minimal FinalizedMsgContext from the Raccoon AgentContext.

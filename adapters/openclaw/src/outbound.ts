@@ -42,7 +42,7 @@ import {
 } from '@raccoon/protocol';
 import type { OutboundHub } from '@raccoon/bridge';
 import { chunkReplyText } from './formatting.js';
-import type { ApprovalValueStore } from './approval-values.js';
+import type { ApprovalChoice, ApprovalValueStore } from './approval-values.js';
 import type {
   ChannelOutboundAdapter,
   ChannelOutboundContext,
@@ -207,18 +207,19 @@ function findPresentationSelect(presentation: MessagePresentation): MessagePrese
 }
 
 /**
- * Resolve a button's underlying value: prefer the modern `action` field
- * ('callback' carries opaque plugin data; 'command' names a native slash
- * command Raccoon has no dispatcher for, so its command string is passed
- * through as the resolved value for whatever consumes the approval response
- * downstream), falling back to the legacy `value` field, then the label.
- * Per the spec, a 'callback' action's value must never be reinterpreted as a
- * slash command — this function only ever returns it as an opaque string.
+ * Resolve a button to its ApprovalChoice: prefer the modern `action` field
+ * ('callback' carries opaque plugin data; 'command' names a REAL native
+ * OpenClaw slash command — see inbound.ts's buildApprovalText, which sends
+ * an isCommand choice back as a standalone `/`-prefixed message, per the
+ * confirmed contract that OpenClaw only recognizes commands as standalone
+ * messages starting with `/`), falling back to the legacy `value` field,
+ * then the label. Per the spec, a 'callback' action's value must never be
+ * reinterpreted as a slash command — isCommand is false for it.
  */
-function resolvePresentationButtonValue(b: MessagePresentationButton): string {
-  if (b.action?.type === 'callback') return b.action.value;
-  if (b.action?.type === 'command') return b.action.command;
-  return b.value ?? b.label;
+function resolveButtonChoice(b: MessagePresentationButton): ApprovalChoice {
+  if (b.action?.type === 'callback') return { value: b.action.value, isCommand: false };
+  if (b.action?.type === 'command') return { value: b.action.command, isCommand: true };
+  return { value: b.value ?? b.label, isCommand: false };
 }
 
 /** Join the presentation's 'text'/'context' blocks (and blank lines for
@@ -253,9 +254,10 @@ async function deliverPresentation(
   const selectOptions = buttons === null ? findPresentationSelect(presentation) : null;
 
   if (buttons !== null || selectOptions !== null) {
-    const choices: Array<{ label: string; value: string }> = buttons !== null
-      ? buttons.map((b) => ({ label: b.label, value: resolvePresentationButtonValue(b) }))
-      : selectOptions!.map((o) => ({ label: o.label, value: o.value ?? o.label }));
+    const choices: Array<{ label: string; choice: ApprovalChoice }> = buttons !== null
+      ? buttons.map((b) => ({ label: b.label, choice: resolveButtonChoice(b) }))
+      // Select options carry no `action` field — never a command.
+      : selectOptions!.map((o) => ({ label: o.label, choice: { value: o.value ?? o.label, isCommand: false } }));
 
     const refId = ulid();
     const title = presentation.title?.trim()
@@ -267,7 +269,7 @@ async function deliverPresentation(
       channel,
       payload: { refId, title, description, options: choices.map((c) => c.label) },
     });
-    approvalValues?.remember(refId, new Map(choices.map((c) => [c.label, c.value])));
+    approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])));
     hub.sendToUser(userId, env);
     return makeResult(env.id, channel);
   }
@@ -367,13 +369,13 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
             options,
           },
         });
-        // Remember each button's real value (falling back to its label when
-        // the SDK didn't supply one) so the inbound runner can resolve it once
-        // the human's choice comes back as one of these labels. Without this,
-        // a button like {label:"Approve", value:"approve:task-42"} lost its
+        // Remember each button's resolved choice (action-aware — see
+        // resolveButtonChoice) so the inbound runner can resolve it once the
+        // human's choice comes back as one of these labels. Without this, a
+        // button like {label:"Approve", value:"approve:task-42"} lost its
         // value entirely — OpenClaw only ever saw "Approve" as an unrelated
         // turn, breaking any correlation to the pending action.
-        approvalValues?.remember(refId, new Map(buttons.map((b) => [b.label, b.value ?? b.label])));
+        approvalValues?.remember(refId, userId, new Map(buttons.map((b) => [b.label, resolveButtonChoice(b)])));
         hub.sendToUser(userId, env);
         return makeResult(env.id, channel);
       }

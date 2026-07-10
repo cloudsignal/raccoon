@@ -93,9 +93,13 @@ describe('buildRaccoonInboundRunner', () => {
     });
 
     // Simulate what outbound.ts does when it builds an approval.request whose
-    // 'Approve' button carries a distinct machine value.
+    // 'Approve' button carries a distinct machine value (non-command — a
+    // legacy/callback-style value, not a native slash command).
     const store = createApprovalValueStore();
-    store.remember('req-1', new Map([['Approve', 'approve:task-42'], ['Skip', 'Skip']]));
+    store.remember('req-1', ctx.userId, new Map([
+      ['Approve', { value: 'approve:task-42', isCommand: false }],
+      ['Skip', { value: 'Skip', isCommand: false }],
+    ]));
 
     const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
     const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-1', choice: 'Approve' } };
@@ -113,6 +117,54 @@ describe('buildRaccoonInboundRunner', () => {
     for await (const _chunk of runner.run(unknownRefCtx)) { /* drain */ }
     expect(capturedBody).toContain('approve');
     expect(capturedBody).toContain('unknown-req');
+  });
+
+  it('sends a REAL OpenClaw slash command (standalone, starting with "/") for a command-type approval choice (#R4-2)', async () => {
+    let capturedBody: string | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      capturedBody = (arg.ctxPayload as { Body: string }).Body;
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    const store = createApprovalValueStore();
+    store.remember('req-2', ctx.userId, new Map([
+      ['Approve', { value: 'approve req-2 allow-once', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-2', choice: 'Approve' } };
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+
+    // Standalone message starting with '/' — the confirmed contract OpenClaw's
+    // command parser requires. Not wrapped in a bracket tag or any other text.
+    expect(capturedBody).toBe('/approve req-2 allow-once');
+  });
+
+  it('does NOT send a command-type choice as a slash command when the user edited the text instead (#R4-2)', async () => {
+    let capturedBody: string | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      capturedBody = (arg.ctxPayload as { Body: string }).Body;
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    const store = createApprovalValueStore();
+    store.remember('req-3', ctx.userId, new Map([
+      ['edit', { value: 'approve req-3 allow-once', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = {
+      ...ctx, text: 'my custom reply',
+      approval: { refId: 'req-3', choice: 'edit', editedText: 'my custom reply' },
+    };
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+
+    expect(capturedBody).not.toMatch(/^\//);
+    expect(capturedBody).toContain('my custom reply');
   });
 
   it('skips sendBlockReply and sendToolResult payloads', async () => {

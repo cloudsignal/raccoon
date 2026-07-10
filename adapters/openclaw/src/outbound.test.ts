@@ -259,11 +259,11 @@ describe('createRaccoonOutbound', () => {
     }
   });
 
-  it('remembers each button label -> value (falling back to label) in the approval-value store (#R2-5)', async () => {
+  it('remembers each button label -> choice (falling back to label) in the approval-value store (#R2-5)', async () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
       hub, channel: 'coordinator',
-      approvalValues: { remember, resolve: (_refId: string, label: string) => label },
+      approvalValues: { remember, resolve: () => undefined },
     });
     const ctx = {
       ...makeCtx('Choose:', 'user:alice'),
@@ -286,10 +286,11 @@ describe('createRaccoonOutbound', () => {
     const env = hub.envelopes[0]!;
     expect(env.kind).toBe('approval.request');
     expect(remember).toHaveBeenCalledTimes(1);
-    const [refIdArg, labelToValue] = remember.mock.calls[0]!;
+    const [refIdArg, userIdArg, labelToChoice] = remember.mock.calls[0]!;
     expect(refIdArg).toBe(env.kind === 'approval.request' ? env.payload.refId : undefined);
-    expect(labelToValue.get('Approve')).toBe('approve:task-42');
-    expect(labelToValue.get('Skip')).toBe('Skip');
+    expect(userIdArg).toBe('alice');
+    expect(labelToChoice.get('Approve')).toEqual({ value: 'approve:task-42', isCommand: false });
+    expect(labelToChoice.get('Skip')).toEqual({ value: 'Skip', isCommand: false });
   });
 
   // ---- unmappable interactive → text fallback ----------------------------
@@ -473,11 +474,11 @@ describe('createRaccoonOutbound', () => {
     if (env.kind === 'approval.request') expect(env.payload.title).toBe('Pick one:');
   });
 
-  it('sendPayload with payload.presentation resolves a callback action value (never reinterpreted as a command) via the approval-value store', async () => {
+  it('sendPayload with payload.presentation resolves callback/command/legacy action values distinctly via the approval-value store (#R4-2)', async () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
       hub, channel: 'coordinator',
-      approvalValues: { remember, resolve: (_refId: string, label: string) => label },
+      approvalValues: { remember, resolve: () => undefined },
     });
     await adapter.sendPayload!({
       ...makeCtx('Choose:', 'user:alice'),
@@ -488,6 +489,7 @@ describe('createRaccoonOutbound', () => {
             type: 'buttons',
             buttons: [
               { label: 'Approve', action: { type: 'callback', value: 'cb:approve-task-42' } },
+              { label: 'Exec', action: { type: 'command', command: 'approve req-1 allow-once' } },
               { label: 'Legacy', value: 'legacy:value' },
               { label: 'Bare' },
             ],
@@ -497,11 +499,16 @@ describe('createRaccoonOutbound', () => {
     });
     const env = hub.envelopes[0]!;
     expect(remember).toHaveBeenCalledTimes(1);
-    const [refIdArg, labelToValue] = remember.mock.calls[0]!;
+    const [refIdArg, userIdArg, labelToChoice] = remember.mock.calls[0]!;
     expect(refIdArg).toBe(env.kind === 'approval.request' ? env.payload.refId : undefined);
-    expect(labelToValue.get('Approve')).toBe('cb:approve-task-42');
-    expect(labelToValue.get('Legacy')).toBe('legacy:value');
-    expect(labelToValue.get('Bare')).toBe('Bare');
+    expect(userIdArg).toBe('alice');
+    // A 'callback' action's value is NEVER reinterpreted as a command.
+    expect(labelToChoice.get('Approve')).toEqual({ value: 'cb:approve-task-42', isCommand: false });
+    // A 'command' action IS a real command — isCommand true, ready to be sent
+    // back as a standalone `/`-prefixed message (see inbound.ts buildApprovalText).
+    expect(labelToChoice.get('Exec')).toEqual({ value: 'approve req-1 allow-once', isCommand: true });
+    expect(labelToChoice.get('Legacy')).toEqual({ value: 'legacy:value', isCommand: false });
+    expect(labelToChoice.get('Bare')).toEqual({ value: 'Bare', isCommand: false });
   });
 
   it('sendPayload with payload.presentation select (no buttons) renders as an approval.request too, not a text fallback', async () => {
