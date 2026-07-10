@@ -50,6 +50,17 @@ export async function kvDel(key: string): Promise<void> {
   await withStore('kv', 'readwrite', (s) => { s.delete(key); });
 }
 
+/**
+ * Wipe all local, identity-scoped state: the entire `kv` store (session, read
+ * markers, push-enabled flag) AND the `outbox`. Used on unpair / terminal
+ * auth-error so that pairing the device as a different user cannot inherit the
+ * prior user's session, read state, or queued-but-unsent messages.
+ */
+export async function wipeLocal(): Promise<void> {
+  await withStore('kv', 'readwrite', (s) => { s.clear(); });
+  await withStore('outbox', 'readwrite', (s) => { s.clear(); });
+}
+
 export async function closeDbForTests(): Promise<void> {
   if (dbPromise) {
     const db = await dbPromise.catch(() => null);

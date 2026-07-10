@@ -3,8 +3,9 @@ import 'fake-indexeddb/auto';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createEnvelope } from '@raccoon/protocol';
-import { closeDbForTests } from '../lib/idb.js';
-import { saveSession } from '../lib/session.js';
+import { closeDbForTests, kvGet, kvSet } from '../lib/idb.js';
+import { loadSession, saveSession } from '../lib/session.js';
+import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
 import { TransportProvider, useChat, type ChatApi } from './context.js';
 
@@ -54,6 +55,30 @@ describe('TransportProvider', () => {
     });
     await waitFor(() => expect(api.phase).toBe('ready'));
     expect(api.session?.userId).toBe('u1');
+  });
+
+  it('unpair wipes local identity state (outbox + kv + chat state) so a re-pair cannot leak the prior user', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    // Seed prior-user local state: a queued outbox entry + a read marker.
+    await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'A private draft' },
+    }));
+    await kvSet('lastread:coordinator', new Date(0).toISOString());
+    expect((await outbox.listPending()).length).toBe(1);
+
+    await act(async () => { await api.unpair(); });
+    await waitFor(() => expect(api.phase).toBe('setup'));
+
+    // Outbox emptied: the next pairing's onStatus('open') -> drain() cannot flush
+    // the prior user's queued messages through the new session.
+    expect(await outbox.listPending()).toEqual([]);
+    // kv wiped: session gone and read markers cleared.
+    expect(await loadSession()).toBeNull();
+    expect(await kvGet('lastread:coordinator')).toBeUndefined();
+    // In-memory chat state reset.
+    expect(api.state.messages).toEqual({});
+    expect(api.session).toBeNull();
   });
 
   it('sends optimistically, settles on ack', async () => {

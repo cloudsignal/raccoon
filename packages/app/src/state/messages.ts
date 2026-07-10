@@ -40,7 +40,8 @@ export type ChatAction =
   | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' }
   | { type: 'typing'; channel: string; on: boolean }
   | { type: 'responded'; channel: string; refId: string; choice: string }
-  | { type: 'read-channel'; channel: string };
+  | { type: 'read-channel'; channel: string }
+  | { type: 'reset' };
 
 const ACK_DELIVERY: Record<'received' | 'delivered' | 'read', Delivery> = {
   received: 'sent',
@@ -63,6 +64,8 @@ function patch(state: ChatState, channel: string, list: ChatMessage[]): ChatStat
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
+    case 'reset':
+      return emptyChatState;
     case 'history': {
       const existing = state.messages[action.channel] ?? [];
       const seen = new Set(existing.map((m) => m.id));

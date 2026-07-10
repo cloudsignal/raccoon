@@ -7,10 +7,10 @@ import {
   type AnyEnvelope, type TransportStatus,
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
-import { kvGet, kvSet } from '../lib/idb.js';
+import { kvGet, kvSet, wipeLocal } from '../lib/idb.js';
 import { browserPushEnv, enablePushFlow } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
-import { clearSession, loadSession, saveSession, type Session } from '../lib/session.js';
+import { loadSession, saveSession, type Session } from '../lib/session.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
 import type { AppTransport, MakeTransport } from './types.js';
 
@@ -208,6 +208,18 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, [attempt]);
 
+  // Full local-identity wipe, used on unpair and on a terminal auth-error: cancel
+  // pending ack timers, clear the kv store (session, read markers, push flag) AND the
+  // outbox, and reset in-memory chat state. Without the outbox + state wipe, a
+  // subsequent pairing as a different user would drain the prior user's queued
+  // messages through the new session and briefly render their history.
+  const wipeAndReset = useCallback(async () => {
+    for (const timer of ackTimers.current.values()) clearTimeout(timer);
+    ackTimers.current.clear();
+    await wipeLocal();
+    dispatch({ type: 'reset' });
+  }, []);
+
   // Finding 2: requestHistory must be declared before wireTransport so the onStatus
   // handler inside wireTransport can reference it without use-before-declare issues.
   const requestHistory = useCallback((channel: string, before?: string) => {
@@ -249,9 +261,12 @@ export function TransportProvider(props: TransportProviderProps) {
         // just surface the error string and leave phase as 'ready'.
         setAuthError('Authentication error. The host is attempting to reconnect.');
       } else {
-        // Default (standalone) path: terminal unpair — clear the session and
-        // drop back to setup so the user can scan a new QR code.
-        void clearSession();
+        // Default (standalone) path: terminal unpair. Fully wipe local identity
+        // state (session, read markers, push flag, queued outbox) and reset chat
+        // state so a re-pair as a different user cannot inherit it, then drop back
+        // to setup so the user can scan a new QR code.
+        void wipeAndReset();
+        sessionRef.current = null;
         setSession(null);
         setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
         setPhase('setup');
@@ -259,7 +274,7 @@ export function TransportProvider(props: TransportProviderProps) {
     });
     // Finding 1: store all three unsubscribe functions
     unsubsRef.current = [u1, u2, u3];
-  }, [drain, handleEnvelope, requestHistory]);
+  }, [drain, handleEnvelope, requestHistory, wipeAndReset]);
 
   useEffect(() => {
     // Host-embedding fast path: a pre-constructed, already-authenticated transport
@@ -439,11 +454,12 @@ export function TransportProvider(props: TransportProviderProps) {
   const unpair = useCallback(async () => {
     await transportRef.current?.close();
     transportRef.current = null;
-    await clearSession();
+    await wipeAndReset();
+    sessionRef.current = null;
     setSession(null);
     setActiveChannel(null);
     setPhase('setup');
-  }, []);
+  }, [wipeAndReset]);
 
   const canEnablePush = !!session?.vapidPublicKey || !!props.pushRegistrarOverride;
 
