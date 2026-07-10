@@ -22,13 +22,28 @@ export class RaccoonBridge {
   // append then failed, the duplicate had already told the client it
   // succeeded (reproduced: blocking the original append, injecting a
   // duplicate, then rejecting the append produced an ack with zero runs).
-  // Bounded FIFO — insertion-ordered Map, oldest evicted past the cap.
-  private readonly persisted = new Map<string, Promise<boolean>>();
+  //
+  // R4-7: `turnDone` tracks whether the AGENT TURN for this key (not just its
+  // append) has finished. Eviction (see evictCompleted()) only ever removes
+  // entries with turnDone === true — never one whose turn is still running.
+  // The append promise resolving (isOriginal's `succeeded`) is NOT the same
+  // event: claim() used to become eviction-eligible the instant append
+  // succeeded, while the (potentially slow, LLM-backed) agent turn was still
+  // in progress. If enough OTHER keys arrived in the meantime and pushed the
+  // map over dedupCap, THIS key — mid-turn — could be evicted; a redelivery
+  // of the same envelope then found no record of it and re-ran the turn from
+  // scratch, alongside the original still finishing (reproduced at cap 1:
+  // two appends and runs, ["B","A","A"] — B's insertion evicted A while A's
+  // own turn was still active).
+  // Bounded FIFO — insertion-ordered Map, oldest COMPLETED entry evicted past
+  // the cap.
+  private readonly persisted = new Map<string, { promise: Promise<boolean>; turnDone: boolean }>();
   // approval.response has no persistence step to gate the ack on (the ack
   // there just means "the server received this envelope", which is always
-  // true once we're running this code) — a plain seen-Set is sufficient for
-  // its dedup-only need.
-  private readonly approvalSeen = new Set<string>();
+  // true once we're running this code), but it has the SAME turn-eviction
+  // hazard as `persisted` above — hence the same turnDone-gated eviction,
+  // via a Map instead of a plain seen-Set.
+  private readonly approvalSeen = new Map<string, boolean>();
 
   constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; historyLimitCap?: number; dedupCap?: number }) {
     this.hub = opts.hub;
@@ -56,16 +71,28 @@ export class RaccoonBridge {
     // ack / typing / presence / pairing kinds are inbound-irrelevant to the agent.
   }
 
-  /** Mark a (userId, envelopeId) seen for approval.response's simple, always-
-   *  succeeds dedup. Returns true if it was ALREADY seen. */
-  private markApprovalSeen(key: string): boolean {
-    if (this.approvalSeen.has(key)) return true;
-    this.approvalSeen.add(key);
-    if (this.approvalSeen.size > this.dedupCap) {
-      const oldest = this.approvalSeen.values().next().value;
-      if (oldest !== undefined) this.approvalSeen.delete(oldest);
+  /** Evict the oldest entries whose turn has completed, until back at or
+   *  under cap — or until no completed entries remain, in which case the
+   *  map is left temporarily over cap rather than evicting an entry whose
+   *  turn is still running (#R4-7). Safe to delete already-visited/current
+   *  keys mid-iteration (well-defined for Map's forward iterator). */
+  private evictCompleted<V>(map: Map<string, V>, cap: number, isDone: (v: V) => boolean): void {
+    if (map.size <= cap) return;
+    for (const [key, value] of map) {
+      if (map.size <= cap) break;
+      if (isDone(value)) map.delete(key);
     }
-    return false;
+  }
+
+  /** Mark a (userId, envelopeId) seen for approval.response's simple, always-
+   *  succeeds dedup. Returns true if it was ALREADY seen, plus a
+   *  markTurnDone() the caller invokes once ITS turn (only when this was
+   *  NOT already seen) finishes — see evictCompleted / #R4-7. */
+  private markApprovalSeen(key: string): { alreadySeen: boolean; markTurnDone: () => void } {
+    if (this.approvalSeen.has(key)) return { alreadySeen: true, markTurnDone: () => {} };
+    this.approvalSeen.set(key, false);
+    this.evictCompleted(this.approvalSeen, this.dedupCap, (done) => done);
+    return { alreadySeen: false, markTurnDone: () => { this.approvalSeen.set(key, true); } };
   }
 
   /**
@@ -77,22 +104,29 @@ export class RaccoonBridge {
    * later, genuinely-new retry (not a duplicate of an in-flight attempt)
    * gets a clean attempt, matching R2-3. Returns `isOriginal: true` only for
    * the call that actually invoked `run()` — callers use this to gate
-   * "proceed to run the agent turn" (which must happen exactly once).
+   * "proceed to run the agent turn" (which must happen exactly once), and
+   * `markTurnDone()`, which the ORIGINAL caller MUST call once that turn
+   * finishes (success or failure) so evictCompleted() knows this entry is
+   * finally safe to evict (#R4-7) — never before then, no matter how many
+   * other keys arrive and push the map over cap in the meantime.
    */
-  private async claim(key: string, run: () => Promise<boolean>): Promise<{ succeeded: boolean; isOriginal: boolean }> {
+  private async claim(
+    key: string,
+    run: () => Promise<boolean>,
+  ): Promise<{ succeeded: boolean; isOriginal: boolean; markTurnDone: () => void }> {
     const existing = this.persisted.get(key);
-    if (existing) return { succeeded: await existing, isOriginal: false };
+    if (existing) return { succeeded: await existing.promise, isOriginal: false, markTurnDone: () => {} };
 
     const promise = run();
-    this.persisted.set(key, promise);
+    const entry = { promise, turnDone: false };
+    this.persisted.set(key, entry);
     const succeeded = await promise.catch(() => false);
     if (!succeeded) {
       this.persisted.delete(key);
-    } else if (this.persisted.size > this.dedupCap) {
-      const oldest = this.persisted.keys().next().value;
-      if (oldest !== undefined) this.persisted.delete(oldest);
+    } else {
+      this.evictCompleted(this.persisted, this.dedupCap, (v) => v.turnDone);
     }
-    return { succeeded, isOriginal: true };
+    return { succeeded, isOriginal: true, markTurnDone: () => { entry.turnDone = true; } };
   }
 
   private async handleMsg(env: Extract<AnyEnvelope, { kind: 'msg' }>, userId: string): Promise<void> {
@@ -110,7 +144,7 @@ export class RaccoonBridge {
     // message was received when it was not (reproduced: blocking the
     // original append, injecting a duplicate, then rejecting the append
     // produced an ack with zero runs under the old boolean-Set design).
-    const { succeeded, isOriginal } = await this.claim(dedupKey, async () => {
+    const { succeeded, isOriginal, markTurnDone } = await this.claim(dedupKey, async () => {
       const ts = new Date().toISOString();
       await this.store.append({ id: env.id, channel, userId, role: 'user', text: env.payload.text, ts });
       return true;
@@ -126,21 +160,28 @@ export class RaccoonBridge {
     // happened, so there is no acked message to act on).
     if (!isOriginal || !succeeded) return;
 
-    this.hub.sendToUser(userId, createEnvelope('typing', {
-      from: agent, to, channel, payload: { state: 'start' },
-    }));
+    // R4-7: markTurnDone() only after the turn (success OR failure) fully
+    // resolves — a `finally` so a throw from runTurn/emitReply still marks
+    // it, rather than leaving the entry permanently ineligible for eviction.
+    try {
+      this.hub.sendToUser(userId, createEnvelope('typing', {
+        from: agent, to, channel, payload: { state: 'start' },
+      }));
 
-    const { reply, failed } = await this.runTurn({ userId, channel, text: env.payload.text, messageId: env.id });
+      const { reply, failed } = await this.runTurn({ userId, channel, text: env.payload.text, messageId: env.id });
 
-    this.hub.sendToUser(userId, createEnvelope('typing', {
-      from: agent, to, channel, payload: { state: 'stop' },
-    }));
+      this.hub.sendToUser(userId, createEnvelope('typing', {
+        from: agent, to, channel, payload: { state: 'stop' },
+      }));
 
-    if (failed) {
-      this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
-      return;
+      if (failed) {
+        this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
+        return;
+      }
+      await this.emitReply(userId, channel, reply);
+    } finally {
+      markTurnDone();
     }
-    await this.emitReply(userId, channel, reply);
   }
 
   /** Route a user's approval decision to the agent as a turn. Previously dropped,
@@ -164,26 +205,33 @@ export class RaccoonBridge {
       from: agent, to, channel, payload: { refId: env.id, status: 'received' },
     }));
 
-    if (this.markApprovalSeen(`${userId}:${env.id}`)) return;
+    const { alreadySeen, markTurnDone } = this.markApprovalSeen(`${userId}:${env.id}`);
+    if (alreadySeen) return;
 
-    this.hub.sendToUser(userId, createEnvelope('typing', {
-      from: agent, to, channel, payload: { state: 'start' },
-    }));
+    // R4-7: see handleMsg's matching comment — markTurnDone() only after the
+    // turn (success OR failure) fully resolves.
+    try {
+      this.hub.sendToUser(userId, createEnvelope('typing', {
+        from: agent, to, channel, payload: { state: 'start' },
+      }));
 
-    const { reply, failed } = await this.runTurn({
-      userId, channel, text: editedText ?? choice, messageId: env.id,
-      approval: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
-    });
+      const { reply, failed } = await this.runTurn({
+        userId, channel, text: editedText ?? choice, messageId: env.id,
+        approval: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
+      });
 
-    this.hub.sendToUser(userId, createEnvelope('typing', {
-      from: agent, to, channel, payload: { state: 'stop' },
-    }));
+      this.hub.sendToUser(userId, createEnvelope('typing', {
+        from: agent, to, channel, payload: { state: 'stop' },
+      }));
 
-    if (failed) {
-      this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
-      return;
+      if (failed) {
+        this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
+        return;
+      }
+      await this.emitReply(userId, channel, reply);
+    } finally {
+      markTurnDone();
     }
-    await this.emitReply(userId, channel, reply);
   }
 
   /** Drain one agent turn to a string, never throwing. */

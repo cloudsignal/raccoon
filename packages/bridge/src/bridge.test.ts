@@ -239,6 +239,61 @@ describe('RaccoonBridge', () => {
     expect(appendCalls).toBe(1); // the duplicate awaited the SAME in-flight attempt, no second append call
   });
 
+  it('dedup eviction never removes a key whose agent turn is still running, even at cap 1 (#R4-7)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const runsFor: Record<string, number> = { A: 0, B: 0 };
+    const appendsFor: Record<string, number> = { A: 0, B: 0 };
+    const originalAppend = store.append.bind(store);
+    store.append = async (m) => {
+      if (m.text === 'A' || m.text === 'B') appendsFor[m.text] = (appendsFor[m.text] ?? 0) + 1;
+      return originalAppend(m);
+    };
+    const gate: { release?: () => void } = {};
+    const runner: AgentRunner = {
+      async *run(ctx) {
+        runsFor[ctx.text] = (runsFor[ctx.text] ?? 0) + 1;
+        if (ctx.text === 'A') {
+          // A's turn blocks — simulates a slow LLM/tool-backed turn still in
+          // progress when other messages arrive.
+          await new Promise<void>((resolve) => { gate.release = resolve; });
+        }
+        yield `handled ${ctx.text}`;
+      },
+    };
+    // Cap 1: any second concurrently-tracked key immediately exceeds it,
+    // maximizing eviction pressure — matches the reviewer's cap-1 repro.
+    const bridge = new RaccoonBridge({ hub, runner, store, dedupCap: 1 });
+    bridge.start();
+
+    const envA = userMsg('A');
+    hub.inject(envA, 'u1'); // A's append succeeds; its turn starts and blocks on the gate
+    await settle();
+    expect(appendsFor['A']).toBe(1);
+    expect(runsFor['A']).toBe(1);
+
+    const envB = userMsg('B');
+    hub.inject(envB, 'u1'); // B's append succeeds too — the map now holds 2 keys, over cap(1)
+    await settle(); // B's turn (unblocked) runs to completion
+
+    expect(appendsFor['B']).toBe(1);
+    expect(runsFor['B']).toBe(1);
+
+    // A's entry must NOT have been evicted despite being the oldest and the
+    // map exceeding cap: its turn was (and still is) running. Redeliver A's
+    // SAME envelope while A's own turn is still blocked.
+    hub.inject(envA, 'u1');
+    await settle();
+
+    // Recognized as an in-flight duplicate: no second append, no second run.
+    expect(appendsFor['A']).toBe(1);
+    expect(runsFor['A']).toBe(1);
+
+    gate.release?.(); // let A's turn finish
+    await settle();
+    expect(runsFor['A']).toBe(1); // still exactly once, even after completing
+  });
+
   it('routes approval.response to the runner and replies (#6)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
@@ -280,5 +335,47 @@ describe('RaccoonBridge', () => {
     const acks = hub.sent.filter((s) => s.env.kind === 'ack');
     expect(acks).toHaveLength(2); // both deliveries ack, so the client settles either way
     for (const a of acks) if (a.env.kind === 'ack') expect(a.env.payload.refId).toBe(env.id);
+  });
+
+  it('approval dedup eviction never removes a key whose agent turn is still running, even at cap 1 (#R4-7)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const runsFor: Record<string, number> = { A: 0, B: 0 };
+    const gate: { release?: () => void } = {};
+    const runner: AgentRunner = {
+      async *run(ctx) {
+        runsFor[ctx.text] = (runsFor[ctx.text] ?? 0) + 1;
+        if (ctx.text === 'A') await new Promise<void>((resolve) => { gate.release = resolve; });
+        yield `handled ${ctx.text}`;
+      },
+    };
+    const bridge = new RaccoonBridge({ hub, runner, store, dedupCap: 1 });
+    bridge.start();
+
+    const envA = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-A', choice: 'A' },
+    });
+    hub.inject(envA, 'u1'); // A's turn starts and blocks
+    await settle();
+    expect(runsFor['A']).toBe(1);
+
+    const envB = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-B', choice: 'B' },
+    });
+    hub.inject(envB, 'u1'); // B's own turn runs to completion — approvalSeen now holds 2 keys, over cap(1)
+    await settle();
+    expect(runsFor['B']).toBe(1);
+
+    // A must still be recognized as in-flight despite being the oldest
+    // entry and the map exceeding cap.
+    hub.inject(envA, 'u1');
+    await settle();
+    expect(runsFor['A']).toBe(1); // no second run
+
+    gate.release?.();
+    await settle();
+    expect(runsFor['A']).toBe(1);
   });
 });
