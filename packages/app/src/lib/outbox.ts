@@ -97,12 +97,36 @@ export async function settle(id: string): Promise<void> {
   notify(entry.channel);
 }
 
+// demoteSending() and clearAll() are serialized through this chain so a
+// status-transition write can never interleave with (and resurrect rows
+// after) a wipe. Each is a snapshot-then-mutate sequence spanning multiple
+// IDB transactions, so without serialization a clearAll() commit landing
+// between two of demoteSending()'s individual put() calls would leave a
+// stale 'sending' row rewritten back into the store post-wipe. Reproduced:
+// 20 'sending' rows left 1 resurrected 'pending' row after a concurrent wipe.
+let opChain: Promise<unknown> = Promise.resolve();
+function serialize<T>(fn: () => Promise<T>): Promise<T> {
+  const result = opChain.then(fn, fn);
+  opChain = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 /** Fires one subscriber notification per demoted entry — subscribers that
  *  trigger drains must tolerate bursts (the provider drains on status
  *  transitions, not per notification). */
 export async function demoteSending(): Promise<void> {
-  const all = await getAll();
-  for (const entry of all) {
-    if (entry.status === 'sending') await put({ ...entry, status: 'pending' });
-  }
+  return serialize(async () => {
+    const all = await getAll();
+    for (const entry of all) {
+      if (entry.status === 'sending') await put({ ...entry, status: 'pending' });
+    }
+  });
+}
+
+/** Clear the entire outbox. Serialized against demoteSending() so an
+ *  in-flight status-transition write cannot resurrect a row after the clear. */
+export async function clearAll(): Promise<void> {
+  return serialize(async () => {
+    await withStore('outbox', 'readwrite', (s) => { s.clear(); });
+  });
 }

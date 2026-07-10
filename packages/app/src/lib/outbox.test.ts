@@ -60,6 +60,26 @@ describe('outbox', () => {
     expect(await outbox.listPending()).toHaveLength(1);
   });
 
+  it('clearAll is serialized against a concurrent demoteSending so no row is resurrected (#R2-1)', async () => {
+    // Seed many 'sending' entries so demoteSending()'s per-entry put() loop
+    // spans several IDB transactions, giving a real interleaving window.
+    const entries = await Promise.all(Array.from({ length: 20 }, (_, i) => outbox.enqueue(msg(`m${i}`))));
+    for (const e of entries) await outbox.markSending(e.id);
+
+    // Fire demoteSending() WITHOUT awaiting (mirrors the transport's 'closed'
+    // status callback: void outbox.demoteSending()), then immediately clear —
+    // mirrors wipeAndReset() racing that callback.
+    const demote = outbox.demoteSending();
+    await outbox.clearAll();
+    await demote;
+
+    // Whichever fired first, the serialization queue guarantees clearAll's
+    // clear() cannot land in the middle of demoteSending()'s writes: no row
+    // survives.
+    expect(await outbox.listPending()).toEqual([]);
+    expect(await outbox.listForChannel('coordinator')).toEqual([]);
+  });
+
   it('notifies subscribers with the touched channel', async () => {
     const touched: string[] = [];
     const unsub = outbox.subscribe((c) => touched.push(c));

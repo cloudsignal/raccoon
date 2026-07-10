@@ -64,6 +64,10 @@ export class WsHub {
   private pairingTokens = new Map<string, PairingToken>();
   private attempts = new Map<string, { count: number; resetAt: number }>();
   private byUser = new Map<string, Set<WebSocket>>();
+  // Bumped by revokeUser(); a redemption in flight captures the epoch before its
+  // async createSession() call and re-checks it after, so a revoke racing a
+  // redemption cannot mint a session that outlives the revoke.
+  private revocationEpoch = new Map<string, number>();
   private handlers = new Set<(env: AnyEnvelope, userId: string) => void>();
 
   constructor(opts: WsHubOptions) {
@@ -121,6 +125,11 @@ export class WsHub {
   }
 
   async revokeUser(userId: string): Promise<void> {
+    // Bump the epoch FIRST (synchronously): any redemption that captured the
+    // prior epoch before this call will observe the mismatch after its own
+    // createSession() await resolves, however that interleaves with the rest
+    // of this method.
+    this.revocationEpoch.set(userId, (this.revocationEpoch.get(userId) ?? 0) + 1);
     await this.store.revokeUser(userId);
     for (const ws of this.byUser.get(userId) ?? []) ws.close(4403, 'revoked');
     this.byUser.delete(userId);
@@ -219,7 +228,19 @@ export class WsHub {
       grantUserId = record.userId;
     }
 
+    // Capture the epoch BEFORE the async createSession() call, so a revoke
+    // that lands while the session is being minted is detected below rather
+    // than silently granting a session to a just-revoked user.
+    const epochAtRedeem = this.revocationEpoch.get(grantUserId) ?? 0;
     const sessionToken = await this.store.createSession(grantUserId);
+    if ((this.revocationEpoch.get(grantUserId) ?? 0) !== epochAtRedeem) {
+      // revokeUser() ran while createSession() was in flight. The store now
+      // holds a session for a revoked user — kill it immediately and refuse
+      // to grant rather than complete the race with a live session.
+      await this.store.revokeUser(grantUserId).catch(() => {});
+      ws.close(4401, 'revoked during redemption');
+      return;
+    }
     this.attach(ws, grantUserId);
     ws.send(JSON.stringify(createEnvelope('pair.grant', {
       from: 'system',

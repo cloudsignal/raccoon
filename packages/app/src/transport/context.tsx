@@ -214,10 +214,16 @@ export function TransportProvider(props: TransportProviderProps) {
   // outbox, and reset in-memory chat state. Without the outbox + state wipe, a
   // subsequent pairing as a different user would drain the prior user's queued
   // messages through the new session and briefly render their history.
+  //
+  // outbox.clearAll() (not a raw store clear) is required here: it is serialized
+  // against outbox.demoteSending(), which the transport's 'closed' status callback
+  // fires unawaited. Without that serialization, a demoteSending() write in flight
+  // when the wipe runs can land AFTER the clear and resurrect a stale row from the
+  // prior user's outbox.
   const wipeAndReset = useCallback(async () => {
     for (const timer of ackTimers.current.values()) clearTimeout(timer);
     ackTimers.current.clear();
-    await wipeLocal();
+    await Promise.all([wipeLocal(), outbox.clearAll()]);
     dispatch({ type: 'reset' });
   }, []);
 
@@ -465,6 +471,12 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [props.pushRegistrarOverride]);
 
   const unpair = useCallback(async () => {
+    // Detach status/envelope listeners BEFORE closing, so this deliberate close
+    // never fires our onStatus('closed') handler and never schedules a
+    // demoteSending() call in the first place (defense in depth on top of the
+    // clearAll()/demoteSending() serialization in wipeAndReset()).
+    for (const unsub of unsubsRef.current) unsub();
+    unsubsRef.current = [];
     await transportRef.current?.close();
     transportRef.current = null;
     await wipeAndReset();

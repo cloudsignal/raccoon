@@ -102,6 +102,49 @@ describe('WsHub pairing', () => {
     expect(await nextClose(resumed)).toBe(4401);
   });
 
+  it('a revoke racing an in-flight token redemption does not leave a live session (#R2-2)', async () => {
+    // A store whose createSession() pauses until released, so we can revoke
+    // the user WHILE a redemption for them is mid-flight — the reviewer's
+    // exact repro: pause createSession(), revoke, resume, then check the
+    // minted session does not verify afterward.
+    let releaseCreate!: (token: string) => void;
+    const createGate = new Promise<string>((r) => { releaseCreate = r; });
+    const sessions = new Map<string, string>();
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async (userId) => {
+          const token = await createGate;
+          sessions.set(token, userId);
+          return token;
+        },
+        verifySession: async (t) => sessions.get(t) ?? null,
+        revokeUser: async (userId) => {
+          for (const [t, u] of sessions) if (u === userId) sessions.delete(t);
+        },
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    await new Promise((r) => setTimeout(r, 20)); // let handleHello reach the paused createSession()
+
+    await hub.revokeUser('u1'); // revoke WHILE createSession() is in flight
+    releaseCreate('sess-1');    // let createSession() resolve, minting a session for the now-revoked user
+
+    // The connection must be closed rather than granted a live session: the
+    // hub must detect the revoke happened mid-redemption.
+    expect(await nextClose(ws)).toBe(4401);
+
+    // And the minted session must not verify for a fresh connection either —
+    // proving it was actively killed, not just that this socket was dropped.
+    const resumed = await connect(port);
+    resumed.send(JSON.stringify({ session: 'sess-1' }));
+    expect(await nextClose(resumed)).toBe(4401);
+  });
+
   it('revokeUser invalidates an unredeemed pairing token (#8)', async () => {
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();

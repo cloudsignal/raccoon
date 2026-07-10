@@ -51,14 +51,20 @@ export async function kvDel(key: string): Promise<void> {
 }
 
 /**
- * Wipe all local, identity-scoped state: the entire `kv` store (session, read
- * markers, push-enabled flag) AND the `outbox`. Used on unpair / terminal
- * auth-error so that pairing the device as a different user cannot inherit the
- * prior user's session, read state, or queued-but-unsent messages.
+ * Wipe the `kv` store (session, read markers, push-enabled flag). Used on
+ * unpair / terminal auth-error so that pairing the device as a different user
+ * cannot inherit the prior user's session or read state.
+ *
+ * Does NOT clear the outbox — that must go through `outbox.clearAll()`, which
+ * is serialized against `outbox.demoteSending()` (a transport-status-driven
+ * write that a plain `withStore('outbox', ...).clear()` call here could race:
+ * demoteSending() snapshots then rewrites rows across several transactions, so
+ * an unserialized clear can land between two of its writes and have a stale
+ * row resurrected back into the store afterward). Callers should wipe BOTH
+ * via `wipeAndReset()` in the app's transport layer, not this function alone.
  */
 export async function wipeLocal(): Promise<void> {
   await withStore('kv', 'readwrite', (s) => { s.clear(); });
-  await withStore('outbox', 'readwrite', (s) => { s.clear(); });
 }
 
 export async function closeDbForTests(): Promise<void> {
