@@ -38,7 +38,7 @@ export function withPushFallback(
     },
     onEnvelope(handler) {
       return hub.onEnvelope((env, userId) => {
-        if (env.kind === 'push.subscribe') return; // consumed below
+        if (env.kind === 'push.subscribe' || env.kind === 'push.unsubscribe') return; // consumed below
         handler(env, userId);
       });
     },
@@ -72,8 +72,17 @@ export function withPushFallback(
   };
 
   const stopCapture = hub.onEnvelope((env, userId) => {
-    if (env.kind !== 'push.subscribe') return;
-    enqueueAdd(userId, env.payload.subscription);
+    if (env.kind === 'push.subscribe') {
+      enqueueAdd(userId, env.payload.subscription);
+      return;
+    }
+    if (env.kind === 'push.unsubscribe') {
+      // remove(userId, endpoint) is scoped to that userId's own subscriptions
+      // (per the SubscriptionStore contract), so a client can only ever
+      // unsubscribe an endpoint registered under its own authenticated
+      // identity, never another user's.
+      void opts.store.remove(userId, env.payload.endpoint).catch(() => { /* best-effort */ });
+    }
   });
 
   return {

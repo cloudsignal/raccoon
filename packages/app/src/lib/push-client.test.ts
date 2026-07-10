@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AnyEnvelope } from '@raccoon/protocol';
-import { enablePushFlow, urlBase64ToUint8Array, type PushEnv } from './push-client.js';
+import { enablePushFlow, unsubscribeCurrentPush, urlBase64ToUint8Array, type PushEnv } from './push-client.js';
 
 const sub = { endpoint: 'https://push.example/1', keys: { p256dh: 'p', auth: 'a' } };
 
@@ -9,6 +9,8 @@ function env(overrides: Partial<PushEnv>): PushEnv {
     permission: () => 'default',
     requestPermission: async () => 'granted',
     getSubscription: async () => sub,
+    currentEndpoint: async () => sub.endpoint,
+    unsubscribeLocal: async () => {},
     ...overrides,
   };
 }
@@ -72,5 +74,43 @@ describe('push client', () => {
       send: async () => { throw new Error('transport not open'); },
     });
     expect(ok).toBe(false);
+  });
+});
+
+describe('unsubscribeCurrentPush (#R2-6)', () => {
+  it('sends push.unsubscribe with the current endpoint, then tears down the local subscription', async () => {
+    const sent: AnyEnvelope[] = [];
+    let unsubscribedLocally = false;
+    await unsubscribeCurrentPush({
+      env: env({ unsubscribeLocal: async () => { unsubscribedLocally = true; } }),
+      userId: 'u1',
+      send: async (e) => { sent.push(e); },
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.kind).toBe('push.unsubscribe');
+    expect(sent[0]!.kind === 'push.unsubscribe' && sent[0]!.payload.endpoint).toBe(sub.endpoint);
+    expect(unsubscribedLocally).toBe(true);
+  });
+
+  it('still tears down locally when there is no current subscription', async () => {
+    let unsubscribedLocally = false;
+    const sent: AnyEnvelope[] = [];
+    await unsubscribeCurrentPush({
+      env: env({ currentEndpoint: async () => null, unsubscribeLocal: async () => { unsubscribedLocally = true; } }),
+      userId: 'u1',
+      send: async (e) => { sent.push(e); },
+    });
+    expect(sent).toHaveLength(0); // nothing to unsubscribe server-side
+    expect(unsubscribedLocally).toBe(true);
+  });
+
+  it('still tears down locally when the server send fails (device is unpairing regardless)', async () => {
+    let unsubscribedLocally = false;
+    await unsubscribeCurrentPush({
+      env: env({ unsubscribeLocal: async () => { unsubscribedLocally = true; } }),
+      userId: 'u1',
+      send: async () => { throw new Error('transport not open'); },
+    });
+    expect(unsubscribedLocally).toBe(true);
   });
 });

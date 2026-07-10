@@ -80,7 +80,9 @@ const pushSubscribePayload = z.object({
   }),
 });
 
-export type Kind = 'msg' | 'ack' | 'typing' | 'presence' | 'approval.request' | 'approval.response' | 'history.request' | 'history.page' | 'pair.request' | 'pair.grant' | 'push.subscribe';
+const pushUnsubscribePayload = z.object({ endpoint: z.string().url() });
+
+export type Kind = 'msg' | 'ack' | 'typing' | 'presence' | 'approval.request' | 'approval.response' | 'history.request' | 'history.page' | 'pair.request' | 'pair.grant' | 'push.subscribe' | 'push.unsubscribe';
 
 const envelopeSchema = z.discriminatedUnion('kind', [
   base.extend({ kind: z.literal('msg'), payload: msgPayload }),
@@ -94,6 +96,7 @@ const envelopeSchema = z.discriminatedUnion('kind', [
   base.extend({ kind: z.literal('pair.request'), payload: pairRequestPayload }),
   base.extend({ kind: z.literal('pair.grant'), payload: pairGrantPayload }),
   base.extend({ kind: z.literal('push.subscribe'), payload: pushSubscribePayload }),
+  base.extend({ kind: z.literal('push.unsubscribe'), payload: pushUnsubscribePayload }),
 ]);
 
 export type AnyEnvelope = z.infer<typeof envelopeSchema>;

@@ -36,5 +36,13 @@ export function createHttpPushRegistrar(opts: {
         return false;
       }
     },
+    async disable(): Promise<void> {
+      // Best-effort local teardown. This registrar has no defined server-side
+      // unsubscribe endpoint (the host relay would need to add one and pass
+      // its URL here, mirroring subscribeUrl); tearing down the browser-level
+      // subscription still stops this device from receiving further pushes.
+      const env = browserPushEnv();
+      await env?.unsubscribeLocal().catch(() => { /* best-effort */ });
+    },
   };
 }

@@ -8,7 +8,7 @@ import {
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
 import { kvGet, kvSet, wipeLocal } from '../lib/idb.js';
-import { browserPushEnv, enablePushFlow } from '../lib/push-client.js';
+import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import { loadSession, saveSession, type Session } from '../lib/session.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
@@ -42,6 +42,10 @@ export interface ChatApi {
  *  only tracks the enabled flag. */
 export interface PushRegistrar {
   enable(): Promise<boolean>;
+  /** Optional: tear down this device's push registration (local + ideally
+   *  server-side). Called on unpair, best-effort, so a re-pair as a different
+   *  user doesn't leave the device receiving the prior user's notifications. */
+  disable?(): Promise<void>;
 }
 
 const ChatContext = createContext<ChatApi | null>(null);
@@ -285,6 +289,16 @@ export function TransportProvider(props: TransportProviderProps) {
         // state (session, read markers, push flag, queued outbox) and reset chat
         // state so a re-pair as a different user cannot inherit it, then drop back
         // to setup so the user can scan a new QR code.
+        //
+        // The transport is already closed here, so there is no live connection
+        // to ask the server to drop the subscription (unlike unpair(), which
+        // runs before closing). Still invalidate the browser-level subscription:
+        // that tells the push service to stop routing to this endpoint AT ALL,
+        // so even a stale server-side row for the now-revoked user can no
+        // longer deliver here (a later send to it just 404/410s, which the
+        // store already prunes on).
+        void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
+
         // Defer the transition until the wipe settles: nulling the session and
         // dropping to setup only after wipeLocal() completes closes a TOCTOU where a
         // re-pair racing the async wipe could have its freshly-saved session cleared.
@@ -476,6 +490,25 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [props.pushRegistrarOverride]);
 
   const unpair = useCallback(async () => {
+    // Tear down THIS device's push registration before closing the transport
+    // (still need the connection + userId for the server-side unsubscribe).
+    // Without this, only local app state was ever wiped: the server-side
+    // subscription row and the browser's own PushManager registration both
+    // survived, so the device kept receiving the PRIOR user's push
+    // notifications (message bodies included) after pairing as someone else,
+    // until the next 404/410-based prune (or indefinitely, if that never
+    // happened). Best-effort: unpair proceeds regardless of outcome.
+    const userId = sessionRef.current?.userId;
+    const transport = transportRef.current;
+    if (props.pushRegistrarOverride) {
+      await props.pushRegistrarOverride.disable?.().catch(() => { /* best-effort */ });
+    } else if (userId && transport) {
+      const env = browserPushEnv();
+      if (env) {
+        await unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }).catch(() => { /* best-effort */ });
+      }
+    }
+
     // Detach status/envelope listeners BEFORE closing, so this deliberate close
     // never fires our onStatus('closed') handler and never schedules a
     // demoteSending() call in the first place (defense in depth on top of the
@@ -489,7 +522,7 @@ export function TransportProvider(props: TransportProviderProps) {
     setSession(null);
     setActiveChannel(null);
     setPhase('setup');
-  }, [wipeAndReset]);
+  }, [wipeAndReset, props.pushRegistrarOverride]);
 
   const canEnablePush = !!session?.vapidPublicKey || !!props.pushRegistrarOverride;
 

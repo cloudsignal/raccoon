@@ -11,6 +11,11 @@ export interface PushEnv {
   permission(): NotificationPermission;
   requestPermission(): Promise<NotificationPermission>;
   getSubscription(vapidPublicKey: string): Promise<{ endpoint: string; keys: { p256dh: string; auth: string } } | null>;
+  /** Read-only: the endpoint of the CURRENT browser-level subscription, if
+   *  any. Unlike getSubscription() above, this never creates one. */
+  currentEndpoint(): Promise<string | null>;
+  /** Tear down the browser-level push subscription, if one exists. */
+  unsubscribeLocal(): Promise<void>;
 }
 
 export function browserPushEnv(): PushEnv | null {
@@ -27,6 +32,16 @@ export function browserPushEnv(): PushEnv | null {
       const json = subscription.toJSON();
       if (!json.endpoint || !json.keys?.p256dh || !json.keys.auth) return null;
       return { endpoint: json.endpoint, keys: { p256dh: json.keys.p256dh, auth: json.keys.auth } };
+    },
+    async currentEndpoint() {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      return subscription?.endpoint ?? null;
+    },
+    async unsubscribeLocal() {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) await subscription.unsubscribe();
     },
   };
 }
@@ -54,4 +69,34 @@ export async function enablePushFlow(opts: {
     return false;
   }
   return true;
+}
+
+/**
+ * Unsubscribe THIS device's push registration: tell the server to drop the
+ * subscription (best-effort — proceeds to the local teardown regardless of
+ * whether the send succeeds, since the device is going through unpair either
+ * way) and unregister the browser-level subscription so the OS also stops
+ * delivering pushes for it.
+ *
+ * Without this, unpair only wiped LOCAL app state (session/outbox/messages).
+ * The server-side subscription row and the browser's own PushManager
+ * registration both survived, so the device kept receiving the PRIOR user's
+ * push notifications (message bodies included) until the next 404/410-based
+ * prune, and could keep receiving them indefinitely if that never happens.
+ */
+export async function unsubscribeCurrentPush(opts: {
+  env: PushEnv;
+  userId: string;
+  send: (env: AnyEnvelope) => Promise<void>;
+}): Promise<void> {
+  const endpoint = await opts.env.currentEndpoint().catch(() => null);
+  if (endpoint) {
+    await opts.send(createEnvelope('push.unsubscribe', {
+      from: userAddress(opts.userId),
+      to: 'system',
+      channel: 'system',
+      payload: { endpoint },
+    })).catch(() => { /* best-effort: still tear down locally below */ });
+  }
+  await opts.env.unsubscribeLocal().catch(() => { /* best-effort */ });
 }

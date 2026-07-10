@@ -81,6 +81,23 @@ describe('TransportProvider', () => {
     expect(api.session).toBeNull();
   });
 
+  it('unpair calls the host push registrar\'s disable() so a re-pair does not inherit its push subscription (#R2-6)', async () => {
+    const transport = new FakeTransport();
+    let disabled = false;
+    render(
+      <TransportProvider
+        transportOverride={transport}
+        sessionOverride={{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] }}
+        pushRegistrarOverride={{ enable: async () => true, disable: async () => { disabled = true; } }}
+      >
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+    await act(async () => { await api.unpair(); });
+    expect(disabled).toBe(true);
+  });
+
   it('re-requests history for loaded channels on reconnect so messages missed while offline appear (#10)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);

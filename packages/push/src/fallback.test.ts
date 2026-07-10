@@ -84,6 +84,42 @@ describe('withPushFallback', () => {
     expect((await store.list('u1')).length).toBe(MAX_SUBSCRIPTIONS_PER_USER);
   });
 
+  it('push.unsubscribe removes the stored subscription and is swallowed like push.subscribe (#R2-6)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    await store.add('u1', sub('https://push.example/1'));
+    const { hub } = withPushFallback(inner, { store, sender: new FakeSender() });
+    const seen: AnyEnvelope[] = [];
+    hub.onEnvelope((env) => seen.push(env));
+
+    inner.emit(createEnvelope('push.unsubscribe', {
+      from: 'user:u1', to: 'system', channel: 'system',
+      payload: { endpoint: 'https://push.example/1' },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(await store.list('u1')).toHaveLength(0);
+    expect(seen).toHaveLength(0); // swallowed, not forwarded to consumers
+  });
+
+  it('push.unsubscribe is scoped to the sender\'s own userId (cannot remove another user\'s subscription)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    await store.add('victim', sub('https://push.example/victim-1'));
+    withPushFallback(inner, { store, sender: new FakeSender() });
+
+    // 'attacker' tries to unsubscribe victim's endpoint; the hub always passes
+    // the AUTHENTICATED userId of the sender (here 'attacker'), so remove() is
+    // scoped to attacker's own (empty) subscription list and cannot touch it.
+    inner.emit(createEnvelope('push.unsubscribe', {
+      from: 'user:attacker', to: 'system', channel: 'system',
+      payload: { endpoint: 'https://push.example/victim-1' },
+    }), 'attacker');
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(await store.list('victim')).toHaveLength(1);
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();

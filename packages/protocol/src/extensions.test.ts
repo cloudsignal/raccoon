@@ -22,6 +22,15 @@ describe('protocol extensions (Plan C)', () => {
     expect(tryParseEnvelope(JSON.parse(JSON.stringify(env)))).not.toBeNull();
   });
 
+  it('accepts push.unsubscribe envelopes (#R2-6)', () => {
+    const env = createEnvelope('push.unsubscribe', {
+      from: 'user:u1', to: 'system', channel: 'system',
+      payload: { endpoint: 'https://push.example/abc' },
+    });
+    expect(env.kind).toBe('push.unsubscribe');
+    expect(tryParseEnvelope(JSON.parse(JSON.stringify(env)))).not.toBeNull();
+  });
+
   it('accepts optional editedText on approval.response', () => {
     const env = createEnvelope('approval.response', {
       from: 'user:u1',
