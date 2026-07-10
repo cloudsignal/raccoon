@@ -18,4 +18,8 @@ export class InMemorySubscriptionStore implements SubscriptionStore {
     subs?.delete(endpoint);
     if (subs && subs.size === 0) this.byUser.delete(userId);
   }
+
+  async clear(userId: string): Promise<void> {
+    this.byUser.delete(userId);
+  }
 }

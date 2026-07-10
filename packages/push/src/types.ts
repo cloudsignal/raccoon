@@ -25,6 +25,10 @@ export interface SubscriptionStore {
   add(userId: string, sub: PushSubscriptionJson): Promise<void>;
   list(userId: string): Promise<PushSubscriptionJson[]>;
   remove(userId: string, endpoint: string): Promise<void>;
+  /** Remove every subscription for a user. Called on revoke so a revoked
+   *  user cannot still receive push notifications after their pairing and
+   *  live sockets are gone. */
+  clear(userId: string): Promise<void>;
 }
 
 export interface PushSender {

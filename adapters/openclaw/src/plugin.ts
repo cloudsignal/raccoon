@@ -1,7 +1,7 @@
 import { WsHub } from '@raccoon/transport-ws';
 import { InMemoryMessageStore, RaccoonBridge, type AgentRunner } from '@raccoon/bridge';
 import { issuePairing, revokePairing } from '@raccoon/pairing';
-import { InMemorySubscriptionStore, VapidPushSender, withPushFallback } from '@raccoon/push';
+import { InMemorySubscriptionStore, VapidPushSender, withPushFallback, type SubscriptionStore } from '@raccoon/push';
 
 export interface RaccoonChannelOptions {
   instance: string;
@@ -49,9 +49,11 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
 
   let stopPush: (() => void) | null = null;
   let bridgeHub: Pick<WsHub, 'sendToUser' | 'onEnvelope'> = hub;
+  let subscriptionStore: SubscriptionStore | null = null;
   if (opts.vapid) {
+    subscriptionStore = new InMemorySubscriptionStore();
     const wrapped = withPushFallback(hub, {
-      store: new InMemorySubscriptionStore(),
+      store: subscriptionStore,
       sender: new VapidPushSender(opts.vapid),
     });
     bridgeHub = wrapped.hub;
@@ -79,7 +81,14 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
     },
     /** Issue a pairing QR for a user — used by the CLI. */
     pair: (userId: string) => issuePairing(hub, { userId, instanceUrl: opts.instanceUrl }),
-    revoke: (userId: string) => revokePairing(hub, userId),
+    // Revoking a user must also drop their push subscriptions: otherwise a
+    // revoked user's device still gets push-delivered notifications (via
+    // withPushFallback's offline fallback) even though their pairing and
+    // live sockets are gone.
+    revoke: async (userId: string) => {
+      await revokePairing(hub, userId);
+      await subscriptionStore?.clear(userId);
+    },
     buildId: opts.buildId ?? 'dev',
   };
 }
