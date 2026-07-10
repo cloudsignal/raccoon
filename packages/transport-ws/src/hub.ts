@@ -354,7 +354,8 @@ export class WsHub {
 
     // Session resume: { session: string } — must not be rate-limited (legit reconnect)
     if (typeof hello === 'object' && hello !== null && 'session' in hello) {
-      const userId = await this.store.verifySession(String((hello as { session: unknown }).session));
+      const presentedToken = String((hello as { session: unknown }).session);
+      const userId = await this.store.verifySession(presentedToken);
       if (!userId) { ws.close(4401, 'bad session'); return; }
       // The store round-trip above has no ordering guarantee against a
       // concurrent revokeUser() for a REAL (non-in-memory) store: it could
@@ -363,7 +364,13 @@ export class WsHub {
       // an already-revoked user.
       const revokedAt = this.revokedAt.get(userId);
       if (revokedAt !== undefined && revokedAt >= helloStartedAt) {
-        await this.store.revokeUser(userId).catch(() => {});
+        // #R5-10: scope the cleanup to THE SESSION THIS HELLO PRESENTED. A
+        // user-wide revokeUser() here also deleted any legitimate session
+        // created for the same user AFTER the revoke (an immediate re-pair)
+        // — this stale hello has no business touching those. Fallback to
+        // user-wide only for stores without revokeSession (over-revoking is
+        // the safe direction for a revoked user's stale cleanup).
+        await (this.store.revokeSession?.(presentedToken) ?? this.store.revokeUser(userId)).catch(() => {});
         ws.close(4401, 'revoked during resume');
         return;
       }
@@ -410,7 +417,9 @@ export class WsHub {
       // revokeUser() ran at some point during this call. The store now holds
       // a session for a revoked user — kill it immediately and refuse to
       // grant rather than complete the race with a live session.
-      await this.store.revokeUser(grantUserId).catch(() => {});
+      // #R5-10: kill THE SESSION THIS CALL JUST MINTED, not every session
+      // the user has — see the matching comment in the resume path above.
+      await (this.store.revokeSession?.(sessionToken) ?? this.store.revokeUser(grantUserId)).catch(() => {});
       ws.close(4401, 'revoked during redemption');
       return;
     }

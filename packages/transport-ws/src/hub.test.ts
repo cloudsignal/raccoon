@@ -428,6 +428,61 @@ describe('WsHub pairing', () => {
     release?.(); // let the now-irrelevant validatePairingToken call settle
   });
 
+  it('stale-hello cleanup revokes only ITS OWN session, not a legitimate one created after the revoke (#R5-10)', async () => {
+    // Sequence: hello H1 parks inside createSession → u1 is revoked → u1 is
+    // legitimately RE-paired (new session S2) → H1 resumes, sees the revoke,
+    // and cleans up. That cleanup previously called user-wide
+    // store.revokeUser(u1), deleting S2 — the brand-new, post-revoke,
+    // fully legitimate session — along with H1's own stale one.
+    const { MemoryCredentialStore } = await import('./credential-store.js');
+    const inner = new MemoryCredentialStore();
+    let gateFirstCreate: (() => void) | undefined;
+    const firstCreateGate = new Promise<void>((r) => { gateFirstCreate = r; });
+    let createCalls = 0;
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async (userId: string) => {
+          createCalls += 1;
+          if (createCalls === 1) await firstCreateGate;
+          return inner.createSession(userId);
+        },
+        verifySession: (t: string) => inner.verifySession(t),
+        revokeUser: (u: string) => inner.revokeUser(u),
+        revokeSession: (t: string) => inner.revokeSession(t),
+      },
+    });
+    const { port } = await hub.start();
+
+    const t1 = hub.issuePairingToken('u1');
+    const h1 = await connect(port);
+    h1.send(pairRequest(t1));
+    await new Promise((r) => setTimeout(r, 20)); // H1 is now parked inside createSession
+
+    await hub.revokeUser('u1');
+
+    // Legitimate re-pair AFTER the revoke: new token, new connection, granted.
+    const t2 = hub.issuePairingToken('u1');
+    const h2 = await connect(port);
+    h2.send(pairRequest(t2));
+    const grant = await nextMessage(h2);
+    const s2 = grant.kind === 'pair.grant' ? grant.payload.sessionToken : '';
+    expect(s2).not.toBe('');
+
+    // Release H1: it sees the revoke landed after its helloStartedAt and
+    // cleans up. That cleanup must be scoped to H1's OWN just-minted
+    // session, leaving S2 intact.
+    gateFirstCreate!();
+    expect(await nextClose(h1)).toBe(4401);
+
+    // S2 still resumes: the legitimate post-revoke session survived.
+    const h3 = await connect(port);
+    h3.send(JSON.stringify({ session: s2 }));
+    const ok = await new Promise<{ ok: boolean; userId: string }>((resolve) =>
+      h3.once('message', (d) => resolve(JSON.parse(d.toString()))));
+    expect(ok).toEqual({ ok: true, userId: 'u1' });
+  });
+
   it('a frame arriving after revokeUser is never dispatched as the revoked user (#R5-6)', async () => {
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();
