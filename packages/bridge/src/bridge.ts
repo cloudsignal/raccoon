@@ -53,6 +53,14 @@ export class RaccoonBridge {
     return false;
   }
 
+  /** Revert a markSeen() call. Used when the durable step that "seen" is meant
+   *  to guarantee (persisting the inbound message) fails, so a subsequent
+   *  retry gets a clean attempt instead of being silently swallowed as an
+   *  already-processed duplicate. */
+  private unmarkSeen(key: string): void {
+    this.processed.delete(key);
+  }
+
   private async handleMsg(env: Extract<AnyEnvelope, { kind: 'msg' }>, userId: string): Promise<void> {
     const channel = env.channel;
     const agent = agentAddress(channel);
@@ -60,7 +68,15 @@ export class RaccoonBridge {
 
     // Idempotency: a redelivered message must re-ack (so the client settles its
     // outbox) but must NOT re-run the agent turn (double LLM/tool execution).
-    if (this.markSeen(`${userId}:${env.id}`)) {
+    // markSeen() is called EAGERLY (before the append below) so a genuinely
+    // concurrent duplicate delivery is caught immediately rather than racing
+    // into a double append. If the append then fails, unmarkSeen() rolls this
+    // back: without that, marking-then-persisting meant a transient store
+    // failure silently discarded the message forever — a later retry would
+    // find it already "seen" and get nothing but a bare ack, with no append
+    // and no agent run.
+    const dedupKey = `${userId}:${env.id}`;
+    if (this.markSeen(dedupKey)) {
       this.hub.sendToUser(userId, createEnvelope('ack', {
         from: agent, to, channel, payload: { refId: env.id, status: 'received' },
       }));
@@ -68,7 +84,12 @@ export class RaccoonBridge {
     }
 
     const ts = new Date().toISOString();
-    await this.store.append({ id: env.id, channel, userId, role: 'user', text: env.payload.text, ts });
+    try {
+      await this.store.append({ id: env.id, channel, userId, role: 'user', text: env.payload.text, ts });
+    } catch (err) {
+      this.unmarkSeen(dedupKey);
+      throw err;
+    }
 
     this.hub.sendToUser(userId, createEnvelope('ack', {
       from: agent, to, channel, payload: { refId: env.id, status: 'received' },

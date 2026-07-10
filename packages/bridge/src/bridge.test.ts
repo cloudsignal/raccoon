@@ -157,6 +157,46 @@ describe('RaccoonBridge', () => {
     expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg', 'ack']);
   });
 
+  it('a redelivery after a transient append failure re-attempts persistence and the agent run (#R2-3)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let appendCalls = 0;
+    const originalAppend = store.append.bind(store);
+    store.append = async (m) => {
+      appendCalls += 1;
+      if (appendCalls === 1) throw new Error('transient store failure');
+      return originalAppend(m);
+    };
+    let runs = 0;
+    const counting: AgentRunner = { async *run() { runs += 1; yield `r${runs}`; } };
+    const bridge = new RaccoonBridge({ hub, runner: counting, store });
+    bridge.start();
+
+    const inbound = userMsg('please persist me');
+    hub.inject(inbound, 'u1'); // first attempt: append() throws
+    await settle();
+    // The failed attempt must NOT have acked (it never reached the ack call)
+    // and must not have crashed the process (start()'s catch contains it).
+    expect(hub.sent).toHaveLength(0);
+    expect(appendCalls).toBe(1);
+    expect(runs).toBe(0);
+
+    hub.inject(inbound, 'u1'); // redelivery: SAME envelope id, client retried
+    await settle();
+
+    // The retry must be treated as a FRESH attempt, not silently swallowed as
+    // "already seen": the failed attempt's 1 append call, plus this attempt's
+    // 2 (user message + agent reply), plus one agent run, full ack/typing/msg.
+    expect(appendCalls).toBe(3);
+    expect(runs).toBe(1);
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg']);
+    const page = await store.page('coordinator', { userId: 'u1', limit: 10 });
+    expect(page.messages.map((m) => [m.role, m.text])).toEqual([
+      ['user', 'please persist me'],
+      ['agent', 'r1'],
+    ]);
+  });
+
   it('routes approval.response to the runner and replies (#6)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
