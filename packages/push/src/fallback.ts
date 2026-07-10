@@ -60,20 +60,26 @@ export function withPushFallback(
     await opts.store.add(userId, sub);
   };
 
-  // Serialise adds per user so the list -> cap-check -> add sequence is atomic for
-  // a given user; concurrent distinct-endpoint subscribes then cannot each pass the
-  // cap check before any write and overshoot MAX_SUBSCRIPTIONS_PER_USER.
-  const addChains = new Map<string, Promise<void>>();
-  const enqueueAdd = (userId: string, sub: PushSubscriptionJson): void => {
-    const prev = addChains.get(userId) ?? Promise.resolve();
-    const next = prev.then(() => addSubscription(userId, sub)).catch(() => { /* best-effort */ });
-    addChains.set(userId, next);
-    void next.finally(() => { if (addChains.get(userId) === next) addChains.delete(userId); });
+  // Serialise BOTH subscribe and unsubscribe per user, in arrival order, on
+  // the SAME chain. Without this, a subscribe's list -> cap-check -> add
+  // sequence could interleave with a concurrent unsubscribe for the same
+  // user: e.g. subscribe's list() snapshot taken before an in-flight
+  // unsubscribe's remove() commits, followed by unsubscribe committing, then
+  // subscribe's add() lands — resurrecting the very endpoint the client had
+  // just asked to remove. One FIFO chain per user closes every such
+  // interleaving, matching the atomicity the cap-check already relied on for
+  // concurrent subscribes.
+  const opChains = new Map<string, Promise<void>>();
+  const enqueue = (userId: string, op: () => Promise<void>): void => {
+    const prev = opChains.get(userId) ?? Promise.resolve();
+    const next = prev.then(op).catch(() => { /* best-effort */ });
+    opChains.set(userId, next);
+    void next.finally(() => { if (opChains.get(userId) === next) opChains.delete(userId); });
   };
 
   const stopCapture = hub.onEnvelope((env, userId) => {
     if (env.kind === 'push.subscribe') {
-      enqueueAdd(userId, env.payload.subscription);
+      enqueue(userId, () => addSubscription(userId, env.payload.subscription));
       return;
     }
     if (env.kind === 'push.unsubscribe') {
@@ -81,7 +87,7 @@ export function withPushFallback(
       // (per the SubscriptionStore contract), so a client can only ever
       // unsubscribe an endpoint registered under its own authenticated
       // identity, never another user's.
-      void opts.store.remove(userId, env.payload.endpoint).catch(() => { /* best-effort */ });
+      enqueue(userId, () => opts.store.remove(userId, env.payload.endpoint));
     }
   });
 

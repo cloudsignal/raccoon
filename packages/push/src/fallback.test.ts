@@ -120,6 +120,52 @@ describe('withPushFallback', () => {
     expect(await store.list('victim')).toHaveLength(1);
   });
 
+  it('a concurrent unsubscribe for the same endpoint is serialized after an in-flight subscribe, not resurrected (#R3-12)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    // Must pass the SSRF/vendor-allowlist guard (unlike 'https://push.example/1',
+    // used elsewhere in this file only to seed the store directly, bypassing
+    // addSubscription) — otherwise addSubscription returns before ever calling
+    // store.list(), and the gate below never engages.
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/1';
+    await store.add('u1', sub(endpoint));
+
+    // Gate store.list() so the subscribe's list -> cap-check -> add sequence
+    // stays in flight while we inject a concurrent unsubscribe for the same
+    // endpoint. Without per-user serialization covering BOTH operations, the
+    // unsubscribe's remove() (which doesn't depend on list()) could complete
+    // BEFORE the gated subscribe's add() runs, so the subscribe would
+    // resurrect the very endpoint the client had just asked to remove.
+    const gate: { release?: () => void } = {};
+    const originalList = store.list.bind(store);
+    let listCalls = 0;
+    store.list = async (userId: string) => {
+      listCalls += 1;
+      if (listCalls === 1) await new Promise<void>((resolve) => { gate.release = resolve; });
+      return originalList(userId);
+    };
+
+    withPushFallback(inner, { store, sender: new FakeSender() });
+
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system', payload: { subscription: sub(endpoint) },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 10)); // let the subscribe reach the gated list() call
+    expect(listCalls).toBe(1); // sanity: the gate actually engaged
+
+    inner.emit(createEnvelope('push.unsubscribe', {
+      from: 'user:u1', to: 'system', channel: 'system', payload: { endpoint },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 10)); // unsubscribe must NOT run yet — it's queued behind the subscribe
+
+    gate.release?.();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The unsubscribe was the later-arriving op: once properly serialized, it
+    // runs AFTER the subscribe completes and the endpoint ends up removed.
+    expect(await originalList('u1')).toHaveLength(0);
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();
