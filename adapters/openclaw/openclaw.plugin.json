@@ -4,15 +4,20 @@
   "description": "Self-hosted Raccoon messenger (installable PWA + push) as an OpenClaw channel.",
   "activation": { "onStartup": true },
   "enabledByDefault": true,
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": true,
-    "properties": {
-      "instance": { "type": "string" },
-      "port": { "type": "number" },
-      "instanceUrl": { "type": "string" },
-      "channels": { "type": "array", "items": { "type": "string" } },
-      "staticDir": { "type": "string" }
+  "channels": ["raccoon"],
+  "channelConfigs": {
+    "raccoon": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "instance": { "type": "string" },
+          "port": { "type": "number" },
+          "instanceUrl": { "type": "string" },
+          "channels": { "type": "array", "items": { "type": "string" } },
+          "staticDir": { "type": "string" }
+        }
+      }
     }
   }
 }

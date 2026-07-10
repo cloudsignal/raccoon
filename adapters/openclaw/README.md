@@ -139,22 +139,28 @@ envelopes, one per chunk, order preserved:
    - `index.js` (the bundle)
    - `package.json` (`"openclaw": { "extensions": ["./index.js"] }`)
    - `openclaw.plugin.json`: REQUIRED by current OpenClaw. Copy the one shipped
-     at `adapters/openclaw/openclaw.plugin.json`; its `configSchema` mirrors
-     `raccoonChannelPlugin.configSchema.schema` (port / instanceUrl / channels /
-     instance / staticDir; `additionalProperties: true` so the allowFrom /
-     dmPolicy fields the security + setup adapters read pass through):
+     at `adapters/openclaw/openclaw.plugin.json`. The top-level `channels`
+     array is what marks this manifest as owning the `raccoon` channel id (not
+     a `kind` field); `channelConfigs.raccoon.schema` is the cold-path config
+     schema (setup and Control UI read it before the plugin runtime loads) and
+     mirrors `raccoonChannelPlugin.configSchema.schema` (port / instanceUrl /
+     channels / instance / staticDir; `additionalProperties: true` so the
+     allowFrom / dmPolicy fields the security + setup adapters read pass
+     through):
 
      ```json
      { "id": "raccoon", "activation": { "onStartup": true },
        "enabledByDefault": true, "name": "Raccoon",
        "description": "Self-hosted Raccoon messenger (installable PWA + push).",
-       "configSchema": { "type": "object", "additionalProperties": true,
+       "channels": ["raccoon"],
+       "channelConfigs": { "raccoon": { "schema": {
+         "type": "object", "additionalProperties": true,
          "properties": {
            "instance": { "type": "string" },
            "port": { "type": "number" },
            "instanceUrl": { "type": "string" },
            "channels": { "type": "array", "items": { "type": "string" } },
-           "staticDir": { "type": "string" } } } }
+           "staticDir": { "type": "string" } } } } } }
      ```
 
 3. Gotchas found live:
