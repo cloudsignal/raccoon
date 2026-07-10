@@ -245,6 +245,44 @@ describe('withPushFallback', () => {
     expect(await store.list('u1')).toHaveLength(1);
   });
 
+  it('an in-flight offline push does not deliver once clearForUser fences it (#R6-6)', async () => {
+    const inner = new FakeHub();
+    const base = new InMemorySubscriptionStore();
+    await base.add('u1', sub('https://push.example/1'));
+
+    // Gate the store snapshot so the delivery is parked with subscriptions
+    // captured but not yet sent; clearForUser runs (bumping the per-user
+    // revocation generation) while it waits. Return a PRE-clear snapshot on
+    // release, so only the generation fence — not an incidentally-emptied
+    // store — can stop the send.
+    const gate: { release?: () => void } = {};
+    const snapshot = await base.list('u1');
+    const store = {
+      list: async (uid: string) => {
+        if (uid === 'u1' && !gate.release) {
+          await new Promise<void>((resolve) => { gate.release = resolve; });
+          return snapshot;
+        }
+        return base.list(uid);
+      },
+      add: (uid: string, s: PushSubscriptionJson) => base.add(uid, s),
+      remove: (uid: string, ep: string) => base.remove(uid, ep),
+      clear: (uid: string) => base.clear(uid),
+    };
+    const sender = new FakeSender();
+
+    const { hub, clearForUser } = withPushFallback(inner, { store, sender });
+    expect(hub.sendToUser('u1', msgTo('u1'))).toBe(false); // offline → push path
+    await new Promise((r) => setTimeout(r, 10)); // delivery parked at the gated snapshot
+    expect(gate.release).toBeDefined();
+
+    await clearForUser('u1'); // revoke lands while the snapshot is in flight
+
+    gate.release!(); // release: the fence must suppress the send
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sender.sent).toHaveLength(0);
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();

@@ -23,8 +23,16 @@ export function withPushFallback(
 ): { hub: PushCapableHub; stop(): void; clearForUser(userId: string): Promise<void> } {
   const notify = opts.notify ?? defaultNotify;
 
+  // #R6-6: per-user revocation generation. clearForUser() bumps it
+  // synchronously the instant a revoke is requested; each in-flight delivery
+  // captured the value at its start and aborts if it has since advanced.
+  // This fences fire-and-forget push delivery against a concurrent revoke
+  // without serializing all deliveries behind the op chain.
+  const revokedGen = new Map<string, number>();
+
   const pushOut = (userId: string, payload: PushPayload): void => {
-    void sendPushToUser(opts.store, opts.sender, userId, payload);
+    const genAtStart = revokedGen.get(userId) ?? 0;
+    void sendPushToUser(opts.store, opts.sender, userId, payload, () => (revokedGen.get(userId) ?? 0) !== genAtStart);
   };
 
   const wrapped: PushCapableHub = {
@@ -118,6 +126,14 @@ export function withPushFallback(
      * blocking add(), completing revoke, then releasing add(), which left
      * one subscription behind.
      */
-    clearForUser: (userId: string) => enqueue(userId, () => opts.store.clear(userId)),
+    clearForUser: (userId: string) => {
+      // #R6-6: bump the revocation generation SYNCHRONOUSLY, before the
+      // (chained, async) store.clear — so any push delivery already in
+      // flight for this user sees the change at its next fence check and
+      // aborts, rather than delivering to a subscription this revoke is
+      // about to remove.
+      revokedGen.set(userId, (revokedGen.get(userId) ?? 0) + 1);
+      return enqueue(userId, () => opts.store.clear(userId));
+    },
   };
 }

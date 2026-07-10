@@ -3,7 +3,7 @@ import { InMemorySubscriptionStore } from './memory-store.js';
 import { sendPushToUser } from './delivery.js';
 import { vendorOf } from './vendor.js';
 import { VapidPushSender } from './vapid.js';
-import type { PushPayload, PushSender, PushSubscriptionJson } from './types.js';
+import type { PushPayload, PushSender, PushSubscriptionJson, SubscriptionStore } from './types.js';
 
 class FakeSender implements PushSender {
   readonly vendor = 'webpush' as const;
@@ -67,6 +67,48 @@ describe('sendPushToUser', () => {
     const delivered = await sendPushToUser(store, sender, 'u1', payload);
     expect(delivered).toBe(0);
     expect(await store.list('u1')).toHaveLength(0);
+  });
+});
+
+describe('sendPushToUser revocation fence (#R6-6)', () => {
+  it('aborts after the store snapshot if the user was revoked while it was in flight', async () => {
+    // The reviewer's exact shape: delivery snapshots subscriptions, a revoke
+    // completes while that snapshot is in flight, and the captured
+    // subscription must NOT then receive. Gate list() to hold the snapshot
+    // open; flip the fence (the revoke) before releasing it.
+    const store = new InMemorySubscriptionStore();
+    await store.add('u1', webSub('https://push.example/1'));
+    let revoked = false;
+    const gated: SubscriptionStore = {
+      list: async (uid: string) => {
+        revoked = true; // the revoke lands while we're snapshotting
+        return store.list(uid);
+      },
+      add: (uid, s) => store.add(uid, s),
+      remove: (uid, ep) => store.remove(uid, ep),
+      clear: (uid) => store.clear(uid),
+    };
+    const sender = new FakeSender();
+    const delivered = await sendPushToUser(gated, sender, 'u1', payload, () => revoked);
+    expect(delivered).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  it('aborts before any send if the user was already revoked at the call', async () => {
+    const store = new InMemorySubscriptionStore();
+    await store.add('u1', webSub('https://push.example/1'));
+    const sender = new FakeSender();
+    const delivered = await sendPushToUser(store, sender, 'u1', payload, () => true);
+    expect(delivered).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+  });
+
+  it('delivers normally when the fence never trips', async () => {
+    const store = new InMemorySubscriptionStore();
+    await store.add('u1', webSub('https://push.example/1'));
+    const sender = new FakeSender();
+    const delivered = await sendPushToUser(store, sender, 'u1', payload, () => false);
+    expect(delivered).toBe(1);
   });
 });
 
