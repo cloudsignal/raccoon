@@ -196,7 +196,17 @@ export function TransportProvider(props: TransportProviderProps) {
         await outbox.settle(entry.id);
       }
     } catch (err) {
-      await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed');
+      // R3-11: markSendFailed's resulting status distinguishes a terminal
+      // failure (MAX_ATTEMPTS reached — the outbox will not retry this entry
+      // again on its own) from one that will still be retried. Only a
+      // terminal failure should flip the UI out of "pending": without this,
+      // the message/response stayed shown as pending forever once outbox
+      // retries were exhausted, with no "tap to retry" affordance (gated on
+      // delivery === 'failed' — see message-bubble.tsx / approval-card.tsx).
+      const status = await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed');
+      if (status === 'failed') {
+        dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
+      }
     }
   }, []);
 

@@ -166,6 +166,39 @@ describe('TransportProvider', () => {
     await waitFor(() => expect(api.state.messages['coordinator']![0]!.delivery).toBe('sent'));
   });
 
+  it('a terminal (MAX_ATTEMPTS-exhausted) send failure flips delivery to "failed", not stuck on "pending" (#R3-11)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    // Force every send to fail synchronously — mirrors the real
+    // "transport not open" race (attempt() sees a non-null transport but its
+    // send() throws because the connection dropped in between).
+    transport.send = async () => { throw new Error('transport not open'); };
+
+    act(() => { api.sendMessage('coordinator', 'hello'); });
+    await waitFor(() => expect(api.state.messages['coordinator']).toBeDefined());
+    expect(api.state.messages['coordinator']![0]!.delivery).toBe('pending');
+
+    // Re-trigger drain() via repeated 'open' status events until the outbox
+    // entry has exhausted MAX_ATTEMPTS (each failed attempt puts it back to
+    // 'pending' — a fresh trigger is needed for each subsequent attempt; once
+    // status flips to 'failed' the entry drops out of listPending() and stops
+    // being retried, so we stop as soon as that happens).
+    for (let i = 0; i < outbox.MAX_ATTEMPTS; i++) {
+      const before = await outbox.listForChannel('coordinator');
+      if (before[0]?.status === 'failed') break;
+      const attemptsBefore = before[0]?.attempts ?? 0;
+      act(() => { transport.setStatus('open'); });
+      await waitFor(async () => {
+        const entry = (await outbox.listForChannel('coordinator'))[0];
+        expect(entry?.attempts ?? 0).toBeGreaterThan(attemptsBefore);
+      });
+    }
+
+    const entry = (await outbox.listForChannel('coordinator'))[0]!;
+    expect(entry.status).toBe('failed'); // outbox itself gave up
+    await waitFor(() => expect(api.state.messages['coordinator']![0]!.delivery).toBe('failed'));
+  });
+
   it('routes inbound msg/typing/approval and requests history on open', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);

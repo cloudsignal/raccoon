@@ -75,40 +75,48 @@ export async function listForChannel(channel: string): Promise<OutboxEntry[]> {
 
 /** Shared get-then-put: reads the entry, computes the next version via
  *  `update`, and writes it back — all within one transaction. Returns the
- *  entry's channel (for the caller's notify()), or undefined if there was no
- *  entry to update (already cleared, e.g. by a concurrent wipe). */
-async function mutate(id: string, update: (entry: OutboxEntry) => OutboxEntry): Promise<string | undefined> {
+ *  updated entry (so callers can inspect its resulting status, e.g.
+ *  markSendFailed's terminal-vs-retry distinction, as well as notify() on its
+ *  channel), or undefined if there was no entry to update (already cleared,
+ *  e.g. by a concurrent wipe). */
+async function mutate(id: string, update: (entry: OutboxEntry) => OutboxEntry): Promise<OutboxEntry | undefined> {
   return withTransaction('outbox', 'readwrite', async (s) => {
     const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
     const next = update(entry);
     await promisifyRequest(s.put(next));
-    return next.channel;
+    return next;
   });
 }
 
 export async function markSending(id: string): Promise<void> {
-  const channel = await mutate(id, (entry) => ({ ...entry, attempts: entry.attempts + 1, status: 'sending' }));
-  if (channel) notify(channel);
+  const entry = await mutate(id, (entry) => ({ ...entry, attempts: entry.attempts + 1, status: 'sending' }));
+  if (entry) notify(entry.channel);
 }
 
-export async function markSendFailed(id: string, error: string): Promise<void> {
-  const channel = await mutate(id, (entry) => ({
+/** Returns the entry's resulting status ('failed' once MAX_ATTEMPTS is
+ *  reached, 'pending' if it will still be retried), or undefined if there
+ *  was no entry to update. Callers use this to distinguish a terminal
+ *  failure (UI should stop showing "pending" and offer retry) from a
+ *  transient one that will be retried automatically. */
+export async function markSendFailed(id: string, error: string): Promise<OutboxStatus | undefined> {
+  const entry = await mutate(id, (entry) => ({
     ...entry,
     status: entry.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending',
     lastError: error,
   }));
-  if (channel) notify(channel);
+  if (entry) notify(entry.channel);
+  return entry?.status;
 }
 
 export async function markFailed(id: string, error: string): Promise<void> {
-  const channel = await mutate(id, (entry) => ({ ...entry, status: 'failed', lastError: error }));
-  if (channel) notify(channel);
+  const entry = await mutate(id, (entry) => ({ ...entry, status: 'failed', lastError: error }));
+  if (entry) notify(entry.channel);
 }
 
 export async function retry(id: string): Promise<void> {
-  const channel = await mutate(id, (entry) => ({ ...entry, status: 'pending', attempts: 0, lastError: undefined }));
-  if (channel) notify(channel);
+  const entry = await mutate(id, (entry) => ({ ...entry, status: 'pending', attempts: 0, lastError: undefined }));
+  if (entry) notify(entry.channel);
 }
 
 export async function settle(id: string): Promise<void> {
