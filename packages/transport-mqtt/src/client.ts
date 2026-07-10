@@ -152,11 +152,14 @@ export class MqttTransport implements Transport {
         if (!settled) {
           settled = true;
           reject(new Error('connection closed during handshake'));
-          return;
+          // fall through: still emit 'closed' below so the status never sticks
         }
 
-        if (this.closedByUser || this.suppressReconnect || this.status === 'closed') return;
-        this.setStatus('closed');
+        // A close always means "not open". Emit 'closed' even on a handshake-phase
+        // close or a not-authorized failure, so the UI never sticks at 'connecting'.
+        if (this.status !== 'closed') this.setStatus('closed');
+
+        if (this.closedByUser || this.suppressReconnect) return;
         if (this.everOpened) this.scheduleReconnect();
       });
     });

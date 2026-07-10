@@ -8,7 +8,10 @@ export function PushBanner() {
 
   useEffect(() => {
     if (!canEnablePush) return;
-    if (!('Notification' in window) || Notification.permission !== 'default') return;
+    // Show while notifications are not yet enabled and not blocked. Include the
+    // 'granted' case: permission can already be granted while the subscription was
+    // lost (server restart / re-pair), and the user must be able to re-register.
+    if (!('Notification' in window) || Notification.permission === 'denied') return;
     void kvGet<boolean>('push-enabled').then((enabled) => {
       if (!enabled) setVisible(true);
     });
@@ -21,7 +24,7 @@ export function PushBanner() {
       <div className="flex shrink-0 gap-1">
         <button
           type="button"
-          onClick={() => void enablePush().then((ok) => setVisible(!ok))}
+          onClick={() => { void enablePush().then((ok) => setVisible(!ok)).catch(() => { /* keep the banner up so the user can retry */ }); }}
           className="h-9 rounded-[10px] bg-primary px-3 text-sm font-medium text-white"
         >
           Enable

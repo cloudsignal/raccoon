@@ -8,7 +8,25 @@ self.addEventListener('install', (event) => {
     const cache = await caches.open(SHELL_CACHE);
     try {
       const res = await fetch('/', { cache: 'no-store' });
-      if (res.ok) await cache.put('/', res);
+      if (res.ok) {
+        const html = await res.clone().text();
+        await cache.put('/', res);
+        // Precache the hashed assets the shell references. The SW registers after
+        // the first page's JS/CSS have already loaded (uncontrolled), so without
+        // this an immediate offline relaunch would serve cached HTML whose assets
+        // were never cached. Best-effort: failures fall back to the fetch handler.
+        const assetUrls = [...html.matchAll(/(?:src|href)="(\/(?:assets|icons)\/[^"]+)"/g)]
+          .map((m) => m[1]);
+        if (assetUrls.length > 0) {
+          const staticCache = await caches.open(STATIC_CACHE);
+          await Promise.all([...new Set(assetUrls)].map(async (u) => {
+            try {
+              const r = await fetch(u, { cache: 'no-store' });
+              if (r.ok) await staticCache.put(u, r);
+            } catch { /* best-effort precache */ }
+          }));
+        }
+      }
     } catch { /* offline install — shell fills on first fetch */ }
     await self.skipWaiting();
   })());
