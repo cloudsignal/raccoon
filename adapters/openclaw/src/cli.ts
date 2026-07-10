@@ -21,7 +21,7 @@
 //   types-CR1WAXpo.d.ts — OpenClawPluginCliContext, OpenClawPluginCliRegistrar
 //   (shim: openclaw/plugin-sdk/plugin-entry block, extended in T5 for CLI)
 
-import type { OpenClawPluginCliRegistrar, OpenClawPluginCliContext } from 'openclaw/plugin-sdk/channel-core';
+import type { OpenClawPluginCliRegistrar, OpenClawPluginCliContext } from 'openclaw/plugin-sdk/plugin-runtime';
 
 // ---------------------------------------------------------------------------
 // RaccoonCliDeps — injectable deps for the CLI commands (testable without a

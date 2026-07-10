@@ -32,8 +32,8 @@ import { issuePairing, type PairingHub } from '@raccoon/pairing';
 import type {
   ChannelGatewayContext,
   ChannelOutboundAdapter,
-  OpenClawConfig,
-} from 'openclaw/plugin-sdk/channel-core';
+} from 'openclaw/plugin-sdk/channel-runtime';
+import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
 import { createRaccoonChannel, type RaccoonAgentChannel } from './plugin.js';
 import { buildRaccoonInboundRunner } from './inbound.js';
 import { createRaccoonOutbound } from './outbound.js';

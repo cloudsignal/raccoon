@@ -11,9 +11,17 @@
     "@raccoon/push": "0.1.0",
     "@raccoon/transport-ws": "0.1.0"
   },
-  "devDependencies": { "@types/node": "^22.0.0" },
+  "peerDependencies": {
+    "openclaw": ">=2026.6.11"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "openclaw": "^2026.6.11"
+  },
   "openclaw": {
-    "extensions": ["./src/index.ts"],
+    "extensions": [
+      "./src/index.ts"
+    ],
     "channel": {
       "id": "raccoon",
       "label": "Raccoon",

@@ -48,15 +48,16 @@ import type {
   ChannelOutboundContext,
   ChannelOutboundPayloadContext,
   ChannelOutboundChunkContext,
-  ChannelOutboundSendContext,
-  OutboundDeliveryResult,
+} from 'openclaw/plugin-sdk/channel-runtime';
+import type { OutboundDeliveryResult } from 'openclaw/plugin-sdk/channel-send-result';
+import type {
   InteractiveReply,
   InteractiveReplyButton,
   MessagePresentation,
   MessagePresentationButton,
   MessagePresentationOption,
-  ReplyPayload,
-} from 'openclaw/plugin-sdk/channel-core';
+} from 'openclaw/plugin-sdk/interactive-runtime';
+import type { ReplyPayload } from 'openclaw/plugin-sdk/reply-runtime';
 import { ulid } from 'ulid';
 
 // ---------------------------------------------------------------------------
@@ -223,9 +224,8 @@ function resolveButtonChoice(b: MessagePresentationButton): ApprovalChoice {
 }
 
 /** Join the presentation's 'text'/'context' blocks (and blank lines for
- *  'divider') into a single string. 'chart' blocks are omitted — Raccoon
- *  declares presentationCapabilities.charts: false and has no faithful plain
- *  text rendering for chart data. */
+ *  'divider') into a single string. Any other block type (e.g. buttons/select,
+ *  which are handled separately) is omitted from the text rendering. */
 function presentationTextBlocks(presentation: MessagePresentation): string {
   const lines: string[] = [];
   for (const block of presentation.blocks) {
@@ -324,7 +324,7 @@ function presentationFromChannelData(channelData: unknown): MessagePresentation 
  * @param deps.channel - OAM channel name (e.g. 'coordinator'); used as
  *                       envelope.channel and the from: agent:<channel> address.
  */
-export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboundAdapter {
+export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
   const { hub, channel, approvalValues } = deps;
 
   // ------------------------------------------------------------------
@@ -447,10 +447,12 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
   // ------------------------------------------------------------------
   // renderPresentation — PURE TRANSFORM, no delivery (R4-1 correction).
   //
-  // Confirmed signature (docs.openclaw.ai/plan/ui-channels, 2026-07-10):
+  // Real SDK signature (outbound.types-CHpw9VBQ.d.ts, openclaw@2026.6.11):
   //   renderPresentation?: (params: { payload: ReplyPayload; presentation:
-  //     MessagePresentation; ctx: ChannelOutboundSendContext }) => ReplyPayload | null
-  // — SYNCHRONOUS, returning a transformed ReplyPayload for core to send
+  //     MessagePresentation; ctx: ChannelOutboundPayloadContext })
+  //       => Promise<ReplyPayload | null> | ReplyPayload | null
+  // We implement the SYNCHRONOUS form, returning a transformed ReplyPayload for
+  // core to send
   // through the channel's OWN delivery hooks, not a value this function
   // delivers itself. Core's sequence: resolve capabilities → degrade
   // unsupported blocks → call renderPresentation → send the result via the
@@ -471,7 +473,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
   function renderPresentation(args: {
     payload: ReplyPayload;
     presentation: MessagePresentation;
-    ctx: ChannelOutboundSendContext;
+    ctx: ChannelOutboundPayloadContext;
   }): ReplyPayload | null {
     const existing = args.payload.channelData;
     const channelData: Record<string, unknown> = {
@@ -504,14 +506,22 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
     // `limits` is intentionally omitted: protocol.ts's approval.request payload
     // has no numeric length/count caps beyond non-empty strings, so there is
     // nothing real to report there.
+    // The real ChannelPresentationCapabilities (outbound.types-CHpw9VBQ.d.ts)
+    // has no `charts` field — chart blocks are not part of the portable
+    // MessagePresentation block union, so there is nothing to declare support
+    // for. presentationTextBlocks() already omits any non-text/context/divider
+    // block, so chart handling is unaffected by dropping this declaration.
     presentationCapabilities: {
       supported: true,
       buttons: true,
       selects: true,
       context: true,
       divider: true,
-      charts: false,
     },
     renderPresentation,
-  };
+    // `satisfies` (rather than a return-type annotation) verifies the adapter
+    // matches the real ChannelOutboundAdapter contract while preserving the
+    // concrete member types — notably renderPresentation as a SYNCHRONOUS
+    // (ReplyPayload | null) transform, which callers and tests rely on.
+  } satisfies ChannelOutboundAdapter;
 }

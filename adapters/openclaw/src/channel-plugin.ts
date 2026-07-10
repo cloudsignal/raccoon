@@ -19,9 +19,9 @@ import type {
   ChannelMeta,
   ChannelCapabilities,
   ChannelConfigAdapter,
-  ChannelConfigSchema,
-  OpenClawConfig,
-} from 'openclaw/plugin-sdk/channel-core';
+} from 'openclaw/plugin-sdk/channel-runtime';
+import type { ChannelConfigSchema } from 'openclaw/plugin-sdk';
+import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
 import { createRegistryOutbound, raccoonPairDeps, resolveRunning, startAccount, stopAccount } from './gateway.js';
 import { createRaccoonPairingAdapter, createRaccoonSecurityAdapter, type PairingIssuer } from './pairing-adapter.js';
 import { raccoonSetupWizard } from './setup-wizard.js';

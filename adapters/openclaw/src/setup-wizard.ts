@@ -24,14 +24,20 @@
 
 import type {
   ChannelSetupWizard,
-  ChannelSetupWizardStatus,
   ChannelSetupWizardTextInput,
-  ChannelSetupWizardAllowFrom,
   ChannelSetupWizardAllowFromEntry,
   ChannelSetupDmPolicy,
   DmPolicy,
-} from 'openclaw/plugin-sdk/setup-runtime';
+} from 'openclaw/plugin-sdk/setup';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
+
+// `ChannelSetupWizardStatus` and `ChannelSetupWizardAllowFrom` are NOT
+// re-exported by name from any public `openclaw/plugin-sdk/*` subpath in
+// openclaw@2026.6.11 (they live only in an internal chunk). Derive them
+// structurally from the exported `ChannelSetupWizard` so these annotations stay
+// bound to the real SDK shapes.
+type ChannelSetupWizardStatus = ChannelSetupWizard['status'];
+type ChannelSetupWizardAllowFrom = NonNullable<ChannelSetupWizard['allowFrom']>;
 
 // ---------------------------------------------------------------------------
 // Internal helpers — read the raccoon config section

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import type { DispatchFromConfigResult, ReplyDispatcher } from 'openclaw/plugin-sdk/channel-inbound';
+import type { DispatchFromConfigResult } from './openclaw-missing-types.js';
 import { buildRaccoonInboundRunner, type InboundRunnerOpts, type CheckAllowed } from './inbound.js';
 import { createApprovalValueStore } from './approval-values.js';
 

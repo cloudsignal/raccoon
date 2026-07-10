@@ -15,15 +15,15 @@
 //     payload.text regardless of which send method called it.
 
 import type { AgentContext, AgentRunner } from '@raccoon/bridge';
-import {
-  dispatchReplyFromConfigWithSettledDispatcher,
-  type DispatchFromConfigResult,
-  type FinalizedMsgContext,
-  type OpenClawConfig,
-  type ReplyDispatchKind,
-  type ReplyDispatcher,
-  type ReplyPayload,
-} from 'openclaw/plugin-sdk/channel-inbound';
+import { dispatchReplyFromConfigWithSettledDispatcher } from 'openclaw/plugin-sdk/channel-inbound';
+import type {
+  FinalizedMsgContext,
+  ReplyDispatchKind,
+  ReplyDispatcher,
+  ReplyPayload,
+} from 'openclaw/plugin-sdk/reply-runtime';
+import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
+import type { DispatchFromConfigResult } from './openclaw-missing-types.js';
 import type { ApprovalChoice, ApprovalValueStore } from './approval-values.js';
 
 export interface InboundRunnerOpts {

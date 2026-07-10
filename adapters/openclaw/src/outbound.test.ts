@@ -58,7 +58,7 @@ function makeFakeHub(): OutboundHub & { envelopes: AnyEnvelope[] } {
 }
 
 // Minimal OpenClawConfig shim (opaque pass-through).
-const fakeCfg = { __brand: 'OpenClawConfig' as const } as import('openclaw/plugin-sdk/channel-inbound').OpenClawConfig;
+const fakeCfg = { __brand: 'OpenClawConfig' as const } as import('openclaw/plugin-sdk/channel-core').OpenClawConfig;
 
 // ---------------------------------------------------------------------------
 // Helper: build a minimal ChannelOutboundContext-like object for sendText tests.
@@ -405,7 +405,9 @@ describe('createRaccoonOutbound', () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
     expect(adapter.presentationCapabilities?.supported).toBe(true);
     expect(adapter.presentationCapabilities?.buttons).toBe(true);
-    expect(adapter.presentationCapabilities?.charts).toBe(false);
+    // `charts` is not part of the real ChannelPresentationCapabilities, so the
+    // adapter must not declare it at all (previously asserted `=== false`).
+    expect((adapter.presentationCapabilities as Record<string, unknown> | undefined)?.charts).toBeUndefined();
   });
 
   // renderPresentation is a PURE TRANSFORM (R4-1 correction): synchronous,
@@ -420,7 +422,7 @@ describe('createRaccoonOutbound', () => {
       title: 'Confirm deploy',
       blocks: [{ type: 'buttons' as const, buttons: [{ label: 'Approve' }, { label: 'Reject' }] }],
     };
-    const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('Deploy to prod?', 'user:alice') });
+    const result = adapter.renderPresentation!({ payload, presentation, ctx: { ...makeCtx('Deploy to prod?', 'user:alice'), payload } });
     expect(result).not.toBeInstanceOf(Promise); // synchronous, not async
     expect(hub.envelopes).toHaveLength(0); // no side effect
     expect(result?.text).toBe('Deploy to prod?');
@@ -431,7 +433,7 @@ describe('createRaccoonOutbound', () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
     const payload = { text: 'hi', mediaUrls: ['https://example.com/a.png'], replyToId: 'm1', channelData: { other: 1 } };
     const presentation = { blocks: [] };
-    const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('hi', 'user:alice') });
+    const result = adapter.renderPresentation!({ payload, presentation, ctx: { ...makeCtx('hi', 'user:alice'), payload } });
     expect(result?.mediaUrls).toEqual(payload.mediaUrls);
     expect(result?.replyToId).toBe('m1');
     expect((result?.channelData as Record<string, unknown>).other).toBe(1);
@@ -456,7 +458,7 @@ describe('createRaccoonOutbound', () => {
     const rendered = adapter.renderPresentation!({
       payload: { text: 'Deploy to prod?' },
       presentation,
-      ctx: makeCtx('Deploy to prod?', 'user:alice'),
+      ctx: { ...makeCtx('Deploy to prod?', 'user:alice'), payload: { text: 'Deploy to prod?' } },
     })!;
     // Simulate core: strip `presentation` from the renderer's result.
     const { presentation: _stripped, ...delivered } = rendered as Record<string, unknown>;
@@ -601,7 +603,7 @@ describe('createRaccoonOutbound', () => {
       ...makeCtx('Confirm?', 'user:alice'),
       payload: {
         text: 'Confirm?',
-        presentation: { blocks: [{ type: 'buttons', buttons: [{ label: 'Yes' }, { label: 'No' }] }] },
+        presentation: { blocks: [{ type: 'buttons' as const, buttons: [{ label: 'Yes' }, { label: 'No' }] }] },
       },
     };
     const result = await adapter.sendPayload!(ctx);

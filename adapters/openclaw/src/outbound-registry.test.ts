@@ -156,7 +156,10 @@ describe('createRegistryOutbound (outbound↔hub seam)', () => {
     const payload = { text: 'hi' };
     const presentation = { blocks: [] as never[] };
     const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('user:alice', 'default') as any });
-    expect(result).not.toBeInstanceOf(Promise);
+    // The registry wrapper is typed as the SDK's ChannelOutboundAdapter, whose
+    // renderPresentation return widens to Promise<...> | .... Raccoon's is
+    // synchronous; assert + narrow so the field reads below typecheck.
+    if (result instanceof Promise) throw new Error('renderPresentation must be synchronous');
     // #R5-1 contract: the presentation is encoded into retained channelData
     // (core strips `presentation` itself before delivery).
     expect(result?.text).toBe('hi');

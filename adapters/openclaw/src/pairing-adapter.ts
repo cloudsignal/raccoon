@@ -15,8 +15,8 @@
 import type {
   ChannelPairingAdapter,
   ChannelSecurityAdapter,
-  OpenClawConfig,
-} from 'openclaw/plugin-sdk/channel-core';
+} from 'openclaw/plugin-sdk/channel-runtime';
+import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
 
 // ---------------------------------------------------------------------------
 // PairingIssuer — dependency interface for device-pair issuance
