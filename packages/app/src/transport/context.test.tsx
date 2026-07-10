@@ -161,12 +161,26 @@ describe('TransportProvider', () => {
     expect(api.state.typing['coordinator']).toBe(false);
   });
 
-  it('drops to setup with a notice on auth error', async () => {
+  it('drops to setup with a notice on auth error, clearing activeChannel (#R2-10)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
+    act(() => { api.openChannel('coordinator'); });
+    expect(api.activeChannel).toBe('coordinator');
     act(() => { transport.authFail(4403); });
     await waitFor(() => expect(api.phase).toBe('setup'));
     expect(api.authError).toContain('unpaired');
+    // Without this, a stale ?c=coordinator URL (or activeChannel) could reopen
+    // a channel left over from the prior user's session after a fresh pairing.
+    expect(api.activeChannel).toBeNull();
+  });
+
+  it('openChannel ignores a channel not in the current session\'s channel list (#R2-10)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport); // session.channels = ['coordinator']
+    act(() => { api.openChannel('someone-elses-channel'); });
+    expect(api.activeChannel).toBeNull();
+    act(() => { api.openChannel('coordinator'); });
+    expect(api.activeChannel).toBe('coordinator');
   });
 
   it('drains queued sends when the transport reopens', async () => {

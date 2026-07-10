@@ -305,6 +305,11 @@ export function TransportProvider(props: TransportProviderProps) {
         void wipeAndReset().finally(() => {
           sessionRef.current = null;
           setSession(null);
+          // R2-10: unpair() already clears this; the auth-error path did not,
+          // so a stale activeChannel (and the URL's ?c= param, via ChatScreen)
+          // could reopen a channel from the PRIOR user's session after a fresh
+          // pairing, since openChannel() does not validate channel membership.
+          setActiveChannel(null);
           setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
           setPhase('setup');
         });
@@ -438,6 +443,11 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [sendEnvelope]);
 
   const openChannel = useCallback((channel: string | null) => {
+    // R2-10: validate membership against the CURRENT session's channel list.
+    // Without this, a stale `?c=<channel>` URL param (ChatScreen reads it on
+    // mount/popstate) could reopen a channel left over from a PRIOR user's
+    // session after a fresh pairing on the same device/browser tab.
+    if (channel && sessionRef.current && !sessionRef.current.channels.includes(channel)) return;
     setActiveChannel(channel);
     if (!channel) return;
     dispatch({ type: 'read-channel', channel });
