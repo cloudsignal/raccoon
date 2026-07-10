@@ -98,6 +98,31 @@ describe('TransportProvider', () => {
     expect(disabled).toBe(true);
   });
 
+  it('requeues a row stranded in "sending" by a crash/reload and sends it once the transport opens (#R3-8)', async () => {
+    // Simulate a prior session that was killed mid-send: an outbox entry left
+    // in 'sending' state with no chance to fire the transport's 'closed'
+    // event (which is the only other thing that calls demoteSending()).
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    const stranded = await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'stranded' },
+    }));
+    await outbox.markSending(stranded.id);
+    expect(await outbox.listPending()).toEqual([]); // excluded from listPending while 'sending'
+
+    const transport = new FakeTransport();
+    render(
+      <TransportProvider makeTransport={() => transport}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+
+    // Requeued to 'pending' and drained through the now-open transport — not
+    // left stranded in 'sending' forever.
+    await waitFor(() => expect(transport.sent.some((e) => e.kind === 'msg' && e.id === stranded.id)).toBe(true));
+    expect(await outbox.listPending()).toEqual([]); // moved to 'sending' again by the successful attempt
+  });
+
   it('re-requests history for loaded channels on reconnect so messages missed while offline appear (#10)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);

@@ -332,9 +332,18 @@ export function TransportProvider(props: TransportProviderProps) {
         sessionRef.current = props.sessionOverride;
         setSession(props.sessionOverride);
       }
-      wireTransport(props.transportOverride);
-      setPhase('ready');
-      void props.transportOverride.connect().catch(() => { /* reconnect loop handles it */ });
+      const override = props.transportOverride;
+      // R3-8: requeue any 'sending' rows stranded by a crash/reload mid-send in a
+      // prior session — demoteSending() otherwise only runs off the transport's
+      // 'closed' event, which a killed tab never gets to fire. Must complete
+      // BEFORE wireTransport so the first drain() this boot (triggered by the
+      // 'open' status event) is guaranteed to see the requeued rows as 'pending',
+      // not race against them still being 'sending'.
+      void outbox.demoteSending().finally(() => {
+        wireTransport(override);
+        setPhase('ready');
+        void override.connect().catch(() => { /* reconnect loop handles it */ });
+      });
       return () => {
         for (const unsub of unsubsRef.current) unsub();
         unsubsRef.current = [];
@@ -353,6 +362,10 @@ export function TransportProvider(props: TransportProviderProps) {
       // session before the setSession re-render fires through the scheduler.
       sessionRef.current = loaded;
       setSession(loaded);
+      // R3-8: see the matching comment in the transportOverride branch above —
+      // must complete before wireTransport so the boot drain() can't miss rows
+      // stranded in 'sending' by a crash/reload in the previous session.
+      await outbox.demoteSending();
       const transport = makeTransport({ url: loaded.url, session: loaded.sessionToken, device: 'raccoon-app' });
       wireTransport(transport);
       setPhase('ready');
