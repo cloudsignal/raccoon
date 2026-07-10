@@ -129,6 +129,30 @@ describe('gateway.startAccount / stopAccount', () => {
     expect(running!.channel).toBe('coordinator');
   });
 
+  it('a stop during an in-flight start tears down the account, leaving no orphan hub (#11)', async () => {
+    // A channel whose start() blocks until released, so we can stop mid-start.
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>((r) => { releaseStart = r; });
+    const ch = {
+      hub: { __fake: 'hub' as const, id: 'hub-race' },
+      start: vi.fn(async () => { await startGate; return { port: 8790 }; }),
+      stop: vi.fn(async () => {}),
+    };
+    const factory = vi.fn(() => ch as unknown as ReturnType<CreateChannel>) as unknown as CreateChannel;
+
+    const ctx = makeCtx(makeAccount());
+    const startPromise = startAccount(ctx, { createChannel: factory }); // in-flight (start blocked)
+    const stopPromise = stopAccount(ctx);                               // stop while starting
+
+    releaseStart();
+    await Promise.all([startPromise, stopPromise]);
+
+    // Before the fix, stopAccount no-op'd (running was empty) and the pending start
+    // registered an orphan. Now the stop awaits the start and tears it down.
+    expect(resolveRunning('default')).toBeUndefined();
+    expect(ch.stop).toHaveBeenCalledTimes(1);
+  });
+
   it('wires the REAL inbound runner (buildRaccoonInboundRunner), not an echo placeholder', async () => {
     const { factory } = makeFakeChannelFactory();
     const account = makeAccount();

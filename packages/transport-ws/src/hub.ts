@@ -124,6 +124,11 @@ export class WsHub {
     await this.store.revokeUser(userId);
     for (const ws of this.byUser.get(userId) ?? []) ws.close(4403, 'revoked');
     this.byUser.delete(userId);
+    // Invalidate any unredeemed pairing tokens for this user, so revocation also
+    // prevents redeeming an outstanding token into a fresh long-lived session.
+    for (const [token, record] of this.pairingTokens) {
+      if (record.userId === userId) this.pairingTokens.delete(token);
+    }
   }
 
   onEnvelope(handler: (env: AnyEnvelope, userId: string) => void): () => void {

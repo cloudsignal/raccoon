@@ -217,6 +217,13 @@ export async function stopAccount(
   ctx: ChannelGatewayContext<RaccoonResolvedAccount>,
 ): Promise<void> {
   const accountId = ctx.accountId ?? 'default';
+  // If a start is in flight, wait for it to finish before tearing down. Otherwise
+  // this stop returns as a no-op (nothing in `running` yet) and the pending start
+  // then registers an orphan hub that never gets stopped.
+  const inflight = starting.get(accountId);
+  if (inflight) {
+    try { await inflight; } catch { /* the start failed; there is nothing to stop */ }
+  }
   const entry = running.get(accountId);
   if (!entry) return;
   // Remove first so a concurrent outbound call cannot resolve a stopping hub.

@@ -102,6 +102,16 @@ describe('WsHub pairing', () => {
     expect(await nextClose(resumed)).toBe(4401);
   });
 
+  it('revokeUser invalidates an unredeemed pairing token (#8)', async () => {
+    hub = new WsHub({ instance: 'test' });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    await hub.revokeUser('u1'); // revoke BEFORE the token is redeemed
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    expect(await nextClose(ws)).toBe(4401); // the outstanding token no longer grants a session
+  });
+
   it('rate-limits pairing attempts per IP with 4429', async () => {
     hub = new WsHub({ instance: 'test', pairingAttemptsPerMinute: 2 });
     const { port } = await hub.start();
