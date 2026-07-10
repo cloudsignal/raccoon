@@ -93,8 +93,28 @@ describe('chatReducer', () => {
     expect(msg.sender).toBe('assistant');
     expect(msg.approval!.options).toEqual(['approve', 'edit', 'skip']);
     expect(state.unread['coordinator'] ?? 0).toBe(0);
-    state = chatReducer(state, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve' });
+    state = chatReducer(state, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve', responseId: 'resp-1' });
     expect(state.messages['coordinator']![0]!.respondedChoice).toBe('approve');
+  });
+
+  it('tracks approval-response delivery via responseEnvId through ack and failure (#R2-5)', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft reply', description: 'We run Raccoon...', options: ['approve', 'edit', 'skip'] },
+    });
+    let state = chatReducer(emptyChatState, { type: 'approval', env, active: true });
+    state = chatReducer(state, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve', responseId: 'resp-1' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('pending');
+    expect(state.messages['coordinator']![0]!.responseEnvId).toBe('resp-1');
+
+    // An ack whose refId is the RESPONSE envelope's id (not the original
+    // approval.request's refId) must resolve to 'delivered' via responseEnvId.
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'received' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('sent');
+
+    // A delivery-failed event keyed by the same response envelope id marks it failed.
+    state = chatReducer(state, { type: 'delivery', channel: 'coordinator', id: 'resp-1', delivery: 'failed' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('failed');
   });
 
   it('sorts merged history + live by ts', () => {

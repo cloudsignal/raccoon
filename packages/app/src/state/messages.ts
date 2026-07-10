@@ -13,6 +13,14 @@ export interface ChatMessage {
   ts: string;
   delivery?: Delivery;
   respondedChoice?: string;
+  /** Delivery status of the approval.response envelope for respondedChoice
+   *  (R2-5): 'pending' until acked, 'delivered' once acked, 'failed' on ack
+   *  timeout (matching the same ack/timeout reliability as a plain msg). */
+  respondedDelivery?: Delivery;
+  /** Id of the approval.response envelope that carried respondedChoice — the
+   *  ack/delivery-timeout events that confirm/fail it reference THIS id, not
+   *  the approval-request message's own id. */
+  responseEnvId?: string;
 }
 
 export interface ChatState {
@@ -39,7 +47,7 @@ export type ChatAction =
   | { type: 'delivery'; channel: string; id: string; delivery: Delivery }
   | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' }
   | { type: 'typing'; channel: string; on: boolean }
-  | { type: 'responded'; channel: string; refId: string; choice: string }
+  | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string }
   | { type: 'read-channel'; channel: string }
   | { type: 'reset' };
 
@@ -157,22 +165,28 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'optimistic':
       return patch(state, action.msg.channel, upsert(state.messages[action.msg.channel] ?? [], action.msg));
     case 'delivery': {
-      const list = (state.messages[action.channel] ?? []).map((m) =>
-        m.id === action.id ? { ...m, delivery: action.delivery } : m,
-      );
+      const list = (state.messages[action.channel] ?? []).map((m) => {
+        if (m.id === action.id) return { ...m, delivery: action.delivery };
+        if (m.responseEnvId === action.id) return { ...m, respondedDelivery: action.delivery };
+        return m;
+      });
       return patch(state, action.channel, list);
     }
     case 'ack': {
-      const list = (state.messages[action.channel] ?? []).map((m) =>
-        m.id === action.refId ? { ...m, delivery: ACK_DELIVERY[action.status] } : m,
-      );
+      const list = (state.messages[action.channel] ?? []).map((m) => {
+        if (m.id === action.refId) return { ...m, delivery: ACK_DELIVERY[action.status] };
+        if (m.responseEnvId === action.refId) return { ...m, respondedDelivery: ACK_DELIVERY[action.status] };
+        return m;
+      });
       return patch(state, action.channel, list);
     }
     case 'typing':
       return { ...state, typing: { ...state.typing, [action.channel]: action.on } };
     case 'responded': {
       const list = (state.messages[action.channel] ?? []).map((m) =>
-        m.kind === 'approval' && m.approval?.refId === action.refId ? { ...m, respondedChoice: action.choice } : m,
+        m.kind === 'approval' && m.approval?.refId === action.refId
+          ? { ...m, respondedChoice: action.choice, respondedDelivery: 'pending' as const, responseEnvId: action.responseId }
+          : m,
       );
       return patch(state, action.channel, list);
     }

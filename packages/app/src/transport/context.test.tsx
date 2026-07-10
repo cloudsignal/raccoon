@@ -173,12 +173,24 @@ describe('TransportProvider', () => {
     await waitFor(() => expect(transport.sent.some((e) => e.kind === 'history.request')).toBe(true));
   });
 
-  it('settles approval responses on send instead of arming an ack timer', async () => {
+  it('approval responses wait for a server ack before settling, and surface as failed on timeout (#R2-5)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
     act(() => { api.respondApproval('coordinator', 'task-9', 'approve'); });
     await waitFor(() => expect(transport.sent.some((e) => e.kind === 'approval.response')).toBe(true));
+    const responseEnv = transport.sent.find((e) => e.kind === 'approval.response')!;
+
     const outbox = await import('../lib/outbox.js');
+    // Must NOT settle immediately: a connection drop before the server actually
+    // receives this must not silently claim success (the old fire-and-forget bug).
+    expect(await outbox.listForChannel('coordinator')).toHaveLength(1);
+
+    act(() => {
+      transport.emit(createEnvelope('ack', {
+        from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+        payload: { refId: responseEnv.id, status: 'received' },
+      }));
+    });
     await waitFor(async () => expect(await outbox.listForChannel('coordinator')).toHaveLength(0));
   });
 

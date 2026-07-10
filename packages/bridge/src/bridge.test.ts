@@ -212,9 +212,31 @@ describe('RaccoonBridge', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]!.text).toBe('Better draft'); // editedText preferred over raw choice
     expect(seen[0]!.approval).toEqual({ refId: 'req-1', choice: 'edit', editedText: 'Better draft' });
-    // Fire-and-forget: no ack, just typing + the agent reply.
-    expect(hub.sent.map((s) => s.env.kind)).toEqual(['typing', 'typing', 'msg']);
-    const reply = hub.sent[2]!.env;
+    // Ack first (R2-5 reliability), then typing + the agent reply.
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg']);
+    const reply = hub.sent[3]!.env;
     if (reply.kind === 'msg') expect(reply.payload.text).toBe('handled Better draft');
+  });
+
+  it('acks a redelivered approval.response without re-running the agent (#R2-5)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let runs = 0;
+    const counting: AgentRunner = { async *run() { runs += 1; yield 'ok'; } };
+    const bridge = new RaccoonBridge({ hub, runner: counting, store });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'approve' },
+    });
+    hub.inject(env, 'u1');
+    await settle();
+    hub.inject(env, 'u1'); // redelivery: same envelope id
+    await settle();
+
+    expect(runs).toBe(1);
+    const acks = hub.sent.filter((s) => s.env.kind === 'ack');
+    expect(acks).toHaveLength(2); // both deliveries ack, so the client settles either way
+    for (const a of acks) if (a.env.kind === 'ack') expect(a.env.payload.refId).toBe(env.id);
   });
 });

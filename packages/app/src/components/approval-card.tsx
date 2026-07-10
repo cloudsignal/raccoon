@@ -11,13 +11,17 @@ function label(option: string): string {
 }
 
 export function ApprovalCard(props: { msg: ChatMessage }) {
-  const { respondApproval } = useChat();
+  const { respondApproval, retryMessage } = useChat();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(props.msg.approval?.description ?? '');
   const approval = props.msg.approval;
   if (!approval) return null;
   const tone = TONES[channelMeta(props.msg.sender).tone];
   const responded = props.msg.respondedChoice;
+  // R2-5: approval.response now round-trips through an ack like a plain msg, so
+  // a dropped connection before the server received it surfaces as 'failed'
+  // (ack timeout) instead of the UI claiming success forever.
+  const responseFailed = responded !== undefined && props.msg.respondedDelivery === 'failed';
 
   const respond = (choice: string, editedText?: string): void => {
     respondApproval(props.msg.channel, approval.refId, choice, editedText);
@@ -60,7 +64,20 @@ export function ApprovalCard(props: { msg: ChatMessage }) {
         <span className="tabular-nums">{formatTime(props.msg.ts)}</span>
       </div>
       {responded ? (
-        <p className="text-sm text-ink-soft">Responded: {responded}</p>
+        responseFailed ? (
+          <p className="text-sm text-ink-soft">
+            Responded {responded}, not sent.{' '}
+            <button
+              type="button"
+              onClick={() => retryMessage(props.msg.channel, props.msg.responseEnvId!)}
+              className="font-medium underline"
+            >
+              Tap to retry
+            </button>
+          </p>
+        ) : (
+          <p className="text-sm text-ink-soft">Responded: {responded}</p>
+        )
       ) : editing ? (
         <div className="flex gap-2">
           <button

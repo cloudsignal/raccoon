@@ -116,11 +116,23 @@ export class RaccoonBridge {
    *  "Responded". Approval responses are fire-and-forget from the client (no ack),
    *  so we only dedup and run the turn. */
   private async handleApprovalResponse(env: Extract<AnyEnvelope, { kind: 'approval.response' }>, userId: string): Promise<void> {
-    if (this.markSeen(`${userId}:${env.id}`)) return;
     const channel = env.channel;
     const agent = agentAddress(channel);
     const to = userAddress(userId);
     const { refId, choice, editedText } = env.payload;
+
+    // Ack unconditionally, including on a redelivery: this envelope has no
+    // durable-persistence step to gate on (unlike handleMsg's append), so
+    // there is no "silently swallowed" risk in acking a duplicate. The ack
+    // gives the client round-trip confirmation — without it, "Responded" was
+    // shown the instant the browser accepted the send buffer, so a connection
+    // drop between that and the server actually receiving it silently lost
+    // the decision while the UI claimed success.
+    this.hub.sendToUser(userId, createEnvelope('ack', {
+      from: agent, to, channel, payload: { refId: env.id, status: 'received' },
+    }));
+
+    if (this.markSeen(`${userId}:${env.id}`)) return;
 
     this.hub.sendToUser(userId, createEnvelope('typing', {
       from: agent, to, channel, payload: { state: 'start' },

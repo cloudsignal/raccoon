@@ -171,7 +171,12 @@ export function TransportProvider(props: TransportProviderProps) {
     await outbox.markSending(entry.id);
     try {
       await transport.send(entry.env);
-      if (entry.env.kind === 'msg') {
+      // msg and approval.response both get a server ack (bridge.ts) and so both
+      // wait for round-trip confirmation before settling. Without this (R2-5),
+      // approval.response settled the instant the browser accepted the send
+      // buffer — a connection drop between that and the server actually
+      // receiving it silently lost the decision while the UI showed "Responded".
+      if (entry.env.kind === 'msg' || entry.env.kind === 'approval.response') {
         // Clear any prior stale timer before arming a new one for the same entry.
         const prior = ackTimers.current.get(entry.id);
         if (prior) clearTimeout(prior);
@@ -182,8 +187,8 @@ export function TransportProvider(props: TransportProviderProps) {
         }, ACK_TIMEOUT_MS);
         ackTimers.current.set(entry.id, timer);
       } else {
-        // Non-msg envelopes (e.g. approval.response, push.subscribe) are fire-and-forget;
-        // settle them immediately without waiting for an ack.
+        // Other non-msg envelopes (e.g. push.subscribe) are genuinely
+        // fire-and-forget; settle them immediately without waiting for an ack.
         await outbox.settle(entry.id);
       }
     } catch (err) {
@@ -414,7 +419,7 @@ export function TransportProvider(props: TransportProviderProps) {
       from: userAddress(userId), to: agentAddress(channel), channel,
       payload: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
     });
-    dispatch({ type: 'responded', channel, refId, choice });
+    dispatch({ type: 'responded', channel, refId, choice, responseId: env.id });
     sendEnvelope(env);
   }, [sendEnvelope]);
 
