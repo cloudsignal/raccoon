@@ -42,6 +42,7 @@ import {
 } from '@raccoon/protocol';
 import type { OutboundHub } from '@raccoon/bridge';
 import { chunkReplyText } from './formatting.js';
+import type { ApprovalValueStore } from './approval-values.js';
 import type {
   ChannelOutboundAdapter,
   ChannelOutboundContext,
@@ -49,6 +50,7 @@ import type {
   ChannelOutboundChunkContext,
   OutboundDeliveryResult,
   InteractiveReply,
+  InteractiveReplyButton,
 } from 'openclaw/plugin-sdk/channel-core';
 import { ulid } from 'ulid';
 
@@ -68,6 +70,14 @@ export interface RaccoonOutboundDeps {
    * multi-channel Raccoon deployments can construct one adapter per channel.
    */
   channel: string;
+  /**
+   * Optional label -> value correlation store (see approval-values.ts).
+   * When provided, every approval.request built from a buttons block records
+   * each button's real `value` (falling back to its `label` when the SDK
+   * didn't supply one), so the inbound runner can resolve the underlying
+   * value once the human's choice comes back as a plain label string.
+   */
+  approvalValues?: ApprovalValueStore;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,14 +134,14 @@ function sendMsgChunks(
 
 /**
  * Try to extract a buttons block from an InteractiveReply (deprecated shape).
- * Returns the button labels as string[] if a 'buttons' block is found, or null
- * if there is no mappable buttons block.
+ * Returns the full button list (label AND optional value) if a 'buttons'
+ * block is found, or null if there is no mappable buttons block. Returning
+ * the full buttons (not just labels) lets the caller preserve each button's
+ * `value` via the approval-value correlation store (see approval-values.ts).
  */
-function extractButtonOptions(interactive: InteractiveReply): string[] | null {
+function findButtonsBlock(interactive: InteractiveReply): InteractiveReplyButton[] | null {
   for (const block of interactive.blocks) {
-    if (block.type === 'buttons' && block.buttons.length > 0) {
-      return block.buttons.map((b) => b.label);
-    }
+    if (block.type === 'buttons' && block.buttons.length > 0) return block.buttons;
   }
   return null;
 }
@@ -181,7 +191,7 @@ function makeResult(messageId: string, channelName: string): OutboundDeliveryRes
  *                       envelope.channel and the from: agent:<channel> address.
  */
 export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboundAdapter {
-  const { hub, channel } = deps;
+  const { hub, channel, approvalValues } = deps;
 
   // ------------------------------------------------------------------
   // sendText — plain text delivery
@@ -225,9 +235,10 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
     const interactive = payload.interactive as InteractiveReply | undefined;
 
     if (interactive && Array.isArray(interactive.blocks) && interactive.blocks.length > 0) {
-      // Try to extract button options → approval.request.
-      const options = extractButtonOptions(interactive);
-      if (options !== null) {
+      // Try to extract a buttons block → approval.request.
+      const buttons = findButtonsBlock(interactive);
+      if (buttons !== null) {
+        const options = buttons.map((b) => b.label);
         // Map to OAM approval.request.
         const refId = ulid();
         const title =
@@ -245,6 +256,13 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
             options,
           },
         });
+        // Remember each button's real value (falling back to its label when
+        // the SDK didn't supply one) so the inbound runner can resolve it once
+        // the human's choice comes back as one of these labels. Without this,
+        // a button like {label:"Approve", value:"approve:task-42"} lost its
+        // value entirely — OpenClaw only ever saw "Approve" as an unrelated
+        // turn, breaking any correlation to the pending action.
+        approvalValues?.remember(refId, new Map(buttons.map((b) => [b.label, b.value ?? b.label])));
         hub.sendToUser(userId, env);
         return makeResult(env.id, channel);
       }

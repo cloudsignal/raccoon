@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DispatchFromConfigResult, ReplyDispatcher } from 'openclaw/plugin-sdk/channel-inbound';
 import { buildRaccoonInboundRunner, type InboundRunnerOpts, type CheckAllowed } from './inbound.js';
+import { createApprovalValueStore } from './approval-values.js';
 
 // Mock dispatchReplyFromConfigWithSettledDispatcher before importing the module.
 vi.mock('openclaw/plugin-sdk/channel-inbound', () => {
@@ -79,6 +80,38 @@ describe('buildRaccoonInboundRunner', () => {
     expect(chunks).toEqual([]);
     expect(mockDispatch).not.toHaveBeenCalled();
     expect(captured).toBeUndefined();
+  });
+
+  it('resolves an approval choice (a label) back to its real value via the shared store, and surfaces the refId (#R2-5)', async () => {
+    let capturedBody: string | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      capturedBody = (arg.ctxPayload as { Body: string }).Body;
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    // Simulate what outbound.ts does when it builds an approval.request whose
+    // 'Approve' button carries a distinct machine value.
+    const store = createApprovalValueStore();
+    store.remember('req-1', new Map([['Approve', 'approve:task-42'], ['Skip', 'Skip']]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-1', choice: 'Approve' } };
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+
+    // The resolved VALUE (not the label) and the refId must both be present —
+    // previously the label alone reached OpenClaw with no refId at all.
+    expect(capturedBody).toContain('approve:task-42');
+    expect(capturedBody).toContain('req-1');
+    expect(capturedBody).not.toBe('Approve'); // not just the raw label
+
+    // A refId never remembered here (e.g. a request built elsewhere) falls
+    // back to the raw label rather than throwing or losing the choice.
+    const unknownRefCtx = { ...ctx, text: 'approve', approval: { refId: 'unknown-req', choice: 'approve' } };
+    for await (const _chunk of runner.run(unknownRefCtx)) { /* drain */ }
+    expect(capturedBody).toContain('approve');
+    expect(capturedBody).toContain('unknown-req');
   });
 
   it('skips sendBlockReply and sendToolResult payloads', async () => {

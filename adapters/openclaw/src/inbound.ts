@@ -24,6 +24,7 @@ import {
   type ReplyDispatcher,
   type ReplyPayload,
 } from 'openclaw/plugin-sdk/channel-inbound';
+import type { ApprovalValueStore } from './approval-values.js';
 
 export interface InboundRunnerOpts {
   /** The loaded OpenClaw config object (passed through from gateway context). */
@@ -36,6 +37,10 @@ export interface InboundRunnerOpts {
   storePath: string;
   /** OpenClaw agent id to target for this channel. */
   agentId: string;
+  /** Same store the outbound adapter records button values into (see
+   *  approval-values.ts). Used to resolve ctx.approval.choice (a label) back
+   *  to the button's real value before it reaches OpenClaw. */
+  approvalValues?: ApprovalValueStore;
 }
 
 /**
@@ -75,6 +80,18 @@ export function buildRaccoonInboundRunner(
   };
 }
 
+/** Render an approval decision as text carrying its refId and resolved value,
+ *  so OpenClaw sees which pending request this turn answers instead of an
+ *  unrelated-looking message. `resolvedValue` is the button's real value
+ *  (falling back to its label) — see approval-values.ts. */
+function buildApprovalText(
+  approval: NonNullable<AgentContext['approval']>,
+  resolvedValue: string,
+): string {
+  const tag = `[approval.response refId=${approval.refId} choice=${resolvedValue}]`;
+  return approval.editedText !== undefined ? `${tag} ${approval.editedText}` : tag;
+}
+
 async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIterable<string> {
   // Async push-pull queue:
   //   - OpenClaw calls dispatcher.sendFinalReply() → enqueue() pushes text
@@ -104,12 +121,24 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
 
   const sessionKey = `raccoon:user:${ctx.userId}`;
 
+  // When this turn is a response to an approval.request, ctx.text is already
+  // editedText ?? choice (set by RaccoonBridge), but that alone previously
+  // reached OpenClaw as an unstructured, unrelated-looking message: the refId
+  // and the button's real value (as opposed to its display label) were both
+  // silently dropped. Resolve the label back to its value via the same store
+  // the outbound adapter recorded it into, and prefix with the refId so
+  // OpenClaw/the agent can correlate this turn to the specific pending
+  // approval, instead of treating it as an arbitrary new chat message.
+  const approvalText = ctx.approval
+    ? buildApprovalText(ctx.approval, opts.approvalValues?.resolve(ctx.approval.refId, ctx.approval.choice) ?? ctx.approval.choice)
+    : ctx.text;
+
   // Build a minimal FinalizedMsgContext from the Raccoon AgentContext.
   const ctxPayload: FinalizedMsgContext = {
-    Body: ctx.text,
-    BodyForAgent: ctx.text,
-    CommandBody: ctx.text,
-    BodyForCommands: ctx.text,
+    Body: approvalText,
+    BodyForAgent: approvalText,
+    CommandBody: approvalText,
+    BodyForCommands: approvalText,
     From: ctx.userId,
     SessionKey: sessionKey,
     AgentId: opts.agentId,

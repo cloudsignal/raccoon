@@ -259,6 +259,39 @@ describe('createRaccoonOutbound', () => {
     }
   });
 
+  it('remembers each button label -> value (falling back to label) in the approval-value store (#R2-5)', async () => {
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator',
+      approvalValues: { remember, resolve: (_refId: string, label: string) => label },
+    });
+    const ctx = {
+      ...makeCtx('Choose:', 'user:alice'),
+      payload: {
+        text: 'Choose:',
+        interactive: {
+          blocks: [
+            {
+              type: 'buttons' as const,
+              buttons: [
+                { label: 'Approve', value: 'approve:task-42' },
+                { label: 'Skip' }, // no value -> falls back to its own label
+              ],
+            },
+          ],
+        },
+      },
+    };
+    await adapter.sendPayload!(ctx);
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    expect(remember).toHaveBeenCalledTimes(1);
+    const [refIdArg, labelToValue] = remember.mock.calls[0]!;
+    expect(refIdArg).toBe(env.kind === 'approval.request' ? env.payload.refId : undefined);
+    expect(labelToValue.get('Approve')).toBe('approve:task-42');
+    expect(labelToValue.get('Skip')).toBe('Skip');
+  });
+
   // ---- unmappable interactive → text fallback ----------------------------
 
   it('unmappable interactive (no buttons block) → text fallback listing options', async () => {

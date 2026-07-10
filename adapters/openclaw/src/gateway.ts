@@ -37,6 +37,7 @@ import type {
 import { createRaccoonChannel, type RaccoonAgentChannel } from './plugin.js';
 import { buildRaccoonInboundRunner } from './inbound.js';
 import { createRaccoonOutbound } from './outbound.js';
+import { createApprovalValueStore, type ApprovalValueStore } from './approval-values.js';
 import type { RaccoonCliDeps } from './cli.js';
 import type { RaccoonResolvedAccount } from './channel-plugin.js';
 
@@ -91,6 +92,12 @@ const running = new Map<string, RunningAccount>();
 // account joins the same promise instead of binding a second hub.
 const starting = new Map<string, Promise<RunningAccount>>();
 
+// Per-account approval label→value correlation store (see approval-values.ts).
+// Shared between the inbound runner and outbound adapter for the SAME running
+// account, so a button's real value recorded on the way out can be resolved
+// when the human's choice (a label) comes back on the way in.
+const approvalValues = new Map<string, ApprovalValueStore>();
+
 /** Resolve the running transport for an account (default 'default'). */
 export function resolveRunning(accountId?: string): RunningAccount | undefined {
   return running.get(accountId ?? 'default');
@@ -100,6 +107,7 @@ export function resolveRunning(accountId?: string): RunningAccount | undefined {
 export function __resetRunningForTests(): void {
   running.clear();
   starting.clear();
+  approvalValues.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -169,12 +177,18 @@ async function doStart(
   const account = ctx.account;
   const channelName = account.channels[0] ?? 'coordinator';
 
+  // Fresh per-start correlation store, shared with the outbound adapter via
+  // the approvalValues registry below (R2-5).
+  const approvalStore = createApprovalValueStore();
+  approvalValues.set(accountId, approvalStore);
+
   // Build the REAL inbound runner (T1) + apply the T5 allowlist gate.
   const runner: AgentRunner = buildRaccoonInboundRunner(
     {
       cfg: ctx.cfg,
       storePath: resolveStorePath(accountId),
       agentId: resolveAgentId(account),
+      approvalValues: approvalStore,
     },
     deps.checkAllowed ? { checkAllowed: deps.checkAllowed } : undefined,
   );
@@ -228,6 +242,7 @@ export async function stopAccount(
   if (!entry) return;
   // Remove first so a concurrent outbound call cannot resolve a stopping hub.
   running.delete(accountId);
+  approvalValues.delete(accountId);
   await entry.stop();
   ctx.log?.info(`raccoon: account "${accountId}" stopped`);
 }
@@ -252,7 +267,11 @@ export function createRegistryOutbound(
           '(gateway.startAccount has not run or the account was stopped)',
       );
     }
-    return createRaccoonOutbound({ hub: entry.hub, channel: entry.channel });
+    return createRaccoonOutbound({
+      hub: entry.hub,
+      channel: entry.channel,
+      approvalValues: approvalValues.get(accountId ?? 'default'),
+    });
   }
 
   return {
