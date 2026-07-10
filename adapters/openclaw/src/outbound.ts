@@ -291,6 +291,27 @@ function asMessagePresentation(presentation: unknown): MessagePresentation | nul
   return null;
 }
 
+/**
+ * channelData key under which renderPresentation stows the presentation for
+ * sendPayload to recover (#R5-1). Namespaced to avoid colliding with other
+ * channelData producers. Why channelData and not `presentation` itself:
+ * OpenClaw core REMOVES `presentation` from every non-null renderPresentation
+ * result before routing it to the channel's delivery methods (verified
+ * against OpenClaw 2026.6.11 core by review) — so anything the adapter needs
+ * at delivery time must ride a field core retains. channelData is the
+ * documented channel-private pass-through for exactly this.
+ */
+const RACCOON_PRESENTATION_KEY = 'raccoonPresentation';
+
+/** Recover the presentation renderPresentation encoded into channelData,
+ *  or null if none is present / it doesn't narrow to a MessagePresentation. */
+function presentationFromChannelData(channelData: unknown): MessagePresentation | null {
+  if (channelData && typeof channelData === 'object') {
+    return asMessagePresentation((channelData as Record<string, unknown>)[RACCOON_PRESENTATION_KEY]);
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -395,16 +416,19 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
       return makeResult(firstId, channel);
     }
 
-    // No (mappable) interactive: check payload.presentation too. This is the
-    // REAL delivery path for the modern MessagePresentation shape (R4-1
-    // correction) — renderPresentation (below) is a pure, side-effect-free
-    // transform; core calls it, then routes the transformed payload back
-    // through sendPayload/sendText for actual delivery, since Raccoon is a
-    // 'gateway'-mode channel (all real sends go through this adapter's own
-    // methods, never a core-generic path). A caller that reaches sendPayload
-    // directly with only `presentation` set (no `interactive`) hits the same
-    // branch, so there's exactly one delivery path regardless of how it got here.
-    const presentation = asMessagePresentation(payload.presentation);
+    // No (mappable) interactive: recover the presentation. This is the REAL
+    // delivery path for the modern MessagePresentation shape —
+    // renderPresentation (below) is a pure, side-effect-free transform; core
+    // calls it, STRIPS `presentation` from the result (#R5-1), then routes
+    // the payload back through sendPayload for actual delivery (Raccoon is a
+    // 'gateway'-mode channel — all real sends go through this adapter's own
+    // methods, never a core-generic path). So the primary decode source is
+    // the channelData slot renderPresentation encoded into; payload.presentation
+    // is kept as a fallback for callers that reach sendPayload directly
+    // without going through the render hook. Either way there's exactly one
+    // delivery implementation (deliverPresentation).
+    const presentation = presentationFromChannelData(payload.channelData)
+      ?? asMessagePresentation(payload.presentation);
     if (presentation) {
       const fallbackText = typeof payload.text === 'string' && payload.text.length > 0 ? payload.text : ctx.text;
       return deliverPresentation(hub, channel, approvalValues, userId, presentation, fallbackText);
@@ -434,22 +458,27 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps): ChannelOutboun
   // channel's transport" IS sendPayload/sendText — there is no separate
   // core-generic delivery path.
   //
-  // The original implementation called deliverPresentation() here directly,
-  // performing hub.sendToUser() as a side effect and returning an
-  // OutboundDeliveryResult — a materially different, incompatible contract
-  // that (a) never matched what core actually expects back from this hook
-  // and (b) risked a double-send if core ALSO routed the transformed payload
-  // through sendPayload afterward. Since sendPayload already fully handles
-  // payload.presentation (see above), the correct transform here is the
-  // identity: hand the presentation straight back attached to the payload,
-  // and let sendPayload perform the one real delivery.
+  // #R5-1: core STRIPS `presentation` from every non-null result before that
+  // delivery step (verified against OpenClaw 2026.6.11 core by review), so a
+  // bare identity transform ({...payload, presentation}) loses the
+  // presentation entirely — sendPayload then sees only text and emits an
+  // ordinary msg, never an approval.request. The transform therefore encodes
+  // the presentation into channelData (a field core retains through
+  // delivery), which sendPayload decodes as its PRIMARY presentation source.
+  // `presentation` is still attached too — harmless when core strips it, and
+  // it keeps the result directly consumable by non-core callers.
   // ------------------------------------------------------------------
   function renderPresentation(args: {
     payload: ReplyPayload;
     presentation: MessagePresentation;
     ctx: ChannelOutboundSendContext;
   }): ReplyPayload | null {
-    return { ...args.payload, presentation: args.presentation };
+    const existing = args.payload.channelData;
+    const channelData: Record<string, unknown> = {
+      ...(existing && typeof existing === 'object' ? existing as Record<string, unknown> : {}),
+      [RACCOON_PRESENTATION_KEY]: args.presentation,
+    };
+    return { ...args.payload, presentation: args.presentation, channelData };
   }
 
   // ------------------------------------------------------------------

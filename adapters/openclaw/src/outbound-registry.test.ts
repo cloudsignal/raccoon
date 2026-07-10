@@ -157,7 +157,10 @@ describe('createRegistryOutbound (outbound↔hub seam)', () => {
     const presentation = { blocks: [] as never[] };
     const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('user:alice', 'default') as any });
     expect(result).not.toBeInstanceOf(Promise);
-    expect(result).toEqual({ text: 'hi', presentation });
+    // #R5-1 contract: the presentation is encoded into retained channelData
+    // (core strips `presentation` itself before delivery).
+    expect(result?.text).toBe('hi');
+    expect((result?.channelData as Record<string, unknown>).raccoonPresentation).toEqual(presentation);
     expect(hub.envelopes).toHaveLength(0); // no running-account resolution needed; no delivery side effect
   });
 });

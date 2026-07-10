@@ -413,7 +413,7 @@ describe('createRaccoonOutbound', () => {
   // back through sendPayload (Raccoon's real, and only, delivery path for
   // presentations — see the "sendPayload with payload.presentation" tests
   // below for the actual delivery behavior).
-  it('renderPresentation is synchronous, performs no delivery, and returns the payload with presentation attached', () => {
+  it('renderPresentation is synchronous, performs no delivery, and encodes the presentation into channelData', () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
     const payload = { text: 'Deploy to prod?' };
     const presentation = {
@@ -423,15 +423,54 @@ describe('createRaccoonOutbound', () => {
     const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('Deploy to prod?', 'user:alice') });
     expect(result).not.toBeInstanceOf(Promise); // synchronous, not async
     expect(hub.envelopes).toHaveLength(0); // no side effect
-    expect(result).toEqual({ text: 'Deploy to prod?', presentation });
+    expect(result?.text).toBe('Deploy to prod?');
+    expect((result?.channelData as Record<string, unknown>).raccoonPresentation).toEqual(presentation);
   });
 
-  it('renderPresentation preserves other ReplyPayload fields when attaching presentation', () => {
+  it('renderPresentation preserves other ReplyPayload fields and pre-existing channelData keys', () => {
     const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
-    const payload = { text: 'hi', mediaUrls: ['https://example.com/a.png'], replyToId: 'm1' };
+    const payload = { text: 'hi', mediaUrls: ['https://example.com/a.png'], replyToId: 'm1', channelData: { other: 1 } };
     const presentation = { blocks: [] };
     const result = adapter.renderPresentation!({ payload, presentation, ctx: makeCtx('hi', 'user:alice') });
-    expect(result).toEqual({ ...payload, presentation });
+    expect(result?.mediaUrls).toEqual(payload.mediaUrls);
+    expect(result?.replyToId).toBe('m1');
+    expect((result?.channelData as Record<string, unknown>).other).toBe(1);
+    expect((result?.channelData as Record<string, unknown>).raccoonPresentation).toEqual(presentation);
+  });
+
+  // The REAL OpenClaw render flow (#R5-1): core calls renderPresentation,
+  // REMOVES `presentation` from the returned payload (verified against
+  // OpenClaw 2026.6.11 core by review), and only then routes the result
+  // through the gateway channel's sendPayload. Anything the adapter needs at
+  // delivery time must therefore ride a RETAINED field — channelData — not
+  // `presentation` itself. This test replays that exact sequence.
+  it('a buttons presentation survives core stripping `presentation` between renderPresentation and sendPayload (#R5-1)', async () => {
+    const adapter = createRaccoonOutbound({ hub, channel: 'coordinator' });
+    const presentation = {
+      title: 'Confirm deploy',
+      blocks: [
+        { type: 'context' as const, text: 'Build #482' },
+        { type: 'buttons' as const, buttons: [{ label: 'Approve' }, { label: 'Reject' }] },
+      ],
+    };
+    const rendered = adapter.renderPresentation!({
+      payload: { text: 'Deploy to prod?' },
+      presentation,
+      ctx: makeCtx('Deploy to prod?', 'user:alice'),
+    })!;
+    // Simulate core: strip `presentation` from the renderer's result.
+    const { presentation: _stripped, ...delivered } = rendered as Record<string, unknown>;
+
+    await adapter.sendPayload!({ ...makeCtx('Deploy to prod?', 'user:alice'), payload: delivered });
+
+    expect(hub.envelopes).toHaveLength(1);
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    if (env.kind === 'approval.request') {
+      expect(env.payload.title).toBe('Confirm deploy');
+      expect(env.payload.description).toBe('Build #482');
+      expect(env.payload.options).toEqual(['Approve', 'Reject']);
+    }
   });
 
   // ---- sendPayload with payload.presentation: the REAL delivery path -----
