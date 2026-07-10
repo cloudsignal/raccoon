@@ -51,6 +51,26 @@ describe('buildRaccoonInboundRunner', () => {
     expect(chunks).toEqual(['hello', ' world']);
   });
 
+  it('sets CommandAuthorized from channels.raccoon.commandsAllowFrom, default-deny (#2)', async () => {
+    let captured: { ctxPayload: { CommandAuthorized: boolean } } | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      captured = arg as unknown as { ctxPayload: { CommandAuthorized: boolean } };
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    // Unset commandsAllowFrom -> default-deny (previously hardcoded true).
+    const denyRunner = buildRaccoonInboundRunner({ ...opts, cfg: { channels: { raccoon: {} } } as unknown as InboundRunnerOpts['cfg'] });
+    for await (const _chunk of denyRunner.run(ctx)) { /* drain */ }
+    expect(captured?.ctxPayload.CommandAuthorized).toBe(false);
+
+    // User listed in commandsAllowFrom -> authorized.
+    const allowRunner = buildRaccoonInboundRunner({ ...opts, cfg: { channels: { raccoon: { commandsAllowFrom: ['user-123'] } } } as unknown as InboundRunnerOpts['cfg'] });
+    for await (const _chunk of allowRunner.run(ctx)) { /* drain */ }
+    expect(captured?.ctxPayload.CommandAuthorized).toBe(true);
+  });
+
   it('skips sendBlockReply and sendToolResult payloads', async () => {
     mockDispatch.mockImplementation(async ({ dispatcher }) => {
       dispatcher.sendToolResult({ text: 'tool-output' });
@@ -197,7 +217,7 @@ describe('buildRaccoonInboundRunner', () => {
       SessionKey: `raccoon:user:${ctx.userId}`,
       AgentId: opts.agentId,
       MessageSid: ctx.messageId,
-      CommandAuthorized: true,
+      CommandAuthorized: false, // default-deny: opts.cfg has no channels.raccoon.commandsAllowFrom
     });
   });
 });

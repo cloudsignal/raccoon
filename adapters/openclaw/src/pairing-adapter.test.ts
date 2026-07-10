@@ -175,6 +175,30 @@ describe('createRaccoonSecurityAdapter', () => {
     });
   });
 
+  describe('dmPolicy is honored (#2)', () => {
+    const cfgWith = (dmPolicy: string, allowFrom: string[] = []): any => ({
+      channels: { raccoon: { dmPolicy, allowFrom } },
+    });
+    it('open admits everyone, including users not in allowFrom', () => {
+      const adapter = createRaccoonSecurityAdapter();
+      expect(adapter.checkDmAllowance(cfgWith('open', []), 'stranger')).toBe(true);
+    });
+    it('disabled admits no one, even users in allowFrom', () => {
+      const adapter = createRaccoonSecurityAdapter();
+      expect(adapter.checkDmAllowance(cfgWith('disabled', ['alice']), 'alice')).toBe(false);
+    });
+    it('allowlist admits only allowFrom members', () => {
+      const adapter = createRaccoonSecurityAdapter();
+      expect(adapter.checkDmAllowance(cfgWith('allowlist', ['alice']), 'alice')).toBe(true);
+      expect(adapter.checkDmAllowance(cfgWith('allowlist', ['alice']), 'bob')).toBe(false);
+    });
+    it('resolveDmPolicy reports the configured policy, not a hardcoded allowlist', () => {
+      const adapter = createRaccoonSecurityAdapter();
+      expect(adapter.resolveDmPolicy?.({ cfg: cfgWith('open'), account: null })?.policy).toBe('open');
+      expect(adapter.resolveDmPolicy?.({ cfg: cfgWith('disabled'), account: null })?.policy).toBe('disabled');
+    });
+  });
+
   describe('defaultDmPolicy', () => {
     it('is "allowlist"', () => {
       const adapter = createRaccoonSecurityAdapter();

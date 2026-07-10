@@ -139,12 +139,29 @@ export function createRaccoonSecurityAdapter(): RaccoonSecurityAdapter {
     return [];
   }
 
+  /** Read the configured DM policy (channels.raccoon.dmPolicy), defaulting to
+   *  'allowlist' when unset or invalid. */
+  function resolveDmPolicyValue(cfg: OpenClawConfig): 'allowlist' | 'open' | 'disabled' {
+    const ch = (cfg as { channels?: Record<string, unknown> }).channels;
+    const section = ch?.['raccoon'];
+    if (section && typeof section === 'object' && !Array.isArray(section)) {
+      const raw = (section as Record<string, unknown>)['dmPolicy'];
+      if (raw === 'open' || raw === 'disabled' || raw === 'allowlist') return raw;
+    }
+    return 'allowlist';
+  }
+
   return {
     defaultDmPolicy: 'allowlist',
 
     resolveAllowFrom,
 
     checkDmAllowance(cfg: OpenClawConfig, userId: string): boolean {
+      // Honor the configured DM policy. 'open' admits everyone, 'disabled' admits
+      // no one, 'allowlist' (the default) admits only channels.raccoon.allowFrom.
+      const policy = resolveDmPolicyValue(cfg);
+      if (policy === 'open') return true;
+      if (policy === 'disabled') return false;
       const normalized = userId.trim().toLowerCase();
       const list = resolveAllowFrom(cfg);
       return list.some((entry) => entry.trim().toLowerCase() === normalized);
@@ -156,7 +173,7 @@ export function createRaccoonSecurityAdapter(): RaccoonSecurityAdapter {
     resolveDmPolicy(ctx: { cfg: OpenClawConfig; accountId?: string | null; account: unknown }) {
       const allowFrom = resolveAllowFrom(ctx.cfg);
       return {
-        policy: 'allowlist',
+        policy: resolveDmPolicyValue(ctx.cfg),
         allowFrom,
         allowFromPath: 'channels.raccoon.allowFrom',
         approveHint: 'openclaw raccoon pair <userId>',

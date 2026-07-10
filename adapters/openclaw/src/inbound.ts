@@ -75,6 +75,24 @@ export function buildRaccoonInboundRunner(
   };
 }
 
+/**
+ * Command authorization for a Raccoon user. OpenClaw's FinalizedMsgContext is
+ * default-deny (missing/false = not authorized), and the channel is the authority
+ * that sets it. We authorize a user for commands ONLY if they appear in
+ * `channels.raccoon.commandsAllowFrom`; when that list is unset, no one is command-
+ * authorized (default-deny). This replaces a hardcoded `true`, which authorized
+ * every message regardless of any configured command allowlist.
+ */
+function isCommandAuthorized(cfg: OpenClawConfig, userId: string): boolean {
+  const ch = (cfg as { channels?: Record<string, unknown> }).channels;
+  const section = ch?.['raccoon'];
+  if (!section || typeof section !== 'object' || Array.isArray(section)) return false;
+  const raw = (section as Record<string, unknown>)['commandsAllowFrom'];
+  if (!Array.isArray(raw)) return false;
+  const normalized = userId.trim().toLowerCase();
+  return raw.some((e) => typeof e === 'string' && e.trim().toLowerCase() === normalized);
+}
+
 async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIterable<string> {
   // Async push-pull queue:
   //   - OpenClaw calls dispatcher.sendFinalReply() → enqueue() pushes text
@@ -114,7 +132,7 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     SessionKey: sessionKey,
     AgentId: opts.agentId,
     MessageSid: ctx.messageId,
-    CommandAuthorized: true,
+    CommandAuthorized: isCommandAuthorized(opts.cfg, ctx.userId),
   };
 
   // Build the dispatcher that funnels final payloads into our queue.
