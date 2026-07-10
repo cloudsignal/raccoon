@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import { createEnvelope, parseEnvelope, type AnyEnvelope } from '@raccoon/protocol';
 import { WsHub } from './hub.js';
@@ -247,6 +247,34 @@ describe('WsHub pairing', () => {
 
     await hub.revokeUser('u1'); // revoke WHILE verifySession() is in flight
     releaseVerify('u1');        // verifySession now resolves 'u1', already revoked
+
+    expect(await nextClose(ws)).toBe(4401);
+  });
+
+  it('a revoke is still detected after the system clock jumps backward (#R4-8)', async () => {
+    // helloStartedAt and revokedAt are monotonic sequence numbers, not
+    // Date.now() timestamps, so they are immune to a backward clock
+    // adjustment (NTP correction, VM resume) landing between the two. A
+    // Date.now()-based revokedAt would compare as EARLIER than the
+    // already-captured helloStartedAt here, defeating the `revokedAt >=
+    // helloStartedAt` check and letting the revoked grant through.
+    let releaseValidate!: (userId: string) => void;
+    const validateGate = new Promise<string>((r) => { releaseValidate = r; });
+    hub = new WsHub({
+      instance: 'test',
+      validatePairingToken: async () => validateGate,
+    });
+    const { port } = await hub.start();
+
+    const ws = await connect(port);
+    ws.send(pairRequest('external-token'));
+    await new Promise((r) => setTimeout(r, 20)); // let handleHello capture helloStartedAt and reach the paused validator
+
+    const realNow = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(realNow - 60 * 60 * 1000); // simulate the clock jumping back an hour
+
+    await hub.revokeUser('u1'); // revoke WHILE the external validator is in flight, under a "past" clock
+    releaseValidate('u1');      // validator now resolves grantUserId = 'u1', already revoked
 
     expect(await nextClose(ws)).toBe(4401);
   });

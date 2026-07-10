@@ -90,20 +90,38 @@ export class WsHub {
   // pre-auth resource usage, never a legitimately high count of authenticated
   // sockets.
   private pendingConnections = new Set<WebSocket>();
-  // Set by revokeUser() (Date.now() at revoke time). handleHello captures its
-  // OWN start time BEFORE any await (including the external validatePairingToken
-  // call, whose duration we don't control) and, right before granting, checks
-  // whether this user has been revoked at or after that start time. A single
-  // check suffices because revokedAt only ever increases: a revoke landing at
-  // ANY point during this handleHello call — before grantUserId is even known,
-  // during createSession(), or anywhere between — is stamped with a time >= the
+  // Set by revokeUser() (a monotonic sequence number at revoke time — see
+  // nextSeq(), #R4-8). handleHello captures its OWN start sequence BEFORE any
+  // await (including the external validatePairingToken call, whose duration
+  // we don't control) and, right before granting, checks whether this user
+  // has been revoked at or after that start. A single check suffices because
+  // revokedAt only ever increases: a revoke landing at ANY point during this
+  // handleHello call — before grantUserId is even known, during
+  // createSession(), or anywhere between — is stamped with a sequence >= the
   // captured start and is caught by the one comparison. This also closes the
   // external-validator gap an epoch-only check could not: an epoch snapshot
   // taken only after grantUserId resolves cannot see a revoke that completed
   // (and already bumped the epoch) before that snapshot, so a genuinely
   // concurrent revoke during that external await passed through undetected.
+  //
+  // A monotonic counter, not Date.now(): a backward system clock adjustment
+  // (NTP correction, VM migration/resume, manual change) between
+  // helloStartedAt being captured and revokeUser() running could make
+  // Date.now() at revoke time LESS than the already-captured helloStartedAt
+  // even though the revoke happened strictly after, in real execution order
+  // — silently defeating the >= check and letting a just-revoked grant/resume
+  // through. Millisecond-resolution timestamps could also collide (two
+  // events in the same ms), which the >= check cannot then order correctly
+  // either way. nextSeq() is immune to both: it only ever increases, and
+  // every call returns a distinct value.
   private revokedAt = new Map<string, number>();
   private handlers = new Set<(env: AnyEnvelope, userId: string) => void>();
+  private seq = 0;
+  /** Monotonic, strictly-increasing sequence number — see revokedAt's comment. */
+  private nextSeq(): number {
+    this.seq += 1;
+    return this.seq;
+  }
 
   constructor(opts: WsHubOptions) {
     this.instance = opts.instance;
@@ -224,7 +242,7 @@ export class WsHub {
     // this method — so a redemption whose OWN synchronous token lookup runs at
     // any point after this line observes the fully-revoked state, not a
     // partially-applied one:
-    this.revokedAt.set(userId, Date.now());
+    this.revokedAt.set(userId, this.nextSeq());
     // Invalidate any unredeemed pairing tokens for this user (moved before the
     // await, not after): a redemption via the internal token map can only ever
     // observe "gone" or "not yet revoked", never "still present, revoke in
@@ -297,8 +315,9 @@ export class WsHub {
     // at or after this instant — no matter which of those awaits it lands
     // during, or how an external store's own timing interleaves them — will
     // be caught by the single revokedAt check each path does right before
-    // granting. See the revokedAt field comment for why one check suffices.
-    const helloStartedAt = Date.now();
+    // granting. See the revokedAt field comment for why one check suffices,
+    // and for why this is a monotonic sequence number (#R4-8), not Date.now().
+    const helloStartedAt = this.nextSeq();
 
     let hello: unknown;
     try { hello = JSON.parse(raw); } catch {
