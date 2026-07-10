@@ -64,10 +64,19 @@ export class WsHub {
   private pairingTokens = new Map<string, PairingToken>();
   private attempts = new Map<string, { count: number; resetAt: number }>();
   private byUser = new Map<string, Set<WebSocket>>();
-  // Bumped by revokeUser(); a redemption in flight captures the epoch before its
-  // async createSession() call and re-checks it after, so a revoke racing a
-  // redemption cannot mint a session that outlives the revoke.
-  private revocationEpoch = new Map<string, number>();
+  // Set by revokeUser() (Date.now() at revoke time). handleHello captures its
+  // OWN start time BEFORE any await (including the external validatePairingToken
+  // call, whose duration we don't control) and, right before granting, checks
+  // whether this user has been revoked at or after that start time. A single
+  // check suffices because revokedAt only ever increases: a revoke landing at
+  // ANY point during this handleHello call — before grantUserId is even known,
+  // during createSession(), or anywhere between — is stamped with a time >= the
+  // captured start and is caught by the one comparison. This also closes the
+  // external-validator gap an epoch-only check could not: an epoch snapshot
+  // taken only after grantUserId resolves cannot see a revoke that completed
+  // (and already bumped the epoch) before that snapshot, so a genuinely
+  // concurrent revoke during that external await passed through undetected.
+  private revokedAt = new Map<string, number>();
   private handlers = new Set<(env: AnyEnvelope, userId: string) => void>();
 
   constructor(opts: WsHubOptions) {
@@ -136,19 +145,21 @@ export class WsHub {
   }
 
   async revokeUser(userId: string): Promise<void> {
-    // Bump the epoch FIRST (synchronously): any redemption that captured the
-    // prior epoch before this call will observe the mismatch after its own
-    // createSession() await resolves, however that interleaves with the rest
-    // of this method.
-    this.revocationEpoch.set(userId, (this.revocationEpoch.get(userId) ?? 0) + 1);
-    await this.store.revokeUser(userId);
-    for (const ws of this.byUser.get(userId) ?? []) ws.close(4403, 'revoked');
-    this.byUser.delete(userId);
-    // Invalidate any unredeemed pairing tokens for this user, so revocation also
-    // prevents redeeming an outstanding token into a fresh long-lived session.
+    // Every synchronous state change happens FIRST, before the only await in
+    // this method — so a redemption whose OWN synchronous token lookup runs at
+    // any point after this line observes the fully-revoked state, not a
+    // partially-applied one:
+    this.revokedAt.set(userId, Date.now());
+    // Invalidate any unredeemed pairing tokens for this user (moved before the
+    // await, not after): a redemption via the internal token map can only ever
+    // observe "gone" or "not yet revoked", never "still present, revoke in
+    // progress".
     for (const [token, record] of this.pairingTokens) {
       if (record.userId === userId) this.pairingTokens.delete(token);
     }
+    for (const ws of this.byUser.get(userId) ?? []) ws.close(4403, 'revoked');
+    this.byUser.delete(userId);
+    await this.store.revokeUser(userId);
   }
 
   onEnvelope(handler: (env: AnyEnvelope, userId: string) => void): () => void {
@@ -206,6 +217,14 @@ export class WsHub {
   }
 
   private async handleHello(ws: WebSocket, ip: string, raw: string): Promise<void> {
+    // Captured BEFORE anything else, including any await this call makes
+    // (verifySession, validatePairingToken, createSession). A revoke stamped
+    // at or after this instant — no matter which of those awaits it lands
+    // during, or how an external store's own timing interleaves them — will
+    // be caught by the single revokedAt check each path does right before
+    // granting. See the revokedAt field comment for why one check suffices.
+    const helloStartedAt = Date.now();
+
     let hello: unknown;
     try { hello = JSON.parse(raw); } catch {
       ws.close(this.rateLimited(ip) ? 4429 : 4401, 'bad hello');
@@ -216,6 +235,17 @@ export class WsHub {
     if (typeof hello === 'object' && hello !== null && 'session' in hello) {
       const userId = await this.store.verifySession(String((hello as { session: unknown }).session));
       if (!userId) { ws.close(4401, 'bad session'); return; }
+      // The store round-trip above has no ordering guarantee against a
+      // concurrent revokeUser() for a REAL (non-in-memory) store: it could
+      // resolve "valid" for a session that is being invalidated right now.
+      // Without this check a resumed connection could attach and go live for
+      // an already-revoked user.
+      const revokedAt = this.revokedAt.get(userId);
+      if (revokedAt !== undefined && revokedAt >= helloStartedAt) {
+        await this.store.revokeUser(userId).catch(() => {});
+        ws.close(4401, 'revoked during resume');
+        return;
+      }
       this.attach(ws, userId);
       ws.send(JSON.stringify({ ok: true, userId }));
       return;
@@ -228,15 +258,6 @@ export class WsHub {
     const env = tryParseEnvelope(hello);
     if (!env || env.kind !== 'pair.request') { ws.close(4401, 'expected pair.request'); return; }
 
-    // NOTE (residual, host-integration-only exposure): when validatePairingToken
-    // is supplied, grantUserId isn't known until this external await resolves, so
-    // a revoke landing DURING it cannot be captured by an epoch snapshot below —
-    // there is no user to key the snapshot on until this call returns. This repo
-    // does not wire validatePairingToken anywhere (grep confirms), so the gap is
-    // not currently reachable. A host that supplies it MUST keep its own
-    // revocation atomic with token invalidation (e.g. reject the token lookup
-    // itself once the user is revoked), since this hub cannot retroactively
-    // detect a revoke that completed before grantUserId was even known.
     let grantUserId: string | null = null;
     if (this.validatePairingToken) {
       grantUserId = await this.validatePairingToken(env.payload.token).catch(() => null);
@@ -248,15 +269,18 @@ export class WsHub {
       grantUserId = record.userId;
     }
 
-    // Capture the epoch BEFORE the async createSession() call, so a revoke
-    // that lands while the session is being minted is detected below rather
-    // than silently granting a session to a just-revoked user.
-    const epochAtRedeem = this.revocationEpoch.get(grantUserId) ?? 0;
     const sessionToken = await this.store.createSession(grantUserId);
-    if ((this.revocationEpoch.get(grantUserId) ?? 0) !== epochAtRedeem) {
-      // revokeUser() ran while createSession() was in flight. The store now
-      // holds a session for a revoked user — kill it immediately and refuse
-      // to grant rather than complete the race with a live session.
+    // One check, using the ORIGINAL helloStartedAt baseline (not a snapshot
+    // re-captured after grantUserId resolved): revokedAt only ever increases,
+    // so this catches a revoke landing ANYWHERE in this call — during
+    // validatePairingToken's external await, during createSession, or
+    // between them — not just the narrower createSession-only window a
+    // post-resolution snapshot would have covered.
+    const revokedAt = this.revokedAt.get(grantUserId);
+    if (revokedAt !== undefined && revokedAt >= helloStartedAt) {
+      // revokeUser() ran at some point during this call. The store now holds
+      // a session for a revoked user — kill it immediately and refuse to
+      // grant rather than complete the race with a live session.
       await this.store.revokeUser(grantUserId).catch(() => {});
       ws.close(4401, 'revoked during redemption');
       return;

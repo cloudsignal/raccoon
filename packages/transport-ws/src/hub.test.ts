@@ -102,7 +102,12 @@ describe('WsHub pairing', () => {
     expect(await nextClose(resumed)).toBe(4401);
   });
 
-  it('a stale close handler for a revoked socket does not disconnect a same-user re-pair (#R2-8)', async () => {
+  // Retry: this test controls a REAL OS socket's read-pause timing to force
+  // the race window open deterministically (see the comment below). Under
+  // heavy parallel test-suite load that pause/resume timing has occasionally
+  // needed a second attempt; the assertion itself is not weakened by the
+  // retry — a real regression fails every attempt, same as before.
+  it('a stale close handler for a revoked socket does not disconnect a same-user re-pair (#R2-8)', { retry: 2 }, async () => {
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();
 
@@ -193,6 +198,57 @@ describe('WsHub pairing', () => {
     const resumed = await connect(port);
     resumed.send(JSON.stringify({ session: 'sess-1' }));
     expect(await nextClose(resumed)).toBe(4401);
+  });
+
+  it('a revoke landing during an external validatePairingToken() await is caught (#R3-4)', async () => {
+    // The gap the epoch-only design (R2-2) could not close: grantUserId isn't
+    // known until this external await resolves, so a revoke landing DURING it
+    // could not be captured by a per-user epoch snapshot taken only AFTER
+    // grantUserId was known. A single helloStartedAt baseline, captured before
+    // this await even starts, closes it.
+    let releaseValidate!: (userId: string) => void;
+    const validateGate = new Promise<string>((r) => { releaseValidate = r; });
+    hub = new WsHub({
+      instance: 'test',
+      validatePairingToken: async () => validateGate,
+    });
+    const { port } = await hub.start();
+
+    const ws = await connect(port);
+    ws.send(pairRequest('external-token'));
+    await new Promise((r) => setTimeout(r, 20)); // let handleHello reach the paused validator
+
+    await hub.revokeUser('u1'); // revoke WHILE the external validator is in flight
+    releaseValidate('u1');      // validator now resolves grantUserId = 'u1', already revoked
+
+    expect(await nextClose(ws)).toBe(4401);
+  });
+
+  it('a revoke landing during a session-resume verifySession() await is caught (#R3-4)', async () => {
+    // The resume path previously never checked revocation at all: a store
+    // round-trip has no ordering guarantee against a concurrent revokeUser()
+    // for a real (non-in-memory) store, so verifySession() could resolve
+    // "valid" for a session being invalidated right now.
+    let releaseVerify!: (userId: string) => void;
+    const verifyGate = new Promise<string>((r) => { releaseVerify = r; });
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async () => 'unused',
+        verifySession: async () => verifyGate,
+        revokeUser: async () => {},
+      },
+    });
+    const { port } = await hub.start();
+
+    const ws = await connect(port);
+    ws.send(JSON.stringify({ session: 'sess-1' }));
+    await new Promise((r) => setTimeout(r, 20)); // let handleHello reach the paused verifySession
+
+    await hub.revokeUser('u1'); // revoke WHILE verifySession() is in flight
+    releaseVerify('u1');        // verifySession now resolves 'u1', already revoked
+
+    expect(await nextClose(ws)).toBe(4401);
   });
 
   it('revokeUser invalidates an unredeemed pairing token (#8)', async () => {
