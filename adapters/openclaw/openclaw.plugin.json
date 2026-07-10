@@ -5,6 +5,11 @@
   "activation": { "onStartup": true },
   "enabledByDefault": true,
   "channels": ["raccoon"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
   "channelConfigs": {
     "raccoon": {
       "schema": {

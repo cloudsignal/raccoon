@@ -205,6 +205,31 @@ describe('WsHub pairing', () => {
     expect(await nextClose(ws)).toBe(4401); // the outstanding token no longer grants a session
   });
 
+  it('a rejecting store failure during hello never escapes as an unhandled rejection (#R3-1)', async () => {
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async () => { throw new Error('unused'); },
+        verifySession: async () => { throw new Error('db outage'); },
+        revokeUser: async () => {},
+      },
+    });
+    const { port } = await hub.start();
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => { rejections.push(reason); };
+    process.on('unhandledRejection', onRejection);
+    try {
+      const ws = await connect(port);
+      ws.send(JSON.stringify({ session: 'whatever' })); // resume path calls verifySession(), which throws
+      // The socket must be closed (contained), not left hanging or crashing the process.
+      await nextClose(ws);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
   it('rate-limits pairing attempts per IP with 4429', async () => {
     hub = new WsHub({ instance: 'test', pairingAttemptsPerMinute: 2 });
     const { port } = await hub.start();

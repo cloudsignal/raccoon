@@ -88,7 +88,18 @@ export class WsHub {
     this.wss = new WebSocketServer({ server: this.server });
     this.wss.on('connection', (ws, req) => {
       const ip = req.socket.remoteAddress ?? 'unknown';
-      ws.once('message', (data) => void this.handleHello(ws, ip, data.toString()));
+      ws.once('message', (data) => {
+        // handleHello is async; a bare `void` call discards its promise with
+        // no rejection handler. A store failure (verifySession/createSession
+        // rejecting, e.g. a DB outage) then becomes an unhandled rejection,
+        // which crashes the host process by default in modern Node. Contain
+        // it: log server-side, close the socket rather than leaving it half-
+        // handled.
+        this.handleHello(ws, ip, data.toString()).catch((err) => {
+          console.error('[raccoon] handleHello failed:', err);
+          try { ws.close(1011, 'internal error'); } catch { /* already closing */ }
+        });
+      });
     });
     // Reject on listen failures (EADDRINUSE, EACCES) — without this the
     // 'error' event is unhandled and crashes the host process (found by the

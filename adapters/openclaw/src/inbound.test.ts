@@ -20,6 +20,7 @@ describe('buildRaccoonInboundRunner', () => {
     cfg: {} as any,
     storePath: '/tmp/raccoon-test',
     agentId: 'test-agent',
+    accountId: 'default',
   };
 
   const ctx = {
@@ -261,6 +262,12 @@ describe('buildRaccoonInboundRunner', () => {
       AgentId: opts.agentId,
       MessageSid: ctx.messageId,
       CommandAuthorized: true, // no gate wired here -> reachable at all -> upstream-authorized (R2-4)
+      // R3-3: without these, commands.allowFrom.raccoon cannot be enforced by
+      // OpenClaw (it can't attribute the message to a provider/sender).
+      Provider: 'raccoon',
+      SenderId: ctx.userId,
+      ChatType: 'direct',
+      AccountId: opts.accountId,
     });
   });
 });
@@ -281,6 +288,7 @@ describe('buildRaccoonInboundRunner with checkAllowed gate', () => {
     cfg: {} as any,
     storePath: '/tmp/raccoon-test',
     agentId: 'test-agent',
+    accountId: 'default',
   };
 
   const ctx = {

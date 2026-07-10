@@ -188,6 +188,7 @@ async function doStart(
       cfg: ctx.cfg,
       storePath: resolveStorePath(accountId),
       agentId: resolveAgentId(account),
+      accountId,
       approvalValues: approvalStore,
     },
     deps.checkAllowed ? { checkAllowed: deps.checkAllowed } : undefined,

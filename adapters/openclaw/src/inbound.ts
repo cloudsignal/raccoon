@@ -37,6 +37,10 @@ export interface InboundRunnerOpts {
   storePath: string;
   /** OpenClaw agent id to target for this channel. */
   agentId: string;
+  /** The gateway account id (e.g. 'default'). Populated into
+   *  FinalizedMsgContext.AccountId so OpenClaw can resolve per-provider
+   *  command authorization (commands.allowFrom.raccoon) correctly. */
+  accountId: string;
   /** Same store the outbound adapter records button values into (see
    *  approval-values.ts). Used to resolve ctx.approval.choice (a label) back
    *  to the button's real value before it reaches OpenClaw. */
@@ -143,6 +147,16 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     SessionKey: sessionKey,
     AgentId: opts.agentId,
     MessageSid: ctx.messageId,
+    // Provider + SenderId let OpenClaw resolve commands.allowFrom.raccoon
+    // correctly. Without these, an operator setting a per-provider allowlist
+    // (commands.allowFrom.raccoon = [...]) cannot have it enforced: OpenClaw
+    // can't attribute the message to the 'raccoon' provider or this specific
+    // sender, and falls back to authorizing anyone. ChatType is always
+    // 'direct' (Raccoon's capabilities declare chatTypes: ['direct'] only).
+    Provider: 'raccoon',
+    SenderId: ctx.userId,
+    ChatType: 'direct',
+    AccountId: opts.accountId,
     // INVARIANT: runOneTurn is private and reachable from exactly one call
     // site (run(), above), which already returns an empty iterable — never
     // reaching this function — when gate.checkAllowed denies the user. So by

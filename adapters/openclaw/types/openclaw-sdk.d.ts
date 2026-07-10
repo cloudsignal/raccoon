@@ -87,6 +87,18 @@ declare module 'openclaw/plugin-sdk/channel-inbound' {
     SessionKey?: string;
     AgentId?: string;
     MessageSid?: string;
+    /** The provider/channel id (e.g. 'raccoon'). Used to resolve
+     *  commands.allowFrom.<provider> — without it OpenClaw cannot correctly
+     *  scope per-provider command authorization to this channel. */
+    Provider?: string;
+    /** Channel-native sender identity (the Raccoon userId). Paired with
+     *  Provider to resolve commands.allowFrom.<provider> membership. */
+    SenderId?: string;
+    /** 'direct' | 'group' — Raccoon is DM-only (capabilities.chatTypes). */
+    ChatType?: string;
+    /** The resolved account id (gateway accountId; 'default' for the single
+     *  Raccoon account model). */
+    AccountId?: string;
     [key: string]: unknown;
   }
 
