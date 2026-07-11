@@ -652,6 +652,42 @@ describe('createRaccoonOutbound', () => {
     expect(remember).not.toHaveBeenCalled();
   });
 
+  it('labels differing only by INTERNAL whitespace are duplicates, and a whitespace-only label degrades to text (#SEC-008 hardening)', async () => {
+    mockChunk.mockReturnValue(['Confirm']);
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined, validate: () => false },
+    });
+    // 'Send now' vs 'Send  now' (double space) render identically → ambiguous.
+    await adapter.sendPayload!({
+      ...makeCtx('Confirm', 'user:alice'),
+      payload: {
+        text: 'Confirm',
+        presentation: { blocks: [{ type: 'buttons', buttons: [
+          { label: 'Send now', action: { type: 'command', command: 'approve a x' } },
+          { label: 'Send  now', action: { type: 'command', command: 'approve b y' } },
+        ] }] },
+      },
+    });
+    expect(hub.envelopes.at(-1)!.kind).toBe('msg'); // degraded — internal-whitespace duplicate
+    expect(remember).not.toHaveBeenCalled();
+
+    hub.envelopes.length = 0;
+    // A whitespace-only label has no perceivable identity → reject the card.
+    await adapter.sendPayload!({
+      ...makeCtx('Confirm', 'user:alice'),
+      payload: {
+        text: 'Confirm',
+        presentation: { blocks: [{ type: 'buttons', buttons: [
+          { label: '   ', action: { type: 'command', command: 'approve a x' } },
+          { label: 'Deny', action: { type: 'command', command: 'approve b y' } },
+        ] }] },
+      },
+    });
+    expect(hub.envelopes.at(-1)!.kind).toBe('msg'); // degraded — blank label
+    expect(remember).not.toHaveBeenCalled();
+  });
+
   it('the LEGACY interactive path also filters disabled and rejects duplicate labels (#R8-7)', async () => {
     // The deprecated payload.interactive path bypassed the disabled/dedup
     // safety entirely: disabled buttons became live choices and duplicate

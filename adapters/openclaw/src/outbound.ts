@@ -229,7 +229,10 @@ function findPresentationSelect(presentation: MessagePresentation): MessagePrese
  * though their raw label strings differ.
  */
 function normalizeLabel(label: string): string {
-  return label.trim().toLowerCase();
+  // Collapse INTERNAL whitespace runs too (#SEC-008 hardening): 'Send now',
+  // 'Send  now', and 'Send\tnow' render identically, so they must normalize
+  // equal and be treated as duplicates. Returns '' for a whitespace-only label.
+  return label.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 /**
@@ -248,6 +251,10 @@ function buildActionableChoices(
   const seen = new Set<string>();
   for (const i of enabled) {
     const key = normalizeLabel(i.label);
+    // A whitespace-only / empty label has no perceivable identity — the user
+    // cannot tell what they are approving, and the label-only wire cannot
+    // address it. Reject the actionable rendering (#SEC-008 hardening).
+    if (key === '') return null;
     if (seen.has(key)) return null; // ambiguous rendered labels — reject the actionable rendering
     seen.add(key);
   }
