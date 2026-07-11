@@ -13,13 +13,6 @@ import { MemoryCredentialStore, type CredentialStore } from './credential-store.
 
 interface PairingToken { userId: string; expiresAt: number; used: boolean }
 
-// #R6-11: sentinel a hello's internal deadline rejects with, so a
-// never-settling external verification (validatePairingToken / verifySession
-// / createSession) cannot keep handleHello — and therefore its
-// outstandingHellos slot — pending forever. Distinct from a real store
-// error, which propagates normally.
-const HELLO_DEADLINE = Symbol('hello-deadline');
-
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -142,26 +135,6 @@ export class WsHub {
   // hello start; decremented only when handleHello actually settles.
   private outstandingHellos = 0;
 
-  /** #R6-11: bound every awaited step of a hello by helloTimeoutMs. Returns a
-   *  `race()` that settles either with the wrapped promise or by rejecting
-   *  with HELLO_DEADLINE once the deadline passes, plus a `done()` to clear
-   *  the timer on the normal path. A hung external verification is thereby
-   *  abandoned — handleHello returns, its `.finally()` runs, and the
-   *  outstandingHellos slot is reclaimed — instead of being held forever. */
-  private helloDeadline(): { race: <T>(p: Promise<T>) => Promise<T>; done: () => void } {
-    let timer: ReturnType<typeof setTimeout>;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(HELLO_DEADLINE), this.helloTimeoutMs);
-    });
-    // If some hello path never calls race(), this promise stays unconsumed;
-    // swallow its eventual rejection so it can't surface as unhandled.
-    timeout.catch(() => {});
-    return {
-      race: <T>(p: Promise<T>): Promise<T> => Promise.race([p, timeout]),
-      done: () => clearTimeout(timer),
-    };
-  }
-
   constructor(opts: WsHubOptions) {
     this.instance = opts.instance;
     this.channels = opts.channels ?? [];
@@ -205,10 +178,18 @@ export class WsHub {
       // (not just pre-auth) — the same object is reused by attach().
       ws.on('error', () => { /* 'close' (e.g. 1009 for oversized frames) already informs the client */ });
       const ip = req.socket.remoteAddress ?? 'unknown';
+      // #R6-11b: the deadline fires ONE timer that both closes the socket AND
+      // aborts this controller. handleHello passes the signal into every
+      // external await and bails on abort (before minting a session or
+      // consuming a token), and a cooperative validatePairingToken cancels
+      // its own I/O — so a timed-out hello's underlying work actually stops
+      // rather than running on detached.
+      const helloController = new AbortController();
       // R3-10: a connection that never sends a first message would otherwise
       // sit open indefinitely, holding the pending-connection slot forever.
       const helloTimer = setTimeout(() => {
         this.pendingConnections.delete(ws);
+        if (!helloController.signal.aborted) helloController.abort();
         try { ws.close(4408, 'hello timeout'); } catch { /* already closing */ }
       }, this.helloTimeoutMs);
       ws.once('close', () => {
@@ -247,7 +228,7 @@ export class WsHub {
           return;
         }
         this.outstandingHellos += 1;
-        this.handleHello(ws, ip, data.toString())
+        this.handleHello(ws, ip, data.toString(), helloController.signal)
           .catch((err) => {
             console.error('[raccoon] handleHello failed:', err);
             try { ws.close(1011, 'internal error'); } catch { /* already closing */ }
@@ -366,32 +347,19 @@ export class WsHub {
     return entry.count > this.maxAttempts;
   }
 
-  private async handleHello(ws: WebSocket, ip: string, raw: string): Promise<void> {
-    // #R6-11: bound the WHOLE hello by helloTimeoutMs. If any awaited step
-    // hangs (a never-settling validatePairingToken / verifySession /
-    // createSession), the deadline wins the race, this returns, and the
-    // caller's `.finally()` reclaims the outstandingHellos slot — a hung
-    // validator can no longer hold a slot forever. The AbortController gives
-    // a cooperative validator an actual cancellation hook (the "or
-    // cancellation" half of the fix); non-cooperative work still can't hold
-    // the slot, it just runs on detached in the background until it settles.
-    const deadline = this.helloDeadline();
-    const controller = new AbortController();
-    try {
-      await deadline.race(this.handleHelloInner(ws, ip, raw, controller.signal));
-    } catch (err) {
-      if (err === HELLO_DEADLINE) {
-        controller.abort();
-        try { ws.close(4408, 'hello timeout'); } catch { /* already closing */ }
-        return;
-      }
-      throw err;
-    } finally {
-      deadline.done();
-    }
-  }
-
-  private async handleHelloInner(ws: WebSocket, ip: string, raw: string, signal: AbortSignal): Promise<void> {
+  private async handleHello(ws: WebSocket, ip: string, raw: string, signal: AbortSignal): Promise<void> {
+    // #R6-11b: `signal` aborts when the hello deadline fires (helloTimer in
+    // start(), which also closes the socket). Rather than RACING the deadline
+    // and returning while this work runs on — which released the
+    // outstandingHellos slot while a hung validator kept running, so new
+    // hellos spun up unbounded concurrent validations, and delayed work still
+    // minted an orphan session / burned a one-time token after the 4408 — we
+    // await the real work and CHECK signal.aborted after every external await.
+    // On abort the hello bails BEFORE creating a session or consuming a token.
+    // The slot is released by the caller's .finally() only when THIS actually
+    // settles, so a cooperative validator (which rejects on abort) frees its
+    // slot, and a non-cooperative one that ignores the signal keeps it — a
+    // true cap on underlying work, not a slot that frees while work continues.
     // Captured BEFORE anything else, including any await this call makes
     // (verifySession, validatePairingToken, createSession). A revoke stamped
     // at or after this instant — no matter which of those awaits it lands
@@ -411,6 +379,7 @@ export class WsHub {
     if (typeof hello === 'object' && hello !== null && 'session' in hello) {
       const presentedToken = String((hello as { session: unknown }).session);
       const userId = await this.store.verifySession(presentedToken);
+      if (signal.aborted) return; // #R6-11b: deadline fired mid-verify — abandon, don't attach
       if (!userId) { ws.close(4401, 'bad session'); return; }
       // The store round-trip above has no ordering guarantee against a
       // concurrent revokeUser() for a REAL (non-in-memory) store: it could
@@ -451,19 +420,35 @@ export class WsHub {
 
     let grantUserId: string | null = null;
     if (this.validatePairingToken) {
-      // #R6-11: pass the abort signal so a cooperative validator can cancel
-      // when the hello deadline fires. A validator that ignores it is still
-      // bounded — the deadline race in handleHello reclaims the slot either way.
+      // #R6-11: pass the abort signal so a cooperative validator cancels its
+      // own I/O when the hello deadline fires.
       grantUserId = await this.validatePairingToken(env.payload.token, signal).catch(() => null);
     }
+    // #R6-11b: if the deadline fired during validation, bail BEFORE consuming
+    // the built-in one-time token or minting a session — otherwise an
+    // abandoned (already 4408-closed) hello burned a token and created an
+    // orphan session, because the readyState check came only at the very end.
+    if (signal.aborted) return;
+    let builtinToken: PairingToken | null = null;
     if (!grantUserId) {
       const record = this.pairingTokens.get(env.payload.token);
       if (!record || record.used || Date.now() > record.expiresAt) { ws.close(4401, 'bad token'); return; }
-      record.used = true;
+      record.used = true; // consume synchronously to keep single-use against a concurrent replay
+      builtinToken = record;
       grantUserId = record.userId;
     }
 
     const sessionToken = await this.store.createSession(grantUserId);
+    // #R6-11b: the deadline may have fired during createSession — we now hold
+    // a session for an abandoned, closed connection. Revoke it rather than
+    // leave an orphan, un-consume the one-time token so the client can retry
+    // with the SAME QR (the deadline is not the client's fault), and do not
+    // attach.
+    if (signal.aborted) {
+      await (this.store.revokeSession?.(sessionToken) ?? this.store.revokeUser(grantUserId)).catch(() => {});
+      if (builtinToken) builtinToken.used = false;
+      return;
+    }
     // One check, using the ORIGINAL helloStartedAt baseline (not a snapshot
     // re-captured after grantUserId resolved): revokedAt only ever increases,
     // so this catches a revoke landing ANYWHERE in this call — during

@@ -538,32 +538,115 @@ describe('WsHub pairing', () => {
     expect(validatorCalls).toBe(1); // the hung validator was never re-entered
   });
 
-  it('a hung validator does not consume its slot forever — the deadline reclaims it (#R6-11)', async () => {
-    // The R5-7 counter alone would let a never-settling validator hold its
-    // slot permanently (handleHello never returns → the decrementing
-    // .finally() never runs). An internal deadline must abandon the hung
-    // verification so the slot is reclaimed and later connections succeed.
+  it('a COOPERATIVE validator that honors the abort signal frees its slot on the deadline (#R6-11/#R6-11b)', async () => {
+    // The deadline aborts the signal; a cooperative validator rejects on it,
+    // so the hello's underlying work actually SETTLES — the slot is then
+    // reclaimed and later connections succeed. (A non-cooperative validator
+    // is the next test: its slot is correctly held.)
     let firstToken = true;
     hub = new WsHub({
       instance: 'test',
       maxPendingConnections: 1,
       helloTimeoutMs: 60,
-      validatePairingToken: async (token) => {
-        if (firstToken) { firstToken = false; return new Promise<string | null>(() => {}); } // hangs forever
-        return token === 'good' ? 'u2' : null;
+      validatePairingToken: (token, signal) => {
+        if (firstToken) {
+          firstToken = false;
+          return new Promise<string | null>((_, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')));
+          });
+        }
+        return Promise.resolve(token === 'good' ? 'u2' : null);
       },
     });
     const { port } = await hub.start();
 
     const stuck = await connect(port);
     stuck.send(pairRequest('t1'));
-    expect(await nextClose(stuck)).toBe(4408); // deadline fires: socket closed…
+    expect(await nextClose(stuck)).toBe(4408); // deadline fires → abort → validator rejects → work settles
 
-    // …AND the slot is reclaimed — a fresh connection is admitted and granted,
-    // not rejected 4503 by a permanently-held slot.
+    // Slot reclaimed (the cooperative validator's work actually ended).
     await new Promise((r) => setTimeout(r, 20));
     const ok = await connect(port);
     ok.send(pairRequest('good'));
+    const grant = await nextMessage(ok);
+    expect(grant.kind).toBe('pair.grant');
+  });
+
+  it('a NON-cooperative hung validator keeps its slot — underlying work is truly capped (#R6-11b)', async () => {
+    // The R6-11 race released the slot while the hung validator ran on, so
+    // three sequential timed-out hellos produced three simultaneously hung
+    // validations. Now a validator that IGNORES the abort signal never
+    // settles, so its slot stays held — capping concurrent underlying work
+    // at maxPendingConnections instead of letting it grow per timeout cycle.
+    let calls = 0;
+    hub = new WsHub({
+      instance: 'test',
+      maxPendingConnections: 1,
+      helloTimeoutMs: 50,
+      validatePairingToken: () => { calls += 1; return new Promise<string | null>(() => { /* ignores abort, never settles */ }); },
+    });
+    const { port } = await hub.start();
+
+    const first = await connect(port);
+    first.send(pairRequest('t1'));
+    expect(await nextClose(first)).toBe(4408); // deadline closes the socket…
+
+    // …but the underlying validation is still outstanding (non-cooperative),
+    // so a new connection is refused rather than starting a SECOND hung
+    // validation — the slot is not freed while work continues.
+    await new Promise((r) => setTimeout(r, 20));
+    const second = await connect(port);
+    second.send(pairRequest('t2'));
+    expect(await nextClose(second)).toBe(4503);
+    expect(calls).toBe(1); // the hung validator was never joined by a second
+  });
+
+  it('a hello aborted mid-createSession leaves no orphan session and un-burns the one-time token (#R6-11b)', async () => {
+    // The old socket check came only AFTER createSession(): a hello whose
+    // createSession resolved past the 4408 minted a live session for a dead
+    // connection (orphan) and had already consumed the one-time token.
+    let releaseFirst!: () => void;
+    let n = 0;
+    let firstCreate = true;
+    const revoked: string[] = [];
+    const sessions = new Set<string>();
+    hub = new WsHub({
+      instance: 'test',
+      helloTimeoutMs: 50,
+      store: {
+        createSession: async (userId: string) => {
+          const t = `sess-${userId}-${++n}`;
+          if (firstCreate) {
+            firstCreate = false;
+            return new Promise<string>((resolve) => {
+              releaseFirst = () => { sessions.add(t); resolve(t); };
+            });
+          }
+          sessions.add(t);
+          return t;
+        },
+        verifySession: async (t: string) => (sessions.has(t) ? 'u1' : null),
+        revokeUser: async () => {},
+        revokeSession: async (t: string) => { revoked.push(t); sessions.delete(t); },
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    expect(await nextClose(ws)).toBe(4408); // deadline fires while the FIRST createSession is gated
+
+    releaseFirst(); // createSession now resolves, AFTER the abort
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The minted session was revoked (no orphan left behind).
+    expect(revoked).toContain('sess-u1-1');
+    expect(sessions.has('sess-u1-1')).toBe(false);
+    // The one-time token was un-burned — a fresh connection still redeems it
+    // (its createSession is no longer gated, so it grants immediately).
+    const ok = await connect(port);
+    ok.send(pairRequest(token));
     const grant = await nextMessage(ok);
     expect(grant.kind).toBe('pair.grant');
   });
