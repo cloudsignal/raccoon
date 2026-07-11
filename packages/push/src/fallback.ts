@@ -71,11 +71,8 @@ export function withPushFallback(
   // client-supplied subscription. A standard web-push endpoint must be a safe https
   // URL; vendor-scheme endpoints are validated by their vendor. Re-subscribing the
   // same endpoint is always allowed; the cap only blocks growth of distinct ones.
-  const addSubscription = async (userId: string, sub: PushSubscriptionJson): Promise<void> => {
+  const addSubscription = async (userId: string, sub: PushSubscriptionJson, genAtReceipt: number): Promise<void> => {
     if (vendorOf(sub) === 'webpush' && !isSafeWebPushEndpoint(sub.endpoint)) return;
-    // #R6-6b: a fresh subscription is a (re-)enrollment — lift any prior
-    // revocation fence for this user so delivery resumes for the new pairing.
-    revoking.delete(userId);
     try {
       const existing = await opts.store.list(userId);
       const already = existing.some((s) => s.endpoint === sub.endpoint);
@@ -84,6 +81,17 @@ export function withPushFallback(
       /* store list failure: fall through to a best-effort add */
     }
     await opts.store.add(userId, sub);
+    // #R6-6b/#R7-4b: a fresh subscription is a (re-)enrollment — lift the
+    // revocation fence so delivery resumes for the new pairing. But ONLY if no
+    // revoke has landed since this subscribe was RECEIVED. push.subscribe is
+    // deferred onto the per-user FIFO chain, so a subscribe received BEFORE a
+    // clearForUser() can have its add() run AFTER that revoke bumped the
+    // generation; lifting the fence unconditionally (the old eager
+    // revoking.delete before the store ops) would erase a fence the revoke
+    // just installed and re-expose the about-to-be-cleared subscriptions to a
+    // delivery. Comparing the generation captured at RECEIPT against the
+    // current one detects exactly that interleaving and keeps the fence.
+    if (genOf(userId) === genAtReceipt) revoking.delete(userId);
   };
 
   // Serialise BOTH subscribe and unsubscribe per user, in arrival order, on
@@ -117,7 +125,11 @@ export function withPushFallback(
     // so attach a catch to keep a failed add/remove from becoming an
     // unhandled rejection. (The chain itself is failure-proof internally.)
     if (env.kind === 'push.subscribe') {
-      void enqueue(userId, () => addSubscription(userId, env.payload.subscription)).catch(() => {});
+      // #R7-4b: capture the revocation generation SYNCHRONOUSLY at receipt —
+      // NOT inside the deferred op — so a clearForUser() that bumps it between
+      // now and when addSubscription runs is detected (see addSubscription).
+      const genAtReceipt = genOf(userId);
+      void enqueue(userId, () => addSubscription(userId, env.payload.subscription, genAtReceipt)).catch(() => {});
       return;
     }
     if (env.kind === 'push.unsubscribe') {

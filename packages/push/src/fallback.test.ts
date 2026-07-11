@@ -321,6 +321,50 @@ describe('withPushFallback', () => {
     expect(sender.sent).toHaveLength(1); // delivered again after re-enrollment
   });
 
+  it('a subscribe that predates a revoke must not un-fence the user (queued-subscribe race, #R7-4b)', async () => {
+    const inner = new FakeHub();
+    const base = new InMemorySubscriptionStore();
+    await base.add('u1', sub('https://fcm.googleapis.com/fcm/send/old')); // seeded, offline user
+
+    // Gate store.clear so clearForUser's chained clear PARKS — the store stays
+    // non-empty during the delivery window, so only the FENCE (not an emptied
+    // store) can stop a send. Models the real ordering: the revoke's clear is
+    // queued behind the predating subscribe on the same FIFO chain.
+    const gate: { release?: () => void } = {};
+    const store = {
+      list: (uid: string) => base.list(uid),
+      add: (uid: string, s: PushSubscriptionJson) => base.add(uid, s),
+      remove: (uid: string, ep: string) => base.remove(uid, ep),
+      clear: (uid: string) => {
+        if (uid === 'u1' && !gate.release) {
+          return new Promise<void>((resolve) => { gate.release = () => resolve(); }).then(() => base.clear(uid));
+        }
+        return base.clear(uid);
+      },
+    };
+    const sender = new FakeSender();
+    const { hub, clearForUser } = withPushFallback(inner, { store, sender });
+
+    // A subscribe RECEIVED BEFORE the revoke (captures generation 0). A valid
+    // FCM endpoint so it passes the SSRF guard and runs the full add path.
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system',
+      payload: { subscription: sub('https://fcm.googleapis.com/fcm/send/new') },
+    }), 'u1');
+    void clearForUser('u1'); // revoke lands right after: bumps gen 0→1, fences, enqueues the gated clear behind the subscribe
+    await new Promise((r) => setTimeout(r, 10)); // let addSubscription run and the chained clear reach the parked store.clear
+
+    // A delivery that STARTS after the revoke. On HEAD the predating subscribe
+    // erased the fence, so this reads the not-yet-cleared store and sends to
+    // the stale endpoint. With the generation-capture fix the fence stays.
+    expect(hub.sendToUser('u1', msgTo('u1'))).toBe(false); // offline → push path
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sender.sent).toHaveLength(0);
+
+    gate.release?.(); // let the clear commit — no dangling promise
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
   it('a re-subscribe does NOT un-fence an OLD delivery that was in flight across the revoke (#R7-4)', async () => {
     const inner = new FakeHub();
     const base = new InMemorySubscriptionStore();
