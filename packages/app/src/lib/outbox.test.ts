@@ -129,6 +129,32 @@ describe('outbox', () => {
     expect(await outbox.acknowledgeReceipt('nope')).toBeUndefined();
   });
 
+  it('markStalled makes a processing row terminal + non-retryable, and a late received cannot regress it (#P1-A)', async () => {
+    const e = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(e.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(e.id); // → processing
+    await outbox.markStalled(e.id);
+    expect((await outbox.getEntry(e.id))!.status).toBe('stalled');
+    // Not in the pending queue (never auto-re-driven).
+    expect((await outbox.listPending()).some((r) => r.id === e.id)).toBe(false);
+    // retry() refuses a stalled row (only 'failed' is retryable) — no one-tap
+    // retry that could double side effects.
+    expect(await outbox.retry(e.id)).toBe(false);
+    expect((await outbox.getEntry(e.id))!.status).toBe('stalled');
+    // A delayed/duplicate 'received' ack must NOT regress it to processing.
+    await outbox.acknowledgeReceipt(e.id);
+    expect((await outbox.getEntry(e.id))!.status).toBe('stalled');
+  });
+
+  it('recoverProcessing never re-drives a stalled row (#P1-A)', async () => {
+    const e = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(e.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(e.id);
+    await outbox.markStalled(e.id);
+    await outbox.recoverProcessing(SCOPE);
+    expect((await outbox.getEntry(e.id))!.status).toBe('stalled'); // untouched, not re-driven
+  });
+
   it('a delayed received ACK does NOT regress a failed row back to processing (#R7-2)', async () => {
     const e = await outbox.enqueue(approvalResp(), SCOPE);
     await outbox.markSending(e.id, TAB, SCOPE);

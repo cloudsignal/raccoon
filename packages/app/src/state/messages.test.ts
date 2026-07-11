@@ -175,6 +175,24 @@ describe('chatReducer', () => {
     expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
   });
 
+  it('a stalled ack is terminal-non-retryable: a stale received cannot un-stall it, delivered still recovers (#P1-A)', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft', description: 'x', options: ['approve'] },
+    });
+    let state = chatReducer(emptyChatState, { type: 'approval', env, active: true });
+    state = chatReducer(state, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve', responseId: 'resp-1' });
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'stalled' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('stalled');
+    // A delayed 'received' must NOT downgrade a stalled row back to 'sent'
+    // (which would re-arm the auto-retry the client suppresses for stalled).
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'received' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('stalled');
+    // But a genuine 'delivered' (higher rank) still recovers a stalled row.
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'delivered' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
+  });
+
   it('retry (delivery reset) re-opens the monotonic gate so a fresh received advances again (#R8-2)', () => {
     const id = 'out-1';
     let state = chatReducer(emptyChatState, { type: 'optimistic', msg: optimistic(id, 'hi', '2020-01-01T00:00:00.000Z') });

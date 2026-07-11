@@ -58,7 +58,7 @@ export class RaccoonBridge {
   // failure path in handleApprovalResponse). Only 'ok' entries are eviction-
   // eligible; a 'running' entry is never evicted mid-turn (same #R4-7 rule
   // as `persisted`).
-  private readonly approvalSeen = new Map<string, 'running' | 'ok'>();
+  private readonly approvalSeen = new Map<string, 'running' | 'ok' | 'stalled'>();
 
   private readonly turnDeadlineMs: number;
 
@@ -177,11 +177,15 @@ export class RaccoonBridge {
     try {
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
 
-      const { reply, failed } = await this.runTurn({ userId, channel, text: env.payload.text, messageId: env.id });
+      const { reply, outcome } = await this.runTurn({ userId, channel, text: env.payload.text, messageId: env.id });
 
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
 
-      if (failed) {
+      // The msg path is already safe from double-run (the persisted append
+      // dedups a redelivery and is never deleted on turn failure), so a
+      // timeout is surfaced the same as an error here — a softer 'still
+      // working' text is deferred polish, not a safety requirement.
+      if (outcome !== 'ok') {
         this.safeSend(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
         return;
       }
@@ -212,44 +216,58 @@ export class RaccoonBridge {
     if (prior !== undefined) {
       // Duplicate: never re-run. Re-emit the outcome-appropriate ack so a
       // client that lost the original can converge — 'delivered' if the turn
-      // already succeeded, 'received' while it is still running.
+      // already succeeded, 'stalled' if it timed out (outcome UNKNOWN, still
+      // running — a retry could double side effects, so NEVER re-open it as
+      // 'received'), 'received' while it is still running.
+      const status = prior === 'ok' ? 'delivered' : prior === 'stalled' ? 'stalled' : 'received';
       this.safeSend(userId, createEnvelope('ack', {
-        from: agent, to, channel, payload: { refId: env.id, status: prior === 'ok' ? 'delivered' : 'received' },
+        from: agent, to, channel, payload: { refId: env.id, status },
       }));
       return;
     }
 
     this.approvalSeen.set(key, 'running');
-    // Only 'ok' entries are eviction-eligible; a 'running' turn is never
-    // evicted (same #R4-7 rule as `persisted`).
+    // Only 'ok' entries are eviction-eligible; a 'running' or 'stalled' turn is
+    // never evicted (same #R4-7 rule as `persisted`) — a 'stalled' entry MUST
+    // persist so a redelivery keeps deduping to 'stalled' rather than re-running
+    // a still-live turn.
     this.evictCompleted(this.approvalSeen, this.dedupCap, (v) => v === 'ok');
 
-    // #R7-1a: EVERYTHING from here is inside try/finally. A send that throws
-    // (hub.sendToUser can throw on a broken socket) — the 'received' ack, the
-    // typing start, or the turn itself — must NOT leave the key stuck on
-    // 'running', or a redelivery would only ever re-emit 'received' and the
-    // client would sit in 'processing' forever. On any failure the finally
-    // block DELETES the key (so a redelivery cleanly re-runs) and best-effort
-    // emits the terminal 'failed' ack; on success it records 'ok' and emits
-    // the terminal 'delivered'. All sends are best-effort (safeSend) so a
-    // failed terminal send can't itself re-strand the key.
-    let ok = false;
+    // #R7-1a / #P1-A: EVERYTHING from here is inside try/finally. A send that
+    // throws (hub.sendToUser on a broken socket) — the 'received' ack, the
+    // typing start, or the turn itself — must not leave the key stuck on
+    // 'running'. Three outcomes:
+    //  - 'ok'      → record 'ok', emit terminal 'delivered'.
+    //  - 'error'   → a fast throw: nothing durable ran, so DELETE the key (a
+    //                redelivery/retry cleanly re-runs) and emit terminal
+    //                'failed' + the error text.
+    //  - 'timeout' → the turn is STILL RUNNING and non-cancellable; outcome is
+    //                UNKNOWN. Do NOT delete the key (a retry would double side
+    //                effects) and do NOT emit 'failed'. Mark 'stalled' and emit
+    //                the terminal-but-non-retryable 'stalled' ack; no error msg
+    //                (the turn may yet succeed and post its reply via history).
+    // A store/emitReply throw is caught and treated as a fast 'error'.
+    let outcome: 'ok' | 'error' | 'timeout' = 'error';
     try {
       this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'received' } }));
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
-      const { reply, failed } = await this.runTurn({
+      const res = await this.runTurn({
         userId, channel, text: editedText ?? choice, messageId: env.id,
         approval: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
       });
-      if (!failed) { await this.emitReply(userId, channel, reply); ok = true; }
+      outcome = res.outcome;
+      if (res.outcome === 'ok') await this.emitReply(userId, channel, res.reply);
     } catch {
-      // A store/emitReply throw (or anything unexpected): treat as failure.
-      ok = false;
+      outcome = 'error';
     } finally {
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
-      if (ok) {
+      if (outcome === 'ok') {
         this.approvalSeen.set(key, 'ok');
         this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'delivered' } })); // TERMINAL success
+      } else if (outcome === 'timeout') {
+        // Keep the key (as 'stalled') so a redelivery never re-runs the live turn.
+        this.approvalSeen.set(key, 'stalled');
+        this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'stalled' } }));
       } else {
         // #R6-2/#R7-1a: forget the envelope so a redelivery/retry re-runs, and
         // tell the client machine-readably (it holds the row in 'processing';
@@ -272,11 +290,19 @@ export class RaccoonBridge {
 
   /** Drain one agent turn to a string, never throwing. Bounds the WAIT at
    *  `turnDeadlineMs` (#R8-2): if the runner hasn't finished by then, stop
-   *  consuming it and report `failed` so the caller emits a terminal ack —
-   *  the client leaves 'processing' instead of spinning forever. The runner's
-   *  own generator/dispatch runs to completion detached; a late reply still
-   *  persists (and surfaces via history). */
-  private async runTurn(ctx: AgentContext): Promise<{ reply: string; failed: boolean }> {
+   *  consuming it. Distinguishes three outcomes (#P1-A):
+   *   - 'ok'      — the turn completed; `reply` is its output.
+   *   - 'error'   — the turn threw fast; nothing durable happened, so a retry
+   *                 is SAFE (the caller may re-run).
+   *   - 'timeout' — the deadline elapsed while the turn was still running. The
+   *                 turn is NOT cancelled (the runner's generator/dispatch
+   *                 continues to completion detached — see the header note), so
+   *                 its outcome is UNKNOWN and its side effects may still land.
+   *                 The caller must NOT treat this as a safe failure: it may
+   *                 neither present success nor enable a one-tap retry (which
+   *                 would double side effects). A late reply still persists via
+   *                 the MessageStore and surfaces through history. */
+  private async runTurn(ctx: AgentContext): Promise<{ reply: string; outcome: 'ok' | 'error' | 'timeout' }> {
     let reply = '';
     const iterator = this.runner.run(ctx)[Symbol.asyncIterator]();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -287,14 +313,17 @@ export class RaccoonBridge {
       for (;;) {
         const step = await Promise.race([iterator.next(), deadline]);
         if (step === 'timeout') {
+          // Best-effort stop consuming; do NOT await (the underlying turn is
+          // non-cancellable in v1 — an optional AbortSignal on AgentRunner.run
+          // is a deferred follow-up).
           void iterator.return?.(undefined).catch(() => { /* detach */ });
-          return { reply: '', failed: true };
+          return { reply: '', outcome: 'timeout' };
         }
-        if (step.done) return { reply, failed: false };
+        if (step.done) return { reply, outcome: 'ok' };
         reply += step.value;
       }
     } catch {
-      return { reply: '', failed: true };
+      return { reply: '', outcome: 'error' };
     } finally {
       if (timer) clearTimeout(timer);
     }

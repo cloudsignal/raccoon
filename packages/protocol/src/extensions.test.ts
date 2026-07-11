@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildPairingPayload,
   createEnvelope,
   parsePairingPayload,
   tryParseEnvelope,
@@ -71,5 +72,16 @@ describe('protocol extensions (Plan C)', () => {
     );
     expect(parsed).toEqual({ v: 1, instanceUrl: 'ws://127.0.0.1:8790/', transport: 'ws', token: 't0k' });
     expect(() => parsePairingPayload('{"v":2}')).toThrow();
+  });
+
+  it('accepts a non-ws transport descriptor and an omitted transport (#A1 vendor-neutral)', () => {
+    // A CloudSignal/MQTT host advertises its real transport, not a false 'ws'.
+    const cs = parsePairingPayload(buildPairingPayload({ instanceUrl: 'wss://hub.example/', token: 't', transport: 'cloudsignal' }));
+    expect(cs.transport).toBe('cloudsignal');
+    // Omitting transport is valid — the client resolves it from its own wiring.
+    const none = parsePairingPayload(JSON.stringify({ v: 1, instanceUrl: 'wss://hub.example/', token: 't' }));
+    expect(none.transport).toBeUndefined();
+    // Build still defaults to 'ws' for backward compatibility.
+    expect(parsePairingPayload(buildPairingPayload({ instanceUrl: 'ws://x/', token: 't' })).transport).toBe('ws');
   });
 });

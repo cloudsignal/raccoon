@@ -26,6 +26,23 @@ describe('envelope', () => {
     expect(parsed).toEqual(env);
   });
 
+  it('accepts a stalled ack status (#P1-A) and a pair.confirm envelope (#P1-C)', () => {
+    const stalled = createEnvelope('ack', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'abc', status: 'stalled' },
+    });
+    expect(parseEnvelope(JSON.parse(JSON.stringify(stalled))).payload).toEqual({ refId: 'abc', status: 'stalled' });
+
+    const confirm = createEnvelope('pair.confirm', {
+      from: 'system', to: 'system', channel: 'pairing',
+      payload: { sessionToken: 'sess-1' },
+    });
+    expect(confirm.kind).toBe('pair.confirm');
+    expect(parseEnvelope(JSON.parse(JSON.stringify(confirm)))).toEqual(confirm);
+    // pair.confirm requires a non-empty sessionToken.
+    expect(tryParseEnvelope({ ...confirm, payload: { sessionToken: '' } })).toBeNull();
+  });
+
   it('rejects unknown kind', () => {
     expect(() =>
       parseEnvelope({ oam: '0.1', id: 'x', kind: 'nope', from: 'system', to: 'user:u1', channel: 'c', ts: new Date().toISOString(), payload: {} }),

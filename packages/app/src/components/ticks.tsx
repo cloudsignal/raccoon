@@ -25,5 +25,15 @@ export function Ticks(props: { delivery: Delivery }) {
       </svg>
     );
   }
+  if (props.delivery === 'stalled') {
+    // #P1-A: still working — a muted clock, distinct from the retryable
+    // 'failed' state (no error styling; the outcome is unknown, not failed).
+    return (
+      <svg data-testid="tick-stalled" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="oklch(0.68 0.13 75)" strokeWidth="2" strokeLinecap="round">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </svg>
+    );
+  }
   return null;
 }

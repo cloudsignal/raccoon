@@ -318,21 +318,26 @@ describe('RaccoonBridge', () => {
     const last = hub.sent[4]!.env; if (last.kind === 'ack') expect(last.payload.status).toBe('delivered');
   });
 
-  it('bounds a hung approval turn with a terminal failed ack, and a retry re-runs (#R8-2)', async () => {
+  it('a hung (timed-out) approval turn is reported as stalled/UNKNOWN and a redelivery does NOT re-run the agent (#P1-A)', async () => {
+    // A timeout is NOT a failure: the turn is still running, non-cancellable,
+    // and may complete its side effects. Reporting it as retryable 'failed'
+    // and clearing the dedup key (the old #R8-2 behavior) let a retry run a
+    // SECOND concurrent turn — two side effects for one decision. The bridge
+    // must instead emit a terminal-but-non-retryable 'stalled' ack and KEEP
+    // the dedup key, so a redelivery converges to 'stalled' without re-running.
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
     let runs = 0;
-    const box: { release: (() => void) | null } = { release: null };
-    // First run hangs forever (never yields, never returns); a later delivery
-    // completes. Models an agent/tool call that wedges the turn.
-    const hangThenOk: AgentRunner = {
+    // The turn hangs forever (models a wedged agent/tool call that never
+    // returns) — so if the fix regressed and a retry re-ran, runs would climb.
+    const hang: AgentRunner = {
       async *run() {
         runs += 1;
-        if (runs === 1) { await new Promise<void>(() => { /* never resolves */ }); }
-        else { await new Promise<void>((r) => { box.release = r; }); yield 'recovered'; }
+        await new Promise<void>(() => { /* never resolves */ });
+        yield 'unreachable';
       },
     };
-    const bridge = new RaccoonBridge({ hub, runner: hangThenOk, store, turnDeadlineMs: 30 });
+    const bridge = new RaccoonBridge({ hub, runner: hang, store, turnDeadlineMs: 30 });
     bridge.start();
     const env = createEnvelope('approval.response', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
@@ -342,19 +347,19 @@ describe('RaccoonBridge', () => {
     await new Promise((r) => setTimeout(r, 80)); // past the 30ms deadline
 
     const acks1 = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
-    // The hung turn does NOT strand the client: after 'received' it gets a
-    // terminal 'failed', not an eternal 'processing'.
-    expect(acks1).toEqual(['received', 'failed']);
+    // After 'received', a terminal 'stalled' — never 'failed' (which would
+    // invite a retry) and never a lingering 'processing'.
+    expect(acks1).toEqual(['received', 'stalled']);
+    // No generic-error chat message: the turn may still succeed and post via history.
+    expect(hub.sent.some((s) => s.env.kind === 'msg')).toBe(false);
 
-    // A retry (same envelope id) re-runs the turn — the failed key was cleared,
-    // so it is NOT deduped into another 'received'-only ack.
+    // A redelivery / client retry of the SAME envelope must NOT re-run the
+    // still-live turn — it re-acks 'stalled' and runs stays at 1.
     hub.inject(env, 'u1');
     await settle();
-    expect(runs).toBe(2);
-    box.release?.();
-    await settle();
+    expect(runs).toBe(1);
     const statuses = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
-    expect(statuses).toEqual(['received', 'failed', 'received', 'delivered']);
+    expect(statuses).toEqual(['received', 'stalled', 'stalled']);
   });
 
   it('acks a redelivered approval.response without re-running the agent (#R2-5)', async () => {

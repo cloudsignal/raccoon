@@ -285,6 +285,14 @@ export function TransportProvider(props: TransportProviderProps) {
         });
       }
       else if (st === 'failed') void outbox.failByServer(refId);
+      else if (st === 'stalled') {
+        // #P1-A: the turn exceeded the server deadline and is STILL RUNNING
+        // (outcome unknown). The no-ack/processing timer is already cleared
+        // above; do NOT arm a new one (that would auto-surface a retry, which
+        // could double side effects). Mark the row terminal-but-non-retryable;
+        // the UI shows "still working", never "tap to retry".
+        void outbox.markStalled(refId);
+      }
       else {
         // Terminal success. If this ack settles an approval RESPONSE, prune
         // the durable approval REQUEST (#R8-1) so a later reload does not

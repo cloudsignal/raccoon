@@ -1,6 +1,9 @@
 import { parseAddress, type Envelope, type HistoryMessage } from '@raccoon/protocol';
 
-export type Delivery = 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
+// 'stalled' (#P1-A): the server started the turn but it exceeded the deadline
+// and is still running with an UNKNOWN outcome. Terminal for the send state
+// but NOT retryable — the UI shows "still working", never a "tap to retry".
+export type Delivery = 'pending' | 'sent' | 'delivered' | 'read' | 'failed' | 'stalled';
 
 export interface ChatMessage {
   id: string;
@@ -49,7 +52,7 @@ export type ChatAction =
   | { type: 'approval'; env: Envelope<'approval.request'>; active: boolean }
   | { type: 'optimistic'; msg: ChatMessage }
   | { type: 'delivery'; channel: string; id: string; delivery: Delivery }
-  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' }
+  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' | 'stalled' }
   | { type: 'typing'; channel: string; on: boolean }
   | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string; editedText?: string }
   // #R7-2: rehydrate responded/failed state onto approval messages from
@@ -69,11 +72,12 @@ export type ChatAction =
 
 // 'failed' (#R6-2): the server received the envelope but the turn it drives
 // failed terminally server-side — surfaces the retry affordance.
-const ACK_DELIVERY: Record<'received' | 'delivered' | 'read' | 'failed', Delivery> = {
+const ACK_DELIVERY: Record<'received' | 'delivered' | 'read' | 'failed' | 'stalled', Delivery> = {
   received: 'sent',
   delivered: 'delivered',
   read: 'read',
   failed: 'failed',
+  stalled: 'stalled',
 };
 
 // #R8-2: server acks must move delivery MONOTONICALLY forward. Acks can be
@@ -85,8 +89,11 @@ const ACK_DELIVERY: Record<'received' | 'delivered' | 'read' | 'failed', Deliver
 // a real 'delivered'. A user RETRY is the one intended backward move — it goes
 // through the separate 'delivery' action (reset to 'pending'), which is NOT
 // gated here, so the next 'received' legitimately advances pending→sent again.
+// 'stalled' (#P1-A) sits at the same tier as 'failed' — both are terminal
+// non-success states a stale 'sent' must not override and a genuine
+// 'delivered' still recovers from. Neither regresses the other (strict-> gate).
 const DELIVERY_RANK: Record<Delivery, number> = {
-  pending: 0, sent: 1, failed: 2, delivered: 3, read: 4,
+  pending: 0, sent: 1, failed: 2, stalled: 2, delivered: 3, read: 4,
 };
 function advanceDelivery(current: Delivery | undefined, next: Delivery): Delivery {
   if (current === undefined) return next;

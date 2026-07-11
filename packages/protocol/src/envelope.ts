@@ -35,7 +35,14 @@ const msgPayload = z.object({
 // 'failed' (#R6-2): the server received the envelope but the turn it drives
 // failed terminally on the server side — the client should surface a retry
 // affordance instead of showing success. Sent AFTER a 'received' ack.
-const ackPayload = z.object({ refId: z.string().min(1), status: z.enum(['received', 'delivered', 'read', 'failed']) });
+// 'stalled' (#P1-A): the server received the envelope and started the turn,
+// but the turn exceeded the server-side deadline and is STILL RUNNING,
+// detached and non-cancellable. Its outcome is UNKNOWN — it may yet complete
+// its side effects. The client MUST NOT auto-offer a retry (a retry would
+// double side effects for approvals/tool calls); it surfaces "still working —
+// check history" and lets any late reply arrive via history. Terminal for the
+// client's send state, but distinct from 'failed' (which is safe to retry).
+const ackPayload = z.object({ refId: z.string().min(1), status: z.enum(['received', 'delivered', 'read', 'failed', 'stalled']) });
 
 const typingPayload = z.object({ state: z.enum(['start', 'stop']) });
 
@@ -68,6 +75,14 @@ const historyPagePayload = z.object({
 
 const pairRequestPayload = z.object({ token: z.string().min(1), device: z.string().min(1) });
 
+// #P1-C: the client's affirmative acknowledgement that it received (and
+// adopted) a pair.grant. Until the hub receives this, the granted session is
+// PROVISIONAL and non-resumable — so a client whose socket closed while the
+// grant was in flight (its close frame not yet seen by the server) never
+// confirms, and its provisional session is reaped by TTL instead of becoming
+// a live orphan that also burned a one-time pairing token.
+const pairConfirmPayload = z.object({ sessionToken: z.string().min(1) });
+
 const pairGrantPayload = z.object({
   sessionToken: z.string().min(1),
   userId: z.string().min(1),
@@ -85,7 +100,7 @@ const pushSubscribePayload = z.object({
 
 const pushUnsubscribePayload = z.object({ endpoint: z.string().url() });
 
-export type Kind = 'msg' | 'ack' | 'typing' | 'presence' | 'approval.request' | 'approval.response' | 'history.request' | 'history.page' | 'pair.request' | 'pair.grant' | 'push.subscribe' | 'push.unsubscribe';
+export type Kind = 'msg' | 'ack' | 'typing' | 'presence' | 'approval.request' | 'approval.response' | 'history.request' | 'history.page' | 'pair.request' | 'pair.grant' | 'pair.confirm' | 'push.subscribe' | 'push.unsubscribe';
 
 const envelopeSchema = z.discriminatedUnion('kind', [
   base.extend({ kind: z.literal('msg'), payload: msgPayload }),
@@ -98,6 +113,7 @@ const envelopeSchema = z.discriminatedUnion('kind', [
   base.extend({ kind: z.literal('history.page'), payload: historyPagePayload }),
   base.extend({ kind: z.literal('pair.request'), payload: pairRequestPayload }),
   base.extend({ kind: z.literal('pair.grant'), payload: pairGrantPayload }),
+  base.extend({ kind: z.literal('pair.confirm'), payload: pairConfirmPayload }),
   base.extend({ kind: z.literal('push.subscribe'), payload: pushSubscribePayload }),
   base.extend({ kind: z.literal('push.unsubscribe'), payload: pushUnsubscribePayload }),
 ]);

@@ -7,7 +7,12 @@ import { promisifyRequest, withStore, withTransaction } from './idb.js';
 // delete: deleting on mere receipt lost the retry path when the terminal ack
 // was dropped (socket drop / reload / hung turn). recoverProcessing() re-drives
 // these on boot/reconnect (dedup-safe: the bridge re-acks the real outcome).
-export type OutboxStatus = 'pending' | 'sending' | 'processing' | 'failed';
+// 'stalled' (#P1-A): the server started this envelope's turn but it exceeded
+// the server deadline and is still running with an UNKNOWN outcome. TERMINAL
+// and NON-retryable — unlike 'failed', retry() refuses to promote it (a retry
+// could double side effects for a turn that may yet complete). Kept out of
+// listPending() and recoverProcessing() so nothing auto-re-drives it.
+export type OutboxStatus = 'pending' | 'sending' | 'processing' | 'failed' | 'stalled';
 
 export interface OutboxEntry {
   id: string;
@@ -283,11 +288,11 @@ export async function acknowledgeReceipt(id: string): Promise<{ channel: string;
   const result = await withTransaction('outbox', 'readwrite', async (s) => {
     const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
-    // #R7-2: a 'failed' row is TERMINAL. A delayed/duplicate 'received' ack
-    // must NOT regress it back to 'processing' — that would silently un-fail
-    // a row the user is looking at a retry affordance for, and (with the
-    // failed→pending retry CAS) make "tap to retry" a no-op. Leave it failed.
-    if (entry.status === 'failed') return undefined;
+    // #R7-2/#P1-A: a 'failed' OR 'stalled' row is TERMINAL. A delayed/duplicate
+    // 'received' ack must NOT regress it back to 'processing' — that would
+    // silently un-fail a row showing a retry affordance (failed), or re-open a
+    // stalled/unknown-outcome turn to the auto-retry timer (stalled). Leave it.
+    if (entry.status === 'failed' || entry.status === 'stalled') return undefined;
     if (entry.env.kind === 'approval.response') {
       await promisifyRequest(s.put({ ...entry, status: 'processing', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
       return { channel: entry.channel, processing: true };
@@ -324,6 +329,21 @@ export async function failProcessing(id: string): Promise<boolean> {
 export async function failByServer(id: string): Promise<void> {
   const entry = await mutate(id, (entry) => (
     { ...entry, status: 'failed', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
+  ));
+  if (entry) notify(entry.channel);
+}
+
+/** Mark a row terminal 'stalled' on a server 'stalled' ack (#P1-A). The turn
+ *  exceeded the server deadline and is still running with an UNKNOWN outcome.
+ *  Authoritative (server-driven), so not claim-token gated. Unlike failByServer
+ *  the resulting row is NON-retryable (retry() only promotes 'failed'), so the
+ *  UI shows "still working" and never a one-tap retry that could double side
+ *  effects. */
+export async function markStalled(id: string): Promise<void> {
+  const entry = await mutate(id, (entry) => (
+    // Don't clobber an already-terminal-success row (a 'delivered' settle
+    // deletes it, so this only ever sees processing/sending here).
+    { ...entry, status: 'stalled', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
   ));
   if (entry) notify(entry.channel);
 }

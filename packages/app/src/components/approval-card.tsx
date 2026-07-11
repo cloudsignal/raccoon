@@ -22,6 +22,10 @@ export function ApprovalCard(props: { msg: ChatMessage }) {
   // a dropped connection before the server received it surfaces as 'failed'
   // (ack timeout) instead of the UI claiming success forever.
   const responseFailed = responded !== undefined && props.msg.respondedDelivery === 'failed';
+  // #P1-A: the turn timed out server-side and is still running (outcome
+  // unknown). Show a non-actionable "still working" state — NEVER a retry,
+  // which could double the action.
+  const responseStalled = responded !== undefined && props.msg.respondedDelivery === 'stalled';
 
   const respond = (choice: string, editedText?: string): void => {
     respondApproval(props.msg.channel, approval.refId, choice, editedText);
@@ -83,6 +87,10 @@ export function ApprovalCard(props: { msg: ChatMessage }) {
             >
               Tap to retry
             </button>
+          </p>
+        ) : responseStalled ? (
+          <p className="text-sm text-ink-soft" data-testid="approval-stalled">
+            Responded {responded} — still working, check back shortly.
           </p>
         ) : (
           <p className="text-sm text-ink-soft">Responded: {responded}</p>

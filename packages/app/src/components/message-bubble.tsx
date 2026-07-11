@@ -49,6 +49,13 @@ export function MessageBubble(props: {
           Not sent — tap to retry
         </button>
       ) : null}
+      {/* #P1-A: a stalled turn is still running with an UNKNOWN outcome — show a
+          non-actionable hint, NEVER a retry (a retry could double side effects). */}
+      {mine && msg.delivery === 'stalled' ? (
+        <span className="mt-1 text-xs font-medium text-ink-soft" data-testid="stalled-hint">
+          Still working — check back shortly
+        </span>
+      ) : null}
     </div>
   );
 }
