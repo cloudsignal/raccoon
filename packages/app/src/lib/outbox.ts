@@ -314,47 +314,60 @@ export async function recoverProcessing(): Promise<void> {
 }
 
 /**
- * Requeues 'sending' rows back to 'pending' — but only ones this tab is safe
- * to touch (#R4-4): rows THIS tab (`myTabId`) owns (its own transport just
- * closed, or it's booting fresh and abandoning whatever it thought it owned
- * pre-reload — never true for a fresh page load in practice, but harmless)
- * are always requeued immediately, since this tab itself knows it cannot
- * finish them. A row owned by a DIFFERENT tab is only requeued once its
- * lease has expired — that tab has had ample time (SEND_LEASE_MS, well
- * past the client's own ACK_TIMEOUT_MS) to settle or fail it on its own, so
- * a still-'sending' row past that point is stranded (crashed tab), not
- * merely slow. Without the lease check, boot-time demoteSending() (R3-8)
- * would requeue — and a subsequent drain() would then RE-SEND — a row a
- * different, still-alive tab is actively transmitting.
+ * CLOSE-TIME reclaim (#R6-5b): requeue every 'sending' row THIS tab
+ * (`myTabId`) owns, unconditionally — its transport just closed, so this tab
+ * knows it cannot finish those sends and they must go back to 'pending' for
+ * a reconnect drain. Owner-scoped and lease-INDEPENDENT: it only ever
+ * touches rows this tab currently owns, never another tab's, and never a row
+ * this tab does not own even if that row's lease looks expired (that is the
+ * expiry sweep's job, below).
  *
- * Fires one subscriber notification per demoted entry — subscribers that
- * trigger drains must tolerate bursts (the provider drains on status
- * transitions, not per notification). All demotions happen within ONE
- * transaction (see the module comment above).
- *
- * Returns the EARLIEST leaseExpiresAt among rows it skipped (foreign-owned,
- * lease still valid), or null if nothing was skipped (#R5-4). A one-shot
- * boot-time call is not enough on its own: a reload seconds after a crash
- * sees the dead tab's still-unexpired lease, skips the row, and — on a
- * stable connection, where no 'closed' event ever fires — nothing would
- * ever call this again, leaving the row 'sending' forever. The caller uses
- * this to schedule a re-check just past that expiry (see context.tsx's
- * sweepLeases).
+ * This is deliberately SEPARATE from recoverExpiredSending(): conflating the
+ * two (the old demoteSending) let a stale expiry-sweep timer, calling with
+ * this tab's id, unconditionally reclaim a NEWER live claim this tab had made
+ * since — requeuing and thus duplicating an active send.
  */
-export async function demoteSending(myTabId: string): Promise<number | null> {
-  const { touched, nextForeignExpiry } = await withTransaction('outbox', 'readwrite', async (s) => {
+export async function releaseOwnedSending(myTabId: string): Promise<void> {
+  const touched = await withTransaction('outbox', 'readwrite', async (s) => {
     const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
-    const result = { touched: [] as string[], nextForeignExpiry: null as number | null };
+    const channels: string[] = [];
+    for (const entry of all) {
+      if (entry.status !== 'sending' || entry.ownerId !== myTabId) continue;
+      await promisifyRequest(s.put({ ...entry, status: 'pending', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
+      channels.push(entry.channel);
+    }
+    return channels;
+  });
+  for (const c of touched) notify(c);
+}
+
+/**
+ * EXPIRY-ONLY recovery (#R6-5b): requeue 'sending' rows whose lease has
+ * actually EXPIRED (a crashed tab's abandoned claim, or a legacy row with no
+ * lease). Honors EVERY row's lease regardless of owner — including this
+ * tab's own live claims (fresh lease → skipped), so a stale scheduled timer
+ * firing late can never reclaim an active send. Used by boot, the scheduled
+ * lease-expiry sweep, and the coarse periodic safety sweep.
+ *
+ * Returns the EARLIEST still-valid (unexpired) leaseExpiresAt it skipped, or
+ * null if it skipped nothing (#R5-4) — the caller schedules a re-check just
+ * past that instant, since a row stranded by a crash may still have an
+ * unexpired lease at the moment of this sweep and nothing else would revisit
+ * it on a stable connection.
+ */
+export async function recoverExpiredSending(): Promise<number | null> {
+  const { touched, nextExpiry } = await withTransaction('outbox', 'readwrite', async (s) => {
+    const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
+    const result = { touched: [] as string[], nextExpiry: null as number | null };
     const now = Date.now();
     for (const entry of all) {
       if (entry.status !== 'sending') continue;
-      const ownedByMe = entry.ownerId === myTabId;
       const leaseExpired = entry.leaseExpiresAt === undefined || entry.leaseExpiresAt <= now;
-      if (!ownedByMe && !leaseExpired) {
-        // Another tab is actively (and still validly) sending this — but
-        // record when its claim lapses so the caller can look again then.
-        if (result.nextForeignExpiry === null || entry.leaseExpiresAt! < result.nextForeignExpiry) {
-          result.nextForeignExpiry = entry.leaseExpiresAt!;
+      if (!leaseExpired) {
+        // Still validly in flight (this tab's live claim, or another tab's) —
+        // honor the lease and record when it lapses so the caller can look again.
+        if (result.nextExpiry === null || entry.leaseExpiresAt! < result.nextExpiry) {
+          result.nextExpiry = entry.leaseExpiresAt!;
         }
         continue;
       }
@@ -364,7 +377,7 @@ export async function demoteSending(myTabId: string): Promise<number | null> {
     return result;
   });
   for (const channel of touched) notify(channel);
-  return nextForeignExpiry;
+  return nextExpiry;
 }
 
 /** Clear the entire outbox, in one transaction — see the module comment. */

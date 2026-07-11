@@ -66,11 +66,11 @@ describe('outbox', () => {
     expect(entry.attempts).toBe(0);
   });
 
-  it('demoteSending returns in-flight entries to pending', async () => {
+  it('releaseOwnedSending returns this tab\'s in-flight entries to pending', async () => {
     const e = await outbox.enqueue(msg('x'), SCOPE);
     await outbox.markSending(e.id, TAB, SCOPE);
     expect(await outbox.listPending()).toHaveLength(0);
-    await outbox.demoteSending(TAB);
+    await outbox.releaseOwnedSending(TAB);
     expect(await outbox.listPending()).toHaveLength(1);
   });
 
@@ -165,7 +165,7 @@ describe('outbox', () => {
     const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - outbox.SEND_LEASE_MS - 1000);
     const tokenA = await outbox.markSending(e.id, 'tab-a', SCOPE);
     dateNowSpy.mockRestore();
-    await outbox.demoteSending('tab-b'); // expired lease → requeued
+    await outbox.recoverExpiredSending(); // expired lease → requeued
     const tokenB = await outbox.markSending(e.id, 'tab-b', SCOPE);
     expect(tokenA).toBeTruthy();
     expect(tokenB).toBeTruthy();
@@ -189,73 +189,90 @@ describe('outbox', () => {
     expect(entry.status).toBe('failed');
   });
 
-  it('demoteSending does not reclaim another tab\'s row whose lease has not expired (#R4-4)', async () => {
+  it('recoverExpiredSending does not reclaim a row whose lease has not expired (#R4-4)', async () => {
     const e = await outbox.enqueue(msg('x'), SCOPE);
     await outbox.markSending(e.id, 'tab-a', SCOPE); // fresh, non-expired lease
-    await outbox.demoteSending('tab-b'); // a DIFFERENT tab's boot-time (or close-triggered) call
-    // Still 'sending', owned by tab-a — tab-b must not have touched it.
+    await outbox.recoverExpiredSending(); // an expiry sweep from any tab
+    // Still 'sending' — an unexpired lease is honored regardless of owner.
     expect(await outbox.listPending()).toEqual([]);
     const entry = (await outbox.listForChannel('coordinator'))[0]!;
     expect(entry.status).toBe('sending');
   });
 
-  it('demoteSending reclaims another tab\'s row once its lease has expired (crashed-tab recovery)', async () => {
+  it('recoverExpiredSending reclaims a row once its lease has expired (crashed-tab recovery)', async () => {
     const e = await outbox.enqueue(msg('x'), SCOPE);
     const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - outbox.SEND_LEASE_MS - 1000);
     await outbox.markSending(e.id, 'crashed-tab', SCOPE); // backdated: already-expired lease
     dateNowSpy.mockRestore();
-    await outbox.demoteSending('tab-b');
+    await outbox.recoverExpiredSending();
     expect(await outbox.listPending()).toHaveLength(1);
   });
 
-  it('demoteSending always reclaims its OWN tab\'s row, lease or no lease (same-tab close)', async () => {
+  it('a stale expiry sweep NEVER reclaims a newer live claim, whoever owns it (#R6-5b)', async () => {
+    // The core R6-5b bug: a settled claim's sweep timer fired late and, via
+    // the old owner-unconditional demoteSending(myTabId), requeued a NEWER
+    // live claim this tab had made since — duplicating an active send. The
+    // expiry sweep must honor the live claim's lease and leave it alone,
+    // regardless of owner.
     const e = await outbox.enqueue(msg('x'), SCOPE);
-    await outbox.markSending(e.id, 'tab-a', SCOPE); // fresh lease, owned by tab-a
-    await outbox.demoteSending('tab-a'); // tab-a's own transport closed — must reclaim immediately
-    expect(await outbox.listPending()).toHaveLength(1);
+    await outbox.markSending(e.id, 'my-tab', SCOPE); // fresh lease, MY tab
+    await outbox.recoverExpiredSending(); // a stale timer firing late
+    const entry = (await outbox.listForChannel('coordinator'))[0]!;
+    expect(entry.status).toBe('sending'); // untouched — not requeued
+    expect(await outbox.listPending()).toEqual([]);
   });
 
-  it('demoteSending reports the earliest still-valid foreign lease expiry so the caller can re-check then (#R5-4)', async () => {
+  it('releaseOwnedSending only reclaims THIS tab\'s rows, never another tab\'s (#R6-5b)', async () => {
+    const a = await outbox.enqueue(msg('mine'), SCOPE);
+    const b = await outbox.enqueue(msg('theirs'), SCOPE);
+    await outbox.markSending(a.id, 'my-tab', SCOPE);
+    await outbox.markSending(b.id, 'other-tab', SCOPE);
+    await outbox.releaseOwnedSending('my-tab'); // my transport closed
+    // Mine is back to pending; the other tab's live send is untouched.
+    expect((await outbox.listForChannel('coordinator')).find((r) => r.id === a.id)!.status).toBe('pending');
+    expect((await outbox.listForChannel('coordinator')).find((r) => r.id === b.id)!.status).toBe('sending');
+  });
+
+  it('recoverExpiredSending reports the earliest still-valid lease expiry so the caller can re-check then (#R5-4)', async () => {
     // A crashed tab's still-unexpired lease is (correctly) skipped — but the
-    // caller must learn WHEN to look again, or a boot-time demote that ran
-    // seconds after the crash leaves the row 'sending' forever on a stable
-    // connection (nothing else ever calls demoteSending again).
+    // caller must learn WHEN to look again, or a boot sweep that ran seconds
+    // after the crash leaves the row 'sending' forever on a stable connection.
     const e = await outbox.enqueue(msg('x'), SCOPE);
     await outbox.markSending(e.id, 'crashed-tab', SCOPE); // fresh lease from another tab
     const entry = (await outbox.listForChannel('coordinator'))[0]!;
 
-    const nextExpiry = await outbox.demoteSending('tab-b');
+    const nextExpiry = await outbox.recoverExpiredSending();
     expect(nextExpiry).toBe(entry.leaseExpiresAt); // skipped row's expiry, to reschedule against
     expect(await outbox.listPending()).toEqual([]); // and it was indeed skipped, not requeued
 
-    // Nothing skipped → nothing to re-check.
-    await outbox.demoteSending('crashed-tab'); // own-tab reclaim
-    expect(await outbox.demoteSending('tab-b')).toBeNull();
+    // Nothing 'sending' left to skip → nothing to re-check.
+    await outbox.releaseOwnedSending('crashed-tab'); // that tab's own close reclaims it
+    expect(await outbox.recoverExpiredSending()).toBeNull();
   });
 
-  it('clearAll is serialized against a concurrent demoteSending so no row is resurrected (#R2-1)', async () => {
-    // Seed many 'sending' entries so demoteSending()'s per-entry put() loop
-    // spans several IDB transactions, giving a real interleaving window.
+  it('clearAll is serialized against a concurrent releaseOwnedSending so no row is resurrected (#R2-1)', async () => {
+    // Seed many 'sending' entries so releaseOwnedSending()'s per-entry put()
+    // loop spans several IDB transactions, giving a real interleaving window.
     const entries = await Promise.all(Array.from({ length: 20 }, (_, i) => outbox.enqueue(msg(`m${i}`), SCOPE)));
     for (const e of entries) await outbox.markSending(e.id, TAB, SCOPE);
 
-    // Fire demoteSending() WITHOUT awaiting (mirrors the transport's 'closed'
-    // status callback: void outbox.demoteSending(tabId)), then immediately clear —
-    // mirrors wipeAndReset() racing that callback.
-    const demote = outbox.demoteSending(TAB);
+    // Fire releaseOwnedSending() WITHOUT awaiting (mirrors the transport's
+    // 'closed' status callback: void outbox.releaseOwnedSending(tabId)), then
+    // immediately clear — mirrors wipeAndReset() racing that callback.
+    const demote = outbox.releaseOwnedSending(TAB);
     await outbox.clearAll();
     await demote;
 
     // Whichever fired first, the serialization queue guarantees clearAll's
-    // clear() cannot land in the middle of demoteSending()'s writes: no row
-    // survives.
+    // clear() cannot land in the middle of releaseOwnedSending()'s writes: no
+    // row survives.
     expect(await outbox.listPending()).toEqual([]);
     expect(await outbox.listForChannel('coordinator')).toEqual([]);
   });
 
-  it('clearAll is serialized against EVERY mutator, not only demoteSending (#R2-1 follow-up)', async () => {
+  it('clearAll is serialized against EVERY mutator, not only the sweep (#R2-1 follow-up)', async () => {
     // A third-party review proved by execution that the original fix only
-    // serialized demoteSending()/clearAll(): a markSending() call (fired from
+    // serialized the sweep/clearAll: a markSending() call (fired from
     // an in-flight drain()'s attempt()) racing a concurrent clearAll() (fired
     // from unpair()'s wipe) still resurrected a row. Exercise each remaining
     // mutator the same way: fire it unawaited, then immediately clearAll(),

@@ -143,7 +143,7 @@ describe('TransportProvider', () => {
     // the wipe handler bumps — and wired + connected the wiped session.
     let releaseDemote!: () => void;
     const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
-    const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; return null; });
+    const demoteSpy = vi.spyOn(outbox, 'recoverExpiredSending').mockImplementation(async () => { await demoteGate; return null; });
 
     const transport = new FakeTransport();
     render(
@@ -302,7 +302,7 @@ describe('TransportProvider', () => {
     // in flight, mid-way through the loadSession().then(...) chain.
     let releaseDemote!: () => void;
     const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
-    const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; return null; });
+    const demoteSpy = vi.spyOn(outbox, 'recoverExpiredSending').mockImplementation(async () => { await demoteGate; return null; });
 
     const transport = new FakeTransport();
     const { unmount } = render(
@@ -609,7 +609,7 @@ describe('TransportProvider', () => {
     it('does not wire/connect the override transport if the provider unmounts during boot recovery (#R4-10)', async () => {
       let releaseDemote!: () => void;
       const demoteGate = new Promise<void>((r) => { releaseDemote = r; });
-      const demoteSpy = vi.spyOn(outbox, 'demoteSending').mockImplementation(async () => { await demoteGate; return null; });
+      const demoteSpy = vi.spyOn(outbox, 'recoverExpiredSending').mockImplementation(async () => { await demoteGate; return null; });
 
       const transport = new FakeTransport();
       const { unmount } = render(

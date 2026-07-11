@@ -341,21 +341,21 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, [attempt]);
 
-  // R5-4: one-shot timer for re-running demoteSending() once a foreign
-  // (other-tab) lease it had to skip lapses. Boot's single demoteSending()
-  // call alone strands a row forever when the owning tab crashed moments
-  // before this one loaded: the lease is still valid at boot, the row is
-  // (correctly) skipped — and on a stable connection no 'closed' event ever
-  // triggers another look. The sweep reschedules itself until nothing is
-  // left to wait on.
+  // R5-4/#R6-5b: coalescing timer for re-running the EXPIRY sweep once a
+  // still-valid lease it had to skip lapses. A one-shot boot sweep alone
+  // strands a row forever when the owning tab crashed moments before this
+  // one loaded (lease still valid at boot → correctly skipped, and on a
+  // stable connection nothing revisits it). The scheduled sweep — and the
+  // coarse periodic safety sweep — call recoverExpiredSending, which honors
+  // every row's lease, so an old timer firing late can NOT reclaim a newer
+  // live claim (the R6-5b bug in the old owner-unconditional demoteSending).
   const leaseSweepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const leaseSweepDueRef = useRef<number>(Infinity);
   const sweepLeasesRef = useRef<() => void>(() => {});
   // #R6-5: single coalescing scheduler — keep whichever pending sweep is
-  // due EARLIEST. Fed from two sources: a sweep's own scan results (a
-  // skipped still-valid foreign lease) and other tabs' claim broadcasts
-  // (see the raccoon-outbox listener in the boot effect), which cover
-  // claims made AFTER this tab's boot/close sweeps already ran.
+  // due EARLIEST. Fed from a sweep's own scan (an unexpired lease it skipped)
+  // and other tabs' claim broadcasts (the raccoon-outbox listener), which
+  // cover claims made AFTER this tab's boot sweep already ran.
   const scheduleSweepAt = useCallback((at: number) => {
     if (leaseSweepTimerRef.current !== null && leaseSweepDueRef.current <= at) return;
     if (leaseSweepTimerRef.current !== null) clearTimeout(leaseSweepTimerRef.current);
@@ -367,11 +367,11 @@ export function TransportProvider(props: TransportProviderProps) {
     }, Math.max(at - Date.now(), 0));
   }, []);
   const sweepLeases = useCallback((): Promise<void> => {
-    return outbox.demoteSending(tabIdRef.current!).then((nextForeignExpiry) => {
+    return outbox.recoverExpiredSending().then((nextExpiry) => {
       // Anything requeued only actually retransmits via drain — but never
       // drain over a closed transport (it would burn retry attempts).
       if (statusNowRef.current === 'open') void drain();
-      if (nextForeignExpiry !== null) scheduleSweepAt(nextForeignExpiry + 100);
+      if (nextExpiry !== null) scheduleSweepAt(nextExpiry + 100);
     });
   }, [drain, scheduleSweepAt]);
   sweepLeasesRef.current = sweepLeases;
@@ -390,6 +390,12 @@ export function TransportProvider(props: TransportProviderProps) {
   const wipeAndReset = useCallback(async () => {
     for (const timer of ackTimers.current.values()) clearTimeout(timer);
     ackTimers.current.clear();
+    // #R6-5b: cancel any scheduled lease sweep — it must not survive a
+    // wipe/re-pair and fire against a fresh identity. (The sweep honors
+    // leases and the outbox is cleared here anyway, so a stray firing is
+    // already harmless; this just avoids the dangling timer.)
+    if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
+    leaseSweepDueRef.current = Infinity;
     await Promise.all([wipeLocal(), outbox.clearAll()]);
     dispatch({ type: 'reset' });
   }, []);
@@ -439,7 +445,11 @@ export function TransportProvider(props: TransportProviderProps) {
         if (active) channels.add(active);
         for (const c of channels) requestHistory(c);
       }
-      if (s === 'closed') void sweepLeases();
+      // #R6-5b: on close, reclaim THIS tab's own in-flight rows immediately
+      // (owner-scoped, lease-independent) — its transport is gone, so it
+      // cannot finish them; they must be pending for the reconnect drain.
+      // NOT the expiry sweep (which is lease-based and owner-agnostic).
+      if (s === 'closed') void outbox.releaseOwnedSending(tabIdRef.current!);
     });
     const isOverride = !!props.transportOverride;
     const u3 = transport.onAuthError(() => {
@@ -511,15 +521,12 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [drain, handleEnvelope, requestHistory, wipeAndReset, sweepLeases]);
 
   useEffect(() => {
-    // #R6-5: recovery-sweep coordination, in BOTH modes. Boot-time and
-    // close-time sweeps cannot cover a claim made AFTER they ran by a tab
-    // that then crashes — on a stable connection nothing would ever sweep
-    // again, leaving that row 'sending' forever. Every markSending()
-    // broadcasts its lease expiry on 'raccoon-outbox'; schedule a sweep for
-    // that moment. Without BroadcastChannel, fall back to a coarse
-    // SEND_LEASE_MS interval.
+    // #R6-5: recovery-sweep coordination. Boot-time and close-time sweeps
+    // cannot cover a claim made AFTER they ran by a tab that then crashes —
+    // on a stable connection nothing would ever sweep again, leaving that
+    // row 'sending' forever. Every markSending() broadcasts its lease expiry
+    // on 'raccoon-outbox'; schedule a precise sweep for that moment.
     let outboxBc: BroadcastChannel | null = null;
-    let sweepInterval: ReturnType<typeof setInterval> | null = null;
     if (typeof BroadcastChannel !== 'undefined') {
       outboxBc = new BroadcastChannel('raccoon-outbox');
       outboxBc.addEventListener('message', (ev) => {
@@ -527,12 +534,21 @@ export function TransportProvider(props: TransportProviderProps) {
         if (data?.type !== 'claimed' || typeof data.leaseExpiresAt !== 'number') return;
         scheduleSweepAt(data.leaseExpiresAt + 100);
       });
-    } else {
-      sweepInterval = setInterval(() => { void sweepLeasesRef.current(); }, outbox.SEND_LEASE_MS);
     }
+    // #R6-5b: coarse periodic safety sweep, ALWAYS on (not just as a
+    // BroadcastChannel fallback). There is an unavoidable crash gap between a
+    // claim's IndexedDB commit and its subsequent BroadcastChannel post: a
+    // tab that crashes in that window leaves a claimed row no other tab was
+    // ever told about. This lease-honoring periodic sweep is the backstop
+    // that still recovers it. Coarse (one SEND_LEASE_MS) so it is cheap; the
+    // precise per-claim scheduling above handles the common case promptly.
+    const sweepInterval: ReturnType<typeof setInterval> = setInterval(
+      () => { void sweepLeasesRef.current(); },
+      outbox.SEND_LEASE_MS,
+    );
     const stopSweepCoordination = (): void => {
       outboxBc?.close();
-      if (sweepInterval !== null) clearInterval(sweepInterval);
+      clearInterval(sweepInterval);
       if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
       leaseSweepDueRef.current = Infinity;
     };
