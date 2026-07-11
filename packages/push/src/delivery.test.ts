@@ -136,6 +136,26 @@ describe('sendPushToUser revocation fence (#R6-6)', () => {
   });
 });
 
+describe('InMemorySubscriptionStore.removeIfMatches (#R8-CQ)', () => {
+  it('removes an endpoint only when the stored sub is byte-identical', async () => {
+    const store = new InMemorySubscriptionStore();
+    const endpoint = 'https://push.example/e';
+    const oldSub: PushSubscriptionJson = { endpoint, keys: { p256dh: 'old', auth: 'old' } };
+    await store.add('u1', oldSub);
+
+    // A re-add with fresh keys on the same endpoint…
+    const newSub: PushSubscriptionJson = { endpoint, keys: { p256dh: 'new', auth: 'new' } };
+    await store.add('u1', newSub);
+    // …a stale prune targeting the OLD sub must NOT remove the new one.
+    await store.removeIfMatches('u1', oldSub);
+    expect(await store.list('u1')).toEqual([newSub]);
+
+    // Pruning the CURRENT sub does remove it.
+    await store.removeIfMatches('u1', newSub);
+    expect(await store.list('u1')).toEqual([]);
+  });
+});
+
 describe('VapidPushSender guard', () => {
   it('rejects keyless subscriptions with a descriptive error', async () => {
     const sender = new VapidPushSender({ publicKey: 'pub', privateKey: 'priv', subject: 'mailto:x@y.z' });

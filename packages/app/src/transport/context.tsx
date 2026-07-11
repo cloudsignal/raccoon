@@ -246,19 +246,24 @@ export function TransportProvider(props: TransportProviderProps) {
       // claim-token gated — the server said this turn failed).
       const st = env.payload.status;
       if (st === 'received') {
-        void outbox.acknowledgeReceipt(refId);
-        // #R7-1b: a server turn that never sends a terminal ack would leave
-        // this row in 'processing' forever on a stable connection (recovery
-        // else runs only on reconnect). Arm a bounded processing timeout that
-        // surfaces it as a retryable failure, so the user isn't stuck on an
-        // endless spinner. A later terminal ack clears this timer (above).
-        const processingTimer = setTimeout(() => {
-          ackTimers.current.delete(refId);
-          void outbox.failProcessing(refId).then((applied) => {
-            if (applied) dispatch({ type: 'delivery', channel: env.channel, id: refId, delivery: 'failed' });
-          });
-        }, PROCESSING_TIMEOUT_MS);
-        ackTimers.current.set(refId, processingTimer);
+        // #R8-CQ: only arm the processing timeout when the row actually became
+        // 'processing' (an approval.response). A plain msg is deleted on
+        // receipt, so arming a 2-minute timer for it just accumulates dead
+        // timers under multi-tab chat load. acknowledgeReceipt reports which.
+        void outbox.acknowledgeReceipt(refId).then((res) => {
+          if (!res?.processing) return;
+          // #R7-1b: a server turn that never sends a terminal ack would leave
+          // this row in 'processing' forever on a stable connection. Arm a
+          // bounded timeout that surfaces it as a retryable failure. A later
+          // terminal ack clears this timer (above).
+          const processingTimer = setTimeout(() => {
+            ackTimers.current.delete(refId);
+            void outbox.failProcessing(refId).then((applied) => {
+              if (applied) dispatch({ type: 'delivery', channel: env.channel, id: refId, delivery: 'failed' });
+            });
+          }, PROCESSING_TIMEOUT_MS);
+          ackTimers.current.set(refId, processingTimer);
+        });
       }
       else if (st === 'failed') void outbox.failByServer(refId);
       else void outbox.settle(refId);

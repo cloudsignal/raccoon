@@ -29,6 +29,17 @@ export interface SubscriptionStore {
    *  user cannot still receive push notifications after their pairing and
    *  live sockets are gone. */
   clear(userId: string): Promise<void>;
+  /**
+   * ATOMICALLY remove `sub` only if the CURRENTLY-stored subscription for its
+   * endpoint is byte-identical to it (#R8-CQ). Used to prune a dead endpoint
+   * on a 410/404 without the read-then-remove TOCTOU that could delete a
+   * subscription re-added on the same endpoint with fresh keys between the
+   * failing delivery's snapshot and its prune. Optional: a store that doesn't
+   * implement it falls back to a best-effort re-read + remove in delivery.
+   * A real backing store should implement this as a single conditional
+   * (version/compare-and-delete) operation.
+   */
+  removeIfMatches?(userId: string, sub: PushSubscriptionJson): Promise<void>;
 }
 
 export interface PushSender {

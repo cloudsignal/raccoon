@@ -265,7 +265,7 @@ export async function settle(id: string): Promise<void> {
  * Authoritative (server-driven), so not claim-token gated; clears the
  * send-claim bookkeeping either way.
  */
-export async function acknowledgeReceipt(id: string): Promise<void> {
+export async function acknowledgeReceipt(id: string): Promise<{ channel: string; processing: boolean } | undefined> {
   const result = await withTransaction('outbox', 'readwrite', async (s) => {
     const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
@@ -276,12 +276,13 @@ export async function acknowledgeReceipt(id: string): Promise<void> {
     if (entry.status === 'failed') return undefined;
     if (entry.env.kind === 'approval.response') {
       await promisifyRequest(s.put({ ...entry, status: 'processing', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
-    } else {
-      await promisifyRequest(s.delete(id)); // msg: receipt is terminal
+      return { channel: entry.channel, processing: true };
     }
-    return entry.channel;
+    await promisifyRequest(s.delete(id)); // msg: receipt is terminal
+    return { channel: entry.channel, processing: false };
   });
-  if (result) notify(result);
+  if (result) notify(result.channel);
+  return result;
 }
 
 /** Transition a row that is stuck in 'processing' to terminal 'failed'

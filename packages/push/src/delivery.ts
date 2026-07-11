@@ -36,19 +36,23 @@ export async function sendPushToUser(
             delivered += 1;
           } catch (err) {
             const code = (err as { statusCode?: number }).statusCode;
-            // #R7-4: a 410/404 prune must remove ONLY the exact subscription
-            // that just failed. Between the snapshot and this catch the user
-            // may have re-subscribed the SAME endpoint with fresh keys (the
-            // push service can reissue an endpoint); a blanket
-            // remove(endpoint) would delete that NEW, valid registration on
-            // the strength of the OLD one's 410. Re-read and remove only if
-            // the currently-stored sub for this endpoint is byte-identical to
-            // the one we sent.
+            // #R7-4/#R8-CQ: a 410/404 prune must remove ONLY the exact
+            // subscription that just failed. Between the snapshot and this
+            // catch the user may have re-subscribed the SAME endpoint with
+            // fresh keys (the push service can reissue an endpoint); a blanket
+            // remove(endpoint) would delete that NEW, valid registration. Use
+            // the store's ATOMIC compare-and-delete when available; otherwise
+            // fall back to a best-effort re-read + remove (still TOCTOU, but
+            // the best a store without the atomic op allows).
             if (code === 404 || code === 410) {
               try {
-                const current = (await store.list(userId)).find((s) => s.endpoint === sub.endpoint);
-                if (current && JSON.stringify(current) === JSON.stringify(sub)) {
-                  await store.remove(userId, sub.endpoint);
+                if (store.removeIfMatches) {
+                  await store.removeIfMatches(userId, sub);
+                } else {
+                  const current = (await store.list(userId)).find((s) => s.endpoint === sub.endpoint);
+                  if (current && JSON.stringify(current) === JSON.stringify(sub)) {
+                    await store.remove(userId, sub.endpoint);
+                  }
                 }
               } catch { /* store failure: skip the prune (best-effort) */ }
             }

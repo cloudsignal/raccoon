@@ -274,6 +274,7 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     }
   })();
 
+  let reservationSettled = false;
   try {
     // Pull yielded texts as they arrive.
     while (true) {
@@ -292,17 +293,27 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     // click now (#R6-1b: edits never resolve/reserve), so there is no
     // edited-path rollback to do here.
     resolvedApproval?.commit();
+    reservationSettled = true;
   } catch (err) {
     // #R5-8/#R6-1: the dispatch failed — release the reservation so a retry
     // can resolve the command again, instead of the approval being burned.
     resolvedApproval?.rollback();
+    reservationSettled = true;
     throw err;
   } finally {
-    // Guard: if the consumer exits early (break / return), suppress any
-    // subsequent rejection from dispatchPromise so it cannot become an
-    // unhandled rejection. The turn is not cancellable — it runs to
-    // completion in the background. (An early exit leaves the reservation
-    // unsettled; the store's TTL is the backstop for that path.)
+    // #R8-CQ: if the CONSUMER exited early (break / return) the reservation
+    // was neither committed nor rolled back here — and resolve() already
+    // REMOVED the entry, so the store's TTL can NOT recover it (the earlier
+    // comment claiming so was wrong). The turn is not cancellable and runs to
+    // completion in the background, so settle the reservation on ITS eventual
+    // outcome: commit on success, rollback on failure (so a background
+    // dispatch failure still frees the approval for retry). commit/rollback
+    // are single-use, so this is a no-op if the try/catch already settled.
+    if (!reservationSettled && resolvedApproval) {
+      dispatchPromise.then(() => resolvedApproval.commit(), () => resolvedApproval.rollback());
+    }
+    // Suppress any late dispatchPromise rejection so it can't surface as an
+    // unhandled rejection.
     dispatchPromise.catch(() => {});
   }
 }

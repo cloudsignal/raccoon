@@ -106,6 +106,18 @@ describe('outbox', () => {
     expect((await outbox.listForChannel('coordinator')).some((r) => r.id === m.id)).toBe(false); // settled
   });
 
+  it('acknowledgeReceipt reports processing=true for an approval, false for a settled msg (#R8-CQ)', async () => {
+    const a = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(a.id, TAB, SCOPE);
+    expect(await outbox.acknowledgeReceipt(a.id)).toEqual({ channel: 'coordinator', processing: true });
+
+    const m = await outbox.enqueue(msg('m'), SCOPE);
+    await outbox.markSending(m.id, TAB, SCOPE);
+    expect(await outbox.acknowledgeReceipt(m.id)).toEqual({ channel: 'coordinator', processing: false });
+    // A missing row → undefined (no timer to arm).
+    expect(await outbox.acknowledgeReceipt('nope')).toBeUndefined();
+  });
+
   it('a delayed received ACK does NOT regress a failed row back to processing (#R7-2)', async () => {
     const e = await outbox.enqueue(approvalResp(), SCOPE);
     await outbox.markSending(e.id, TAB, SCOPE);
