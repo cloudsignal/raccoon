@@ -25,7 +25,13 @@ export interface OutboxEntry {
    *  user:u1 are different people with identical from addresses. The claim
    *  CAS compares this persisted scope against the caller's current one.
    *  Rows from before this field existed have scope undefined and are never
-   *  claimable; drain() purges them. */
+   *  claimable; drain() SKIPS them (it does not delete them). #P1-F1: a legacy
+   *  row carrying an OLD (pre-epoch, token-derived) scope is likewise
+   *  unclaimable after an epoch migration and is left in place — same-identity
+   *  so no leak, but an offline draft queued under the old scope is not
+   *  re-sent. This only affects pre-publish sessions (no released epoch-less
+   *  scope format reached users); a rescope-on-migration pass is a deferred
+   *  data-completeness follow-up, not a safety fix. */
   scope?: string;
   createdAt: string;
   attempts: number;

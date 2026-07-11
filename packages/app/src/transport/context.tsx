@@ -717,6 +717,16 @@ export function TransportProvider(props: TransportProviderProps) {
       if (props.sessionOverride) {
         // #R8-5: guarantee a non-secret epoch (host may omit it) so the
         // identity key never derives from the secret sessionToken.
+        // #P1-F2: a host override intentionally never persists (see the
+        // provider-never-writes-IDB guarantee), so a MISSING epoch is minted
+        // fresh EVERY mount → the identity key changes each mount → durable
+        // outbox rows from a prior mount are stranded (unclaimable). A host
+        // with durable local state MUST supply a stable, non-secret epoch.
+        // Warn in dev rather than reject (rejecting would break the documented
+        // token-less override path); GTM already supplies one.
+        if (props.sessionOverride.epoch === undefined && process.env.NODE_ENV !== 'production') {
+          console.warn('[raccoon] sessionOverride has no epoch: a fresh one is minted per mount, stranding durable outbox rows across remounts. Supply a stable non-secret epoch.');
+        }
         const overrideSession = withEpoch(props.sessionOverride);
         sessionGenRef.current += 1;
         sessionRef.current = overrideSession;
@@ -1062,6 +1072,16 @@ export function TransportProvider(props: TransportProviderProps) {
     const transport = transportRef.current;
     validUserIdRef.current = null;
     identityScopeRef.current = null;
+    // #P1-F3: invalidate the DURABLE session FIRST — before the un-timeout-
+    // bounded push-disable / transport-close awaits below. Previously the only
+    // durable clear was clearSessionIfMatches inside wipeAndReset() at the very
+    // end, so a hung host push disable() (or the user closing the tab) during
+    // those awaits left the session row in IDB and the "unpaired" device
+    // silently reconnected on next boot. Compare-and-clear (only if it still
+    // matches the wiped identity) so a concurrent re-pair's newer session is
+    // not erased; wipeAndReset's own clearSessionIfMatches then no-ops.
+    const wipedScope = wiped ? identityKey(wiped) : null;
+    if (wipedScope) await clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))).catch(() => { /* best-effort; wipeAndReset retries */ });
     if (props.pushRegistrarOverride) {
       await props.pushRegistrarOverride.disable?.().catch(() => { /* best-effort */ });
     } else if (userId && transport) {
