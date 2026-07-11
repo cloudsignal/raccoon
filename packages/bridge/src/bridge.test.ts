@@ -455,6 +455,45 @@ describe('RaccoonBridge', () => {
     expect(delivered.length).toBeGreaterThanOrEqual(1); // reached a terminal outcome
   });
 
+  it('a reply-delivery send throw after a completed approval turn does NOT re-run the turn (#R8-3)', async () => {
+    // emitReply persists the reply, THEN delivers it. A raw throwing
+    // sendToUser on that delivery used to make emitReply throw AFTER the
+    // reply was durably stored; the outer catch deleted the dedup key and
+    // reported failure, so a redelivery RE-RAN the side-effecting agent turn
+    // (reviewer probe: runs=2, two stored replies). safeSend makes delivery
+    // best-effort: the turn is 'ok' once persisted.
+    let runs = 0;
+    class ReplyThrowingHub extends FakeHub {
+      sendToUser(userId: string, env: AnyEnvelope): boolean {
+        // Throw only on the agent's reply msg (after the turn ran + persisted).
+        if (env.kind === 'msg' && env.from.startsWith('agent:')) throw new Error('socket broke on reply');
+        return super.sendToUser(userId, env);
+      }
+    }
+    const hub = new ReplyThrowingHub();
+    const store = new InMemoryMessageStore();
+    const runner: AgentRunner = { async *run() { runs += 1; yield 'the reply'; } };
+    const bridge = new RaccoonBridge({ hub, runner, store });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'Approve' },
+    });
+    hub.inject(env, 'u1');
+    await settle();
+    hub.inject(env, 'u1'); // redelivery
+    await settle();
+
+    expect(runs).toBe(1); // the completed turn is NOT re-run despite the delivery throw
+    // Exactly one persisted agent reply (no double side effect).
+    const page = await store.page('coordinator', { userId: 'u1', limit: 50 });
+    expect(page.messages.filter((m) => m.role === 'agent' && m.text === 'the reply')).toHaveLength(1);
+    // The turn was reported as SUCCESS (delivered), never failed.
+    const statuses = hub.sent.filter((s) => s.env.kind === 'ack').map((s) => s.env.kind === 'ack' && s.env.payload.status);
+    expect(statuses).toContain('delivered');
+    expect(statuses).not.toContain('failed');
+  });
+
   it('approval dedup eviction never removes a key whose agent turn is still running, even at cap 1 (#R4-7)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();

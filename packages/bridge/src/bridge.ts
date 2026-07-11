@@ -147,7 +147,7 @@ export class RaccoonBridge {
     });
 
     if (succeeded) {
-      this.hub.sendToUser(userId, createEnvelope('ack', {
+      this.safeSend(userId, createEnvelope('ack', {
         from: agent, to, channel, payload: { refId: env.id, status: 'received' },
       }));
     }
@@ -159,19 +159,18 @@ export class RaccoonBridge {
     // R4-7: markTurnDone() only after the turn (success OR failure) fully
     // resolves — a `finally` so a throw from runTurn/emitReply still marks
     // it, rather than leaving the entry permanently ineligible for eviction.
+    // #R8-3: sends are best-effort (safeSend) so a transport throw can't
+    // escape and, for the msg path, the persisted append already dedups a
+    // redelivery — the turn is never re-run on a delivery-send failure.
     try {
-      this.hub.sendToUser(userId, createEnvelope('typing', {
-        from: agent, to, channel, payload: { state: 'start' },
-      }));
+      this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
 
       const { reply, failed } = await this.runTurn({ userId, channel, text: env.payload.text, messageId: env.id });
 
-      this.hub.sendToUser(userId, createEnvelope('typing', {
-        from: agent, to, channel, payload: { state: 'stop' },
-      }));
+      this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
 
       if (failed) {
-        this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
+        this.safeSend(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
         return;
       }
       await this.emitReply(userId, channel, reply);
@@ -279,8 +278,15 @@ export class RaccoonBridge {
     const replyEnv = createEnvelope('msg', {
       from: agentAddress(channel), to: userAddress(userId), channel, payload: { text: reply },
     });
+    // The DURABLE record of a completed turn is the persisted reply — the
+    // client fetches it via history on reconnect. #R8-3: the live delivery is
+    // therefore best-effort (safeSend). A raw throwing sendToUser here caused
+    // emitReply to throw AFTER the reply was already persisted; the approval
+    // path's outer catch then deleted the dedup key and reported failure, so
+    // a redelivery RE-RAN the (side-effecting) agent turn. append() throwing
+    // is still a real failure (nothing durable happened) and propagates.
     await this.store.append({ id: replyEnv.id, channel, userId, role: 'agent', text: reply, ts: replyEnv.ts });
-    this.hub.sendToUser(userId, replyEnv);
+    this.safeSend(userId, replyEnv);
   }
 
   private async handleHistory(env: Extract<AnyEnvelope, { kind: 'history.request' }>, userId: string): Promise<void> {
