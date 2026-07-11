@@ -123,3 +123,17 @@ describe('WsHub external pairing validation', () => {
     await hub2.stop();
   });
 });
+
+import { grantAbandoned } from './hub.js';
+
+describe('grantAbandoned (#R8-6)', () => {
+  it('abandons a just-minted grant when the deadline aborted OR the socket is no longer open', () => {
+    // The whole point: the socket-not-open case must abandon even when the
+    // abort signal has NOT yet fired (createSession resolved in the window
+    // before the close-event abort callback ran).
+    expect(grantAbandoned(false, false)).toBe(true);  // socket closing, signal not aborted → abandon (the #R8-6 gap)
+    expect(grantAbandoned(true, true)).toBe(true);     // deadline aborted, socket still "open" → abandon
+    expect(grantAbandoned(true, false)).toBe(true);    // both
+    expect(grantAbandoned(false, true)).toBe(false);   // healthy: open + not aborted → grant proceeds
+  });
+});

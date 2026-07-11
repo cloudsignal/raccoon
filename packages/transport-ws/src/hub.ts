@@ -13,6 +13,21 @@ import { MemoryCredentialStore, type CredentialStore } from './credential-store.
 
 interface PairingToken { userId: string; expiresAt: number; used: boolean }
 
+/**
+ * #R8-6: after createSession() mints a session, decide whether the grant must
+ * be ABANDONED (session revoked, one-time token un-burned) because the
+ * connection went away during that await. Two independent signals:
+ *  - `signalAborted`: the hello deadline fired (or the close-event abort ran).
+ *  - `socketOpen === false`: the client started closing and the socket is no
+ *    longer OPEN, even though the close-event abort callback has NOT run yet
+ *    (createSession resolved in that window). The old code returned here
+ *    WITHOUT revoking → orphan session + burned QR token.
+ * Exported for direct unit coverage of every combination.
+ */
+export function grantAbandoned(signalAborted: boolean, socketOpen: boolean): boolean {
+  return signalAborted || !socketOpen;
+}
+
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -446,18 +461,16 @@ export class WsHub {
     }
 
     const sessionToken = await this.store.createSession(grantUserId);
-    // #R6-11b: the deadline may have fired during createSession — we now hold
-    // a session for an abandoned, closed connection. Revoke it rather than
-    // leave an orphan, un-consume the one-time token so the client can retry
-    // with the SAME QR (the deadline is not the client's fault), and do not
-    // attach.
-    if (signal.aborted) {
-      // #R7-5: revoke ONLY this just-minted session. Do NOT fall back to a
-      // user-wide revokeUser() here — unlike the revoked-user paths below,
-      // this user was NOT revoked; over-revoking would kill a concurrent,
-      // legitimate session of theirs. A store without revokeSession leaves
-      // this one orphan to expire on its own TTL, which is the safe
-      // direction when the alternative is harming a valid session.
+    // #R6-11b/#R8-6: the connection may have gone away during createSession —
+    // EITHER the deadline fired (signal.aborted) OR the client started closing
+    // before the close-event abort callback ran (signal NOT yet aborted, but
+    // the socket is no longer OPEN). Both mean we now hold a session for an
+    // abandoned connection. Treat them identically: revoke ONLY this
+    // just-minted session (never user-wide revokeUser — this user was NOT
+    // revoked, so over-revoking would kill a concurrent legitimate session;
+    // a store without revokeSession leaves this orphan to TTL-expire), and
+    // un-consume the one-time token so the client can retry with the SAME QR.
+    if (grantAbandoned(signal.aborted, ws.readyState === ws.OPEN)) {
       await this.store.revokeSession?.(sessionToken).catch(() => {});
       if (builtinToken) builtinToken.used = false;
       return;
@@ -479,8 +492,8 @@ export class WsHub {
       ws.close(4401, 'revoked during redemption');
       return;
     }
-    // R4-6: see the matching guard in the session-resume path above.
-    if (ws.readyState !== ws.OPEN) return;
+    // (The not-OPEN case is handled together with signal.aborted above, #R8-6,
+    // where it also revokes the just-minted session and un-burns the token.)
     this.attach(ws, grantUserId);
     ws.send(JSON.stringify(createEnvelope('pair.grant', {
       from: 'system',
