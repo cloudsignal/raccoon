@@ -221,6 +221,39 @@ function findPresentationSelect(presentation: MessagePresentation): MessagePrese
  * choice back as a standalone `/`-prefixed message), then the legacy `value`
  * field, then the label.
  */
+/**
+ * Normalize a label to the identity the USER perceives (#R8-7). The app
+ * capitalizes the first letter and trims when rendering an option, so 'allow',
+ * 'Allow', and ' allow ' all display identically — two such controls are
+ * indistinguishable to the user and must be treated as duplicates, even
+ * though their raw label strings differ.
+ */
+function normalizeLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+/**
+ * Build the actionable approval choices from buttons OR select options,
+ * applied by BOTH the modern presentation path and the legacy interactive
+ * path (#R7-6/#R8-7). Drops disabled controls, and returns null (→ caller
+ * degrades to plain text, no executable buttons) if, after filtering, there
+ * are no choices or any two share a normalized (rendered) label — which the
+ * wire protocol (labels only) cannot disambiguate.
+ */
+function buildActionableChoices(
+  items: ReadonlyArray<{ label: string; action?: MessagePresentationButton['action']; value?: string; disabled?: boolean }>,
+): Array<{ label: string; choice: ApprovalChoice }> | null {
+  const enabled = items.filter((i) => !i.disabled);
+  if (enabled.length === 0) return null;
+  const seen = new Set<string>();
+  for (const i of enabled) {
+    const key = normalizeLabel(i.label);
+    if (seen.has(key)) return null; // ambiguous rendered labels — reject the actionable rendering
+    seen.add(key);
+  }
+  return enabled.map((i) => ({ label: i.label, choice: resolveChoice(i) }));
+}
+
 function resolveChoice(c: { label: string; action?: MessagePresentationButton['action']; value?: string }): ApprovalChoice {
   if (c.action?.type === 'callback') return { value: c.action.value, isCommand: false };
   if (c.action?.type === 'command') return { value: c.action.command, isCommand: true };
@@ -257,25 +290,13 @@ async function deliverPresentation(
   const buttons = findPresentationButtons(presentation);
   const selectOptions = buttons === null ? findPresentationSelect(presentation) : null;
 
-  // #R7-6: build the actionable choice list defensively.
-  //  - Disabled buttons are NOT choices (a disabled control must never become
-  //    a live approval option). Options have no `disabled` field in the SDK.
-  //  - Labels are the ONLY identifier carried over the wire (the OAM
-  //    approval.request payload has just `options: string[]`, and the response
-  //    echoes the clicked label). Duplicate labels are therefore fundamentally
-  //    ambiguous — a last-wins map could execute the WRONG action for a click.
-  //    Rather than guess, reject the actionable rendering and fall through to
-  //    a plain-text listing (no executable buttons), which is safe.
-  const rawChoices: Array<{ label: string; choice: ApprovalChoice }> | null = buttons !== null
-    ? buttons.filter((b) => !b.disabled).map((b) => ({ label: b.label, choice: resolveChoice(b) }))
-    : selectOptions !== null
-      // #R6-9b: select options carry the same action?/value/label shape as
-      // buttons — resolve them the same action-aware way.
-      ? selectOptions.map((o) => ({ label: o.label, choice: resolveChoice(o) }))
-      : null;
-  const hasDuplicateLabels = rawChoices !== null
-    && new Set(rawChoices.map((c) => c.label)).size !== rawChoices.length;
-  const choices = rawChoices !== null && rawChoices.length > 0 && !hasDuplicateLabels ? rawChoices : null;
+  // #R7-6/#R8-7: disabled-filtered, duplicate-rejected choices (shared with
+  // the legacy interactive path). Select options carry the same
+  // action?/value/label shape as buttons (#R6-9b), so both resolve the same
+  // action-aware way.
+  const choices = buttons !== null
+    ? buildActionableChoices(buttons)
+    : selectOptions !== null ? buildActionableChoices(selectOptions) : null;
 
   if (choices !== null) {
     const refId = ulid();
@@ -390,9 +411,13 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
     if (interactive && Array.isArray(interactive.blocks) && interactive.blocks.length > 0) {
       // Try to extract a buttons block → approval.request.
       const buttons = findButtonsBlock(interactive);
-      if (buttons !== null) {
-        const options = buttons.map((b) => b.label);
-        // Map to OAM approval.request.
+      // #R8-7: the legacy interactive path must apply the SAME safety as the
+      // modern presentation path — drop disabled controls and reject
+      // ambiguous (duplicate rendered-label) sets — via the shared builder.
+      // A null result (empty/all-disabled/duplicate) degrades to the text
+      // fallback below, never an executable-but-ambiguous card.
+      const choices = buttons !== null ? buildActionableChoices(buttons) : null;
+      if (choices !== null) {
         const refId = ulid();
         const title =
           typeof payload.text === 'string' && payload.text.trim().length > 0
@@ -406,16 +431,10 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
             refId,
             title,
             description: '',
-            options,
+            options: choices.map((c) => c.label),
           },
         });
-        // Remember each button's resolved choice (action-aware — see
-        // resolveButtonChoice) so the inbound runner can resolve it once the
-        // human's choice comes back as one of these labels. Without this, a
-        // button like {label:"Approve", value:"approve:task-42"} lost its
-        // value entirely — OpenClaw only ever saw "Approve" as an unrelated
-        // turn, breaking any correlation to the pending action.
-        approvalValues?.remember(refId, userId, new Map(buttons.map((b) => [b.label, resolveChoice(b)])));
+        approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])));
         hub.sendToUser(userId, env);
         return makeResult(env.id, channel);
       }

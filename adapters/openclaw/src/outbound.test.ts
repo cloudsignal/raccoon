@@ -624,6 +624,76 @@ describe('createRaccoonOutbound', () => {
     expect(remember).not.toHaveBeenCalled(); // no ambiguous label→command mapping recorded
   });
 
+  it('labels differing only in case/whitespace are treated as duplicates and degrade to text (#R8-7)', async () => {
+    // The app capitalizes/trims option labels when rendering, so 'allow' and
+    // 'Allow' look identical to the user — ambiguous, must not be an
+    // executable card.
+    mockChunk.mockReturnValue(['Confirm']);
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined, validate: () => false },
+    });
+    await adapter.sendPayload!({
+      ...makeCtx('Confirm', 'user:alice'),
+      payload: {
+        text: 'Confirm',
+        presentation: {
+          blocks: [{
+            type: 'buttons',
+            buttons: [
+              { label: 'allow', action: { type: 'command', command: 'approve a allow-once' } },
+              { label: 'Allow', action: { type: 'command', command: 'approve b deny' } },
+            ],
+          }],
+        },
+      },
+    });
+    expect(hub.envelopes[0]!.kind).toBe('msg'); // degraded
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('the LEGACY interactive path also filters disabled and rejects duplicate labels (#R8-7)', async () => {
+    // The deprecated payload.interactive path bypassed the disabled/dedup
+    // safety entirely: disabled buttons became live choices and duplicate
+    // labels mapped last-wins (wrong command on click).
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined, validate: () => false },
+    });
+    // Disabled filtered:
+    await adapter.sendPayload!({
+      ...makeCtx('Deploy?', 'user:alice'),
+      payload: {
+        text: 'Deploy?',
+        interactive: { blocks: [{ type: 'buttons', buttons: [
+          { label: 'Allow', action: { type: 'command', command: 'approve x allow-once' } },
+          { label: 'Disabled', disabled: true, action: { type: 'command', command: 'approve x deny' } },
+        ] }] },
+      },
+    });
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    if (env.kind === 'approval.request') expect(env.payload.options).toEqual(['Allow']);
+    expect(remember.mock.calls[0]![2].has('Disabled')).toBe(false);
+
+    // Duplicate labels (legacy path) degrade to text.
+    hub.envelopes.length = 0;
+    remember.mockClear();
+    mockChunk.mockReturnValue(['pick']);
+    await adapter.sendPayload!({
+      ...makeCtx('pick', 'user:bob'),
+      payload: {
+        text: 'pick',
+        interactive: { blocks: [{ type: 'buttons', buttons: [
+          { label: 'Allow', action: { type: 'command', command: 'approve a allow-once' } },
+          { label: 'Allow', action: { type: 'command', command: 'approve b deny' } },
+        ] }] },
+      },
+    });
+    expect(hub.envelopes[0]!.kind).toBe('msg');
+    expect(remember).not.toHaveBeenCalled();
+  });
+
   it('sendPayload resolves a select OPTION\'s command action to a real slash command, not bracket text (#R6-9b)', async () => {
     // Real SDK 2026.6.11: MessagePresentationOption has action?: like a
     // button. An exec approval rendered as a SELECT (not buttons) whose
