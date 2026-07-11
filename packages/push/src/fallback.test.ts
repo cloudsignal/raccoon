@@ -321,6 +321,35 @@ describe('withPushFallback', () => {
     expect(sender.sent).toHaveLength(1); // delivered again after re-enrollment
   });
 
+  it('a FAILED clearForUser stays fenced across a later re-subscribe — the revoked endpoint is not re-exposed (#R10)', async () => {
+    const inner = new FakeHub();
+    const base = new InMemorySubscriptionStore();
+    await base.add('u1', sub('https://fcm.googleapis.com/fcm/send/old')); // offline, seeded
+    const store = {
+      list: (uid: string) => base.list(uid),
+      add: (uid: string, s: PushSubscriptionJson) => base.add(uid, s),
+      remove: (uid: string, ep: string) => base.remove(uid, ep),
+      clear: async () => { throw new Error('db outage'); }, // revoke's clear FAILS; old rows remain
+    };
+    const sender = new FakeSender();
+    const { hub, clearForUser } = withPushFallback(inner, { store, sender });
+
+    await expect(clearForUser('u1')).rejects.toThrow('db outage'); // fence set, gen bumped, clear did NOT complete
+
+    // A genuine re-enrollment arrives (valid FCM endpoint, passes the SSRF guard).
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system',
+      payload: { subscription: sub('https://fcm.googleapis.com/fcm/send/new') },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 20));
+
+    // On HEAD the re-subscribe lifts the fence and BOTH endpoints get pushed.
+    // The fence must hold until a revoke's clear TRULY completes.
+    expect(hub.sendToUser('u1', msgTo('u1'))).toBe(false); // offline → push path
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sender.sent).toHaveLength(0);
+  });
+
   it('a subscribe that predates a revoke must not un-fence the user (queued-subscribe race, #R7-4b)', async () => {
     const inner = new FakeHub();
     const base = new InMemorySubscriptionStore();

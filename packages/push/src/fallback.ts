@@ -39,6 +39,14 @@ export function withPushFallback(
   const revoking = new Set<string>();
   const revokeGen = new Map<string, number>();
   const genOf = (userId: string): number => revokeGen.get(userId) ?? 0;
+  // #R10: the highest revoke generation whose store.clear() ACTUALLY completed.
+  // A revoke bumps revokeGen synchronously but the clear is async and may
+  // REJECT — leaving the revoked rows in the store. Lifting the fence on a mere
+  // generation match would then re-expose those stale rows on the next
+  // enrollment. The fence is lifted only when clearedGen has caught up, i.e.
+  // the revoke's clear genuinely removed the old rows.
+  const clearedGen = new Map<string, number>();
+  const clearedOf = (userId: string): number => clearedGen.get(userId) ?? 0;
 
   const pushOut = (userId: string, payload: PushPayload): void => {
     if (revoking.has(userId)) return; // fence deliveries that START after a revoke
@@ -91,7 +99,12 @@ export function withPushFallback(
     // just installed and re-expose the about-to-be-cleared subscriptions to a
     // delivery. Comparing the generation captured at RECEIPT against the
     // current one detects exactly that interleaving and keeps the fence.
-    if (genOf(userId) === genAtReceipt) revoking.delete(userId);
+    // #R10: only lift the fence when the revoke's clear ACTUALLY completed
+    // (clearedOf >= the captured generation). A revoke whose clear() rejected
+    // leaves the revoked rows in the store; matching the generation alone would
+    // re-expose them here. Requiring clearedOf keeps the fence up until a clear
+    // genuinely succeeds (the caller is contractually expected to retry it).
+    if (genOf(userId) === genAtReceipt && clearedOf(userId) >= genAtReceipt) revoking.delete(userId);
   };
 
   // Serialise BOTH subscribe and unsubscribe per user, in arrival order, on
@@ -164,8 +177,13 @@ export function withPushFallback(
       // this revoke is about to remove, whether it started before or after
       // the revoke. Reactivated only by a fresh push.subscribe (re-pair).
       revoking.add(userId);
-      revokeGen.set(userId, genOf(userId) + 1); // #R7-4: bump so in-flight deliveries stay fenced across a later re-subscribe
-      return enqueue(userId, () => opts.store.clear(userId));
+      const gen = genOf(userId) + 1;
+      revokeGen.set(userId, gen); // #R7-4: bump so in-flight deliveries stay fenced across a later re-subscribe
+      // #R10: only advance clearedGen once the clear ACTUALLY completes. On the
+      // per-user FIFO chain clears run in arrival order, so clearedGen only ever
+      // advances. A rejecting clear() never records — the fence stays up until
+      // a retried clearForUser succeeds.
+      return enqueue(userId, () => opts.store.clear(userId).then(() => { clearedGen.set(userId, gen); }));
     },
   };
 }
