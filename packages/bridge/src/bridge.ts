@@ -14,6 +14,22 @@ const DEFAULT_DEDUP_CAP = 500;
 const DEFAULT_TURN_DEADLINE_MS = 90_000;
 const GENERIC_ERROR = 'Something went wrong handling that.';
 
+/**
+ * #R10: a runner throws this to CERTIFY that its turn failed BEFORE any durable
+ * side effect — i.e. a retry is safe (a transient dispatch outage, a validation
+ * reject with nothing executed). Any OTHER thrown error is treated as
+ * UNKNOWN-outcome (a generic runner may `await sideEffect()` then throw), so the
+ * approval path stalls it rather than offering a retry that could double side
+ * effects. The bridge cannot infer safety from the yielded text deltas, so the
+ * runner must opt in to retryability explicitly.
+ */
+export class RetryableTurnError extends Error {
+  constructor(message = 'retryable turn error') {
+    super(message);
+    this.name = 'RetryableTurnError';
+  }
+}
+
 export class RaccoonBridge {
   private readonly hub: OutboundHub;
   private readonly runner: AgentRunner;
@@ -174,24 +190,35 @@ export class RaccoonBridge {
     // #R8-3: sends are best-effort (safeSend) so a transport throw can't
     // escape and, for the msg path, the persisted append already dedups a
     // redelivery — the turn is never re-run on a delivery-send failure.
+    // #R10: on TIMEOUT the real turn is still running in drainLate — the dedup
+    // entry must NOT become eviction-eligible yet, or a cap-driven eviction +
+    // redelivery would start a SECOND concurrent turn (violating #R4-7). So
+    // markTurnDone ownership transfers to drainLate for the timeout path; the
+    // ok/error paths mark it done here.
+    let outcome: 'ok' | 'error' | 'timeout' = 'error';
     try {
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
 
-      const { reply, outcome } = await this.runTurn({ userId, channel, text: env.payload.text, messageId: env.id });
+      const res = await this.runTurn(
+        { userId, channel, text: env.payload.text, messageId: env.id },
+        () => markTurnDone(), // drainLate marks the timed-out turn done only when it finally ends
+      );
+      outcome = res.outcome;
 
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
 
-      // The msg path is already safe from double-run (the persisted append
-      // dedups a redelivery and is never deleted on turn failure), so a
-      // timeout is surfaced the same as an error here — a softer 'still
-      // working' text is deferred polish, not a safety requirement.
-      if (outcome !== 'ok') {
+      // The msg path is already safe from double-run on a FAST failure (the
+      // persisted append dedups a redelivery and is never deleted on turn
+      // failure). A softer 'still working' text on timeout is deferred polish.
+      if (res.outcome !== 'ok') {
         this.safeSend(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
         return;
       }
-      await this.emitReply(userId, channel, reply);
+      await this.emitReply(userId, channel, res.reply);
     } finally {
-      markTurnDone();
+      // Timeout: drainLate owns markTurnDone (called when the background turn
+      // ends). Anything else: the turn is over, mark it done now.
+      if (outcome !== 'timeout') markTurnDone();
     }
   }
 
@@ -247,31 +274,51 @@ export class RaccoonBridge {
     //                the terminal-but-non-retryable 'stalled' ack; no error msg
     //                (the turn may yet succeed and post its reply via history).
     // A store/emitReply throw is caught and treated as a fast 'error'.
+    // #R10: when a timed-out turn eventually COMPLETES in drainLate, converge
+    // the stalled entry to a real terminal: set 'ok' (now eviction-eligible)
+    // and emit 'delivered' so the client card moves off "still working". A late
+    // error leaves it 'stalled' (outcome remains UNKNOWN — no reply to surface).
+    const onLateComplete = (ok: boolean): void => {
+      if (!ok) return;
+      this.approvalSeen.set(key, 'ok');
+      this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'delivered' } }));
+    };
+
     let outcome: 'ok' | 'error' | 'timeout' = 'error';
+    let safeToRetry = false;
     try {
       this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'received' } }));
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
       const res = await this.runTurn({
         userId, channel, text: editedText ?? choice, messageId: env.id,
         approval: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
-      });
+      }, onLateComplete);
       outcome = res.outcome;
+      safeToRetry = res.safeToRetry ?? false;
       if (res.outcome === 'ok') await this.emitReply(userId, channel, res.reply);
     } catch {
+      // A store/emitReply throw AFTER a successful turn: the side effects DID
+      // happen but the reply didn't persist — outcome is UNKNOWN, NOT safe to
+      // retry.
       outcome = 'error';
+      safeToRetry = false;
     } finally {
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
       if (outcome === 'ok') {
         this.approvalSeen.set(key, 'ok');
         this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'delivered' } })); // TERMINAL success
-      } else if (outcome === 'timeout') {
-        // Keep the key (as 'stalled') so a redelivery never re-runs the live turn.
+      } else if (outcome === 'timeout' || !safeToRetry) {
+        // #P1-A / #R10: UNKNOWN outcome — the turn is still running (timeout) OR
+        // threw without certifying it did nothing durable (a generic runner may
+        // have side-effected before throwing). Keep the key as 'stalled' so a
+        // redelivery/retry NEVER re-runs (which could double side effects), and
+        // emit the terminal-but-non-retryable 'stalled' ack. No error msg.
         this.approvalSeen.set(key, 'stalled');
         this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'stalled' } }));
       } else {
-        // #R6-2/#R7-1a: forget the envelope so a redelivery/retry re-runs, and
-        // tell the client machine-readably (it holds the row in 'processing';
-        // only a terminal ack releases it), plus surface the error text.
+        // #R6-2/#R7-1a: a runner-CERTIFIED safe failure (RetryableTurnError) —
+        // nothing durable ran, so forget the envelope (a redelivery/retry
+        // cleanly re-runs) and surface a retryable 'failed' + the error text.
         this.approvalSeen.delete(key);
         this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'failed' } }));
         this.safeSend(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
@@ -305,7 +352,10 @@ export class RaccoonBridge {
    *                 persist its eventual reply via emitReply, so the client's
    *                 "still working — check back" is real (the reply appears in
    *                 history / live if still connected). */
-  private async runTurn(ctx: AgentContext): Promise<{ reply: string; outcome: 'ok' | 'error' | 'timeout' }> {
+  private async runTurn(
+    ctx: AgentContext,
+    onLateComplete?: (ok: boolean) => void,
+  ): Promise<{ reply: string; outcome: 'ok' | 'error' | 'timeout'; safeToRetry?: boolean }> {
     let reply = '';
     const iterator = this.runner.run(ctx)[Symbol.asyncIterator]();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -322,31 +372,39 @@ export class RaccoonBridge {
         if (step === 'timeout') {
           // Do NOT abandon the iterator — the underlying turn is non-cancellable
           // in v1 and runs to completion anyway. Keep consuming it in the
-          // background and persist the eventual reply (no further ack — the
-          // client already got 'stalled'). Detached: never blocks this return.
-          void this.drainLate(ctx, iterator, reply, nextP);
+          // background: persist the eventual reply AND signal completion so the
+          // caller can converge (msg → markTurnDone; approval → stalled→ok +
+          // 'delivered'). Detached: never blocks this return.
+          void this.drainLate(ctx, iterator, reply, nextP, onLateComplete);
           return { reply: '', outcome: 'timeout' };
         }
         if (step.done) return { reply, outcome: 'ok' };
         reply += step.value;
       }
-    } catch {
-      return { reply: '', outcome: 'error' };
+    } catch (err) {
+      // #R10: a throw does NOT imply nothing durable happened — a generic
+      // runner may `await sideEffect()` then throw. Only a runner-certified
+      // RetryableTurnError is safe to retry; every other error is UNKNOWN.
+      return { reply: '', outcome: 'error', safeToRetry: err instanceof RetryableTurnError };
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 
-  /** #P1-A (adv): finish consuming a timed-out turn's iterator in the
-   *  background and persist its reply, so a 'stalled' turn's eventual output is
-   *  not silently lost. Persist-only via emitReply (which appends to the store
-   *  and best-effort sends the msg) — it does NOT touch the approval ack/dedup,
-   *  so it can't re-settle or re-open the stalled row. Best-effort throughout. */
+  /** #P1-A: finish consuming a timed-out turn's iterator in the background,
+   *  persist its reply (#P1-A adv), and signal completion (#R10) so the caller
+   *  converges — the msg path marks the dedup entry evictable, the approval
+   *  path transitions stalled→ok and emits a terminal 'delivered'. Persist is
+   *  via emitReply (append + best-effort send); the CONVERGENCE is the caller's
+   *  onLateComplete so drainLate stays agnostic to path bookkeeping. onLateComplete
+   *  is invoked exactly once: true if the turn completed (reply persisted),
+   *  false if it errored late (nothing durable to surface). Best-effort throughout. */
   private async drainLate(
     ctx: AgentContext,
     iterator: AsyncIterator<string>,
     soFar: string,
     pending: Promise<IteratorResult<string>>,
+    onLateComplete?: (ok: boolean) => void,
   ): Promise<void> {
     let reply = soFar;
     try {
@@ -357,10 +415,13 @@ export class RaccoonBridge {
         step = await iterator.next();
       }
     } catch {
-      return; // the detached turn errored late — nothing to persist
+      onLateComplete?.(false); // the detached turn errored late — nothing to persist
+      return;
     }
-    try { await this.emitReply(ctx.userId, ctx.channel, reply); }
+    let persisted = false;
+    try { await this.emitReply(ctx.userId, ctx.channel, reply); persisted = true; }
     catch { /* append failed — best-effort; nothing durable to surface */ }
+    onLateComplete?.(persisted);
   }
 
   /** Persist + send the agent reply. Skips an empty reply: an empty agent turn (or

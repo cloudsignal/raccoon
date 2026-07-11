@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createEnvelope, type AnyEnvelope } from '@raccoon/protocol';
-import { RaccoonBridge } from './bridge.js';
+import { RaccoonBridge, RetryableTurnError } from './bridge.js';
 import { InMemoryMessageStore } from './message-store.js';
 import type { AgentContext, AgentRunner, OutboundHub } from './types.js';
 
@@ -362,7 +362,7 @@ describe('RaccoonBridge', () => {
     expect(statuses).toEqual(['received', 'stalled', 'stalled']);
   });
 
-  it('a stalled turn that completes AFTER the deadline still persists its reply (background drain, #P1-A adv)', async () => {
+  it('a stalled turn that completes AFTER the deadline persists its reply AND converges stalled→delivered (#R10)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
     const box: { release: (() => void) | null } = { release: null };
@@ -383,16 +383,20 @@ describe('RaccoonBridge', () => {
     await new Promise((r) => setTimeout(r, 60)); // past the 30ms deadline → 'stalled'
     expect(hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '')).toEqual(['received', 'stalled']);
 
-    // The turn now completes; the background drain must persist the reply.
+    // The turn now completes; the background drain persists the reply AND
+    // converges the row to a real terminal ('delivered') so the client card
+    // moves off "still working" and the dedup entry becomes eviction-eligible.
     box.release?.();
     await settle();
-    // Persisted to the store (surfaces via history) AND best-effort sent live.
     const page = await store.page('coordinator', { userId: 'u1', limit: 50 });
     expect(page.messages.some((m) => m.role === 'agent' && m.text === 'the late reply')).toBe(true);
-    // No EXTRA ack beyond received/stalled — the late reply does not re-settle
-    // or re-open the stalled row.
-    const acks = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
-    expect(acks).toEqual(['received', 'stalled']);
+    expect(hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '')).toEqual(['received', 'stalled', 'delivered']);
+
+    // A redelivery now re-acks the converged 'delivered' (not 'stalled') and never re-runs.
+    hub.inject(env, 'u1');
+    await settle();
+    const statuses = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
+    expect(statuses).toEqual(['received', 'stalled', 'delivered', 'delivered']);
   });
 
   it('acks a redelivered approval.response without re-running the agent (#R2-5)', async () => {
@@ -421,19 +425,18 @@ describe('RaccoonBridge', () => {
     for (const a of acks) if (a.env.kind === 'ack') expect(a.env.payload.refId).toBe(env.id);
   });
 
-  it('a failed approval turn emits a machine-readable failed ack and permits a retry to re-run (#R6-2)', async () => {
-    // Previously the bridge acked 'received' and marked the envelope seen
-    // BEFORE dispatch, then converted the runner's exception into a generic
-    // error text — so the client had settled its outbox row and hidden the
-    // approval controls, the redelivery was dropped as already-seen, and the
-    // retained approval mapping (R5-8/R6-1) was unreachable in production.
+  it('a runner-CERTIFIED safe failure (RetryableTurnError) emits a machine-readable failed ack and permits a retry to re-run (#R6-2/#R10)', async () => {
+    // Only a runner that explicitly certifies "nothing durable ran" (a
+    // transient dispatch outage BEFORE any side effect) may present a
+    // retryable 'failed'. It throws RetryableTurnError; any other error is
+    // UNKNOWN (see the side-effect-then-throw test below).
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
     let runs = 0;
     const flaky: AgentRunner = {
       async *run() {
         runs += 1;
-        if (runs === 1) throw new Error('transient dispatch outage');
+        if (runs === 1) throw new RetryableTurnError('transient dispatch outage');
         yield 'approved!';
       },
     };
@@ -460,6 +463,75 @@ describe('RaccoonBridge', () => {
     expect(runs).toBe(2);
     const reply = hub.sent.filter((s) => s.env.kind === 'msg').at(-1)!.env;
     if (reply.kind === 'msg') expect(reply.payload.text).toBe('approved!');
+  });
+
+  it('an approval runner that side-effects then throws a PLAIN error is UNKNOWN (stalled), not re-run by a retry (#R10)', async () => {
+    // The 'fast error = nothing durable happened' assumption is invalid for a
+    // generic runner: it may `await sideEffect()` then throw. Without a
+    // RetryableTurnError certification, such an error is UNKNOWN — the bridge
+    // must NOT offer a retry that would double the side effect.
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let runs = 0;
+    let sideEffects = 0;
+    const risky: AgentRunner = {
+      // eslint-disable-next-line require-yield
+      async *run() {
+        runs += 1;
+        sideEffects += 1;           // a durable side effect already happened...
+        throw new Error('then it threw'); // ...then a plain (uncertified) throw
+      },
+    };
+    const bridge = new RaccoonBridge({ hub, runner: risky, store });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'approve' },
+    });
+    hub.inject(env, 'u1');
+    await settle();
+    // UNKNOWN → terminal 'stalled', never a retryable 'failed', no error msg.
+    expect(hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '')).toEqual(['received', 'stalled']);
+    expect(hub.sent.some((s) => s.env.kind === 'msg')).toBe(false);
+
+    // A redelivery must NOT re-run (which would double the side effect).
+    hub.inject(env, 'u1');
+    await settle();
+    expect(runs).toBe(1);
+    expect(sideEffects).toBe(1);
+    expect(hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '')).toEqual(['received', 'stalled', 'stalled']);
+  });
+
+  it('a timed-out msg keeps its dedup entry non-evictable until the background drain finishes (#R4-7 timeout)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const runsFor: Record<string, number> = {};
+    const box: { release: (() => void) | null } = { release: null };
+    // Msg A hangs past the deadline (then releasable); every other msg completes.
+    const runner: AgentRunner = {
+      async *run(ctx) {
+        runsFor[ctx.text] = (runsFor[ctx.text] ?? 0) + 1;
+        if (ctx.text === 'A') { await new Promise<void>((r) => { box.release = r; }); yield 'A done'; }
+        else yield `${ctx.text} done`;
+      },
+    };
+    const bridge = new RaccoonBridge({ hub, runner, store, turnDeadlineMs: 30, dedupCap: 1 });
+    bridge.start();
+    const mkMsg = (text: string) => createEnvelope('msg', { from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text } });
+    const a = mkMsg('A');
+    hub.inject(a, 'u1');
+    await new Promise((r) => setTimeout(r, 60)); // A times out; its drain is still blocked
+    // A different msg B: its claim() append runs evictCompleted at cap 1. A's
+    // entry must NOT be evicted (its turn is still running in drainLate), so a
+    // redelivery of A must NOT re-run.
+    hub.inject(mkMsg('B'), 'u1');
+    await settle();
+    hub.inject(a, 'u1'); // redeliver A while its drain is still blocked
+    await settle();
+    expect(runsFor['A']).toBe(1); // NOT re-run despite the cap-1 eviction pressure
+    box.release?.();
+    await settle();
+    expect(runsFor['A']).toBe(1);
   });
 
   it('a redelivery AFTER success re-emits the terminal delivered ack, never received (#R6-2b)', async () => {
