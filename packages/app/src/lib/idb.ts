@@ -96,6 +96,53 @@ export async function kvDel(key: string): Promise<void> {
 }
 
 /**
+ * ATOMIC read-modify-write of one kv key in a SINGLE transaction (#R8-4).
+ * `fn(current)` returns the next value (or undefined to leave unchanged).
+ * Because IDB serializes 'readwrite' transactions on a store across ALL tabs,
+ * two concurrent kvUpdate() calls run one-after-another — so e.g. a lazy
+ * epoch mint converges: the first writes the epoch, the second sees it and
+ * leaves it. Returns the resulting stored value.
+ */
+export function kvUpdate<T>(key: string, fn: (current: T | undefined) => T | undefined): Promise<T | undefined> {
+  return withTransaction<T | undefined>('kv', 'readwrite', async (s) => {
+    const current = await promisifyRequest(s.get(key) as IDBRequest<T | undefined>);
+    const next = fn(current);
+    if (next !== undefined) await promisifyRequest(s.put(next, key));
+    return next !== undefined ? next : current;
+  });
+}
+
+/**
+ * ATOMIC compare-and-delete of one kv key in a SINGLE transaction (#R8-4):
+ * delete only if `predicate(currentValue)` holds. Returns whether it deleted.
+ * The read and the delete cannot interleave, so a value re-saved between them
+ * (e.g. a newer session written by a concurrent re-pair) is NOT deleted.
+ */
+export function kvDeleteIf<T>(key: string, predicate: (value: T) => boolean): Promise<boolean> {
+  return withTransaction<boolean>('kv', 'readwrite', async (s) => {
+    const current = await promisifyRequest(s.get(key) as IDBRequest<T | undefined>);
+    if (current === undefined || !predicate(current)) return false;
+    await promisifyRequest(s.delete(key));
+    return true;
+  });
+}
+
+/**
+ * Clear every kv key EXCEPT `session` (#R8-4). Used by a wipe that has
+ * already compare-and-cleared the session key itself — so it can drop read
+ * markers / the push flag without risking deletion of a session a concurrent
+ * re-pair may have written since.
+ */
+export async function wipeKvExceptSession(): Promise<void> {
+  await withTransaction('kv', 'readwrite', async (s) => {
+    const keys = await promisifyRequest(s.getAllKeys() as IDBRequest<IDBValidKey[]>);
+    for (const k of keys) {
+      if (k !== 'session') await promisifyRequest(s.delete(k));
+    }
+  });
+}
+
+/**
  * Wipe the `kv` store (session, read markers, push-enabled flag). Used on
  * unpair / terminal auth-error so that pairing the device as a different user
  * cannot inherit the prior user's session or read state.

@@ -46,6 +46,21 @@ describe('session store', () => {
     expect(await loadSession()).toBeNull();
   });
 
+  it('concurrent legacy loads converge on ONE epoch (atomic get-or-set, #R8-4)', async () => {
+    const { kvSet } = await import('./idb.js');
+    const { epoch: _drop, ...legacy } = session;
+    await kvSet('session', legacy); // pre-epoch stored session
+
+    // Two tabs load concurrently. With a read-then-write migration each would
+    // mint a different random epoch and race their writes; the atomic
+    // get-or-set must make both observe the SAME epoch.
+    const [a, b] = await Promise.all([loadSession(), loadSession()]);
+    expect(a?.epoch).toBeTruthy();
+    expect(a?.epoch).toBe(b?.epoch);
+    // And the persisted value matches (no divergent write won).
+    expect((await loadSession())?.epoch).toBe(a?.epoch);
+  });
+
   it('clearSessionIfMatches clears a matching session but leaves a since-re-paired newer one (#R7-3)', async () => {
     const keyOf = (s: Session) => `${s.instance}:${s.userId}:${s.epoch}`;
     await saveSession(session); // epoch-1

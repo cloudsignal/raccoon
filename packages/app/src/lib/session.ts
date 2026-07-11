@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { kvDel, kvGet, kvSet } from './idb.js';
+import { kvDeleteIf, kvGet, kvSet, kvUpdate } from './idb.js';
 
 const sessionSchema = z.object({
   url: z.string().min(1),
@@ -23,17 +23,20 @@ export type Session = z.infer<typeof sessionSchema>;
 const KEY = 'session';
 
 export async function loadSession(): Promise<Session | null> {
-  const raw = await kvGet<unknown>(KEY);
-  const parsed = sessionSchema.safeParse(raw);
-  if (!parsed.success) return null;
-  // Lazy migration: a session persisted before `epoch` existed gets one minted
-  // and written back, so it has a stable non-secret epoch from here on.
-  if (parsed.data.epoch === undefined) {
-    const migrated = { ...parsed.data, epoch: crypto.randomUUID() };
-    await kvSet(KEY, migrated);
-    return migrated;
-  }
-  return parsed.data;
+  // #R8-4: the lazy epoch migration is an ATOMIC get-or-set in one
+  // transaction. Two tabs loading a pre-epoch session concurrently would, with
+  // a plain read-then-write, each mint a DIFFERENT random epoch and race their
+  // writes — leaving the two tabs with divergent identity keys and existing
+  // outbox rows permanently unclaimable. kvUpdate serializes them so both
+  // converge on the first-written epoch.
+  const stored = await kvUpdate<unknown>(KEY, (current) => {
+    const parsed = sessionSchema.safeParse(current);
+    if (!parsed.success) return undefined;           // nothing/corrupt: don't write
+    if (parsed.data.epoch !== undefined) return undefined; // already has one: leave unchanged
+    return { ...parsed.data, epoch: crypto.randomUUID() };  // mint once
+  });
+  const parsed = sessionSchema.safeParse(stored);
+  return parsed.success ? parsed.data : null;
 }
 
 export async function saveSession(s: Session): Promise<void> {
@@ -43,37 +46,25 @@ export async function saveSession(s: Session): Promise<void> {
 }
 
 export async function clearSession(): Promise<void> {
-  await kvDel(KEY);
+  await kvDeleteIf(KEY, () => true);
 }
 
 /**
- * Clear the stored session ONLY if it still matches `expectedKey` (#R7-3).
- * A tombstoned-load path must not blindly clearSession(): if the user
- * re-paired (saving a NEWER session) between the wipe and this stale IDB
- * read resolving, an unconditional clear would delete that new session.
- * `keyOf` derives the identity key to compare. Returns whether it cleared.
+ * Clear the stored session ONLY if it still matches `expectedKey` (#R7-3),
+ * as a SINGLE atomic compare-and-delete transaction (#R8-4). A tombstoned-load
+ * path must not blindly clearSession(): if the user re-paired (saving a NEWER
+ * session) between the wipe and this stale IDB read resolving, an
+ * unconditional clear — or a read-then-delete across two transactions — would
+ * delete that new session. `keyOf` derives the identity key to compare;
+ * because the read and delete share one transaction, a concurrent
+ * saveSession() cannot land between them. Returns whether it cleared.
  */
 export async function clearSessionIfMatches(
   expectedKey: string,
   keyOf: (s: Session) => string,
 ): Promise<boolean> {
-  return withKvSessionLock(async () => {
-    const raw = await kvGet<unknown>(KEY);
+  return kvDeleteIf<unknown>(KEY, (raw) => {
     const parsed = sessionSchema.safeParse(raw);
-    if (!parsed.success) return false;
-    if (keyOf(parsed.data) !== expectedKey) return false; // a newer session was saved — keep it
-    await kvDel(KEY);
-    return true;
+    return parsed.success && keyOf(parsed.data) === expectedKey;
   });
-}
-
-// The kv store has no transactions across get+del here; this module-local
-// promise chain serializes clearSessionIfMatches against itself so a
-// concurrent re-pair's save (also going through saveSession) is at least not
-// racing two compare-and-clears. saveSession/loadSession are single kv ops.
-let kvSessionChain: Promise<unknown> = Promise.resolve();
-function withKvSessionLock<T>(op: () => Promise<T>): Promise<T> {
-  const next = kvSessionChain.then(op, op);
-  kvSessionChain = next.catch(() => {});
-  return next;
 }

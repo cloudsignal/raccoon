@@ -7,7 +7,7 @@ import {
   type AnyEnvelope, type TransportStatus,
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
-import { kvGet, kvSet, wipeLocal } from '../lib/idb.js';
+import { kvGet, kvSet, wipeKvExceptSession } from '../lib/idb.js';
 import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import { clearSessionIfMatches, loadSession, saveSession, type Session } from '../lib/session.js';
@@ -476,14 +476,26 @@ export function TransportProvider(props: TransportProviderProps) {
   // shared per-origin outbox — another tab logged in as a different identity
   // keeps its queued rows. `wipedScope` is captured by the caller BEFORE it
   // nulls identityScopeRef.
-  const wipeAndReset = useCallback(async (wipedScope: string | null) => {
+  const wipeAndReset = useCallback(async (wiped: ActiveSession | null) => {
     for (const timer of ackTimers.current.values()) clearTimeout(timer);
     ackTimers.current.clear();
     // #R6-5b: cancel any scheduled lease sweep — it must not survive a
     // wipe/re-pair and fire against a fresh identity.
     if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
     leaseSweepDueRef.current = Infinity;
-    await Promise.all([wipeLocal(), wipedScope ? outbox.clearScope(wipedScope) : Promise.resolve()]);
+    // #R8-4: the SESSION is cleared by an atomic compare-and-clear (only if it
+    // still matches the wiped identity), NOT a blanket wipeLocal() after async
+    // work — an older unpair racing a newer tab's re-pair would otherwise
+    // erase the newer session. Read markers / push flag are then cleared
+    // WITHOUT touching the session key (wipeKvExceptSession), so a session a
+    // concurrent re-pair wrote in the meantime is never collateral. The
+    // outbox clear is already identity-scoped (#R7-3).
+    const wipedScope = wiped ? identityKey(wiped) : null;
+    await Promise.all([
+      wipedScope ? clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))) : Promise.resolve(false),
+      wipeKvExceptSession(),
+      wipedScope ? outbox.clearScope(wipedScope) : Promise.resolve(),
+    ]);
     dispatch({ type: 'reset' });
   }, []);
 
@@ -590,7 +602,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // superseded this one (the original TOCTOU this deferral pattern was
         // written to avoid: "a re-pair racing the async wipe could have its
         // freshly-saved session cleared").
-        void wipeAndReset(wiped ? identityKey(wiped) : null).finally(() => {
+        void wipeAndReset(wiped).finally(() => {
           if (sessionGenRef.current !== myGen) return;
           setSession(null);
           // R2-10: unpair() already clears this; the auth-error path did not,
@@ -994,7 +1006,6 @@ export function TransportProvider(props: TransportProviderProps) {
     // still see this (now-terminating) identity as valid.
     const userId = sessionRef.current?.userId;
     const transport = transportRef.current;
-    const wipedScope = wiped ? identityKey(wiped) : null; // capture before nulling (#R7-3)
     validUserIdRef.current = null;
     identityScopeRef.current = null;
     if (props.pushRegistrarOverride) {
@@ -1014,7 +1025,7 @@ export function TransportProvider(props: TransportProviderProps) {
     unsubsRef.current = [];
     await transportRef.current?.close();
     transportRef.current = null;
-    await wipeAndReset(wipedScope);
+    await wipeAndReset(wiped);
     // Guarded the same way as the auth-error path: skip if a newer wipe or a
     // newer successful pairing has already superseded this one.
     if (sessionGenRef.current !== myGen) return;
