@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
-import { afterEach, describe, expect, it } from 'vitest';
-import { openDb, closeDbForTests, kvGet } from './idb.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { openDb, closeDbForTests, kvGet, __setBlockedTimeoutMsForTests } from './idb.js';
 
 afterEach(async () => { await closeDbForTests(); });
 
@@ -49,6 +49,38 @@ describe('idb multi-tab upgrade coordination (#P1-D)', () => {
     expect(reopened).not.toBe(dbA);
 
     bumped.close();
+  });
+
+  it('a blocked open (a peer holds a handler-less older connection) rejects within the bound instead of pending forever (#R10)', async () => {
+    __setBlockedTimeoutMsForTests(50); // real short bound, so no fake-timer/setImmediate fragility
+    let held: IDBDatabase | undefined;
+    try {
+      // Emulate the OLD v1 bundle: a raw v1 connection with NO onversionchange
+      // handler — it will NEVER yield to a newer-version open.
+      held = await new Promise<IDBDatabase>((res, rej) => {
+        const r = indexedDB.open('raccoon-app', 1);
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      // compiled DB_VERSION=2 → blocked by the held v1 conn; must REJECT within
+      // the bound rather than pend forever.
+      await expect(openDb()).rejects.toThrow(/blocked/);
+      // Cache was reset by the rejection: with the blocker gone, a fresh open works.
+      held.close();
+      held = undefined;
+      await expect(openDb()).resolves.toBeDefined();
+    } finally {
+      __setBlockedTimeoutMsForTests(10_000);
+      held?.close();
+    }
+  });
+
+  it('a synchronous indexedDB.open throw rejects and does not poison the cache (#R10)', async () => {
+    const spy = vi.spyOn(indexedDB, 'open').mockImplementationOnce(() => { throw new Error('open blew up'); });
+    await expect(openDb()).rejects.toThrow('open blew up');
+    spy.mockRestore();
+    // The cache was nulled on the synchronous throw → the next call reopens cleanly.
+    await expect(openDb()).resolves.toBeDefined();
   });
 
   it('does not cache a rejected open — a superseded VersionError re-attempts on the next call (#P1-D adv)', async () => {

@@ -9,10 +9,34 @@ type StoreName = 'kv' | 'outbox' | 'approvals';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
+// #R10: how long a BLOCKED open (a peer tab — typically one still running the
+// OLD bundle, which has no onversionchange to yield) may hold us before we
+// give up. onversionchange only helps FUTURE upgrades (new code yielding to
+// newer code); it cannot be retrofitted into an already-running old tab. So a
+// blocked open must fail closed within a bound (callers/UpdateGate can then
+// prompt a reload) rather than leave every await openDb() pending forever.
+let blockedTimeoutMs = 10_000;
+
+/** Test-only: shorten the blocked-open bound so a held-connection test doesn't
+ *  wait the full production timeout. Not part of the public API. */
+export function __setBlockedTimeoutMsForTests(ms: number): void {
+  blockedTimeoutMs = ms;
+}
+
 export function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+  const p = new Promise<IDBDatabase>((resolve, reject) => {
+    let req: IDBOpenDBRequest;
+    try {
+      req = indexedDB.open(DB_NAME, DB_VERSION);
+    } catch (err) {
+      // #R10: indexedDB.open() can throw SYNCHRONOUSLY (private-browsing /
+      // sandboxed / partitioned storage). Reject rather than leave a
+      // half-built promise; the p.catch below nulls the cache.
+      reject(err);
+      return;
+    }
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
@@ -25,16 +49,21 @@ export function openDb(): Promise<IDBDatabase> {
         approvals.createIndex('channel', 'channel');
       }
     };
-    // #P1-D: a multi-tab PWA schema upgrade must not hang. Without these
-    // handlers, a tab holding an older-version connection blocks a newer tab's
-    // open indefinitely, and every await openDb() (i.e. every kvGet/withStore)
-    // wedges. `blocked` is transient — do NOT reject (onsuccess still fires
-    // once the other tab yields); just surface it so a genuine hang is
-    // diagnosable.
+    // #P1-D/#R10: a multi-tab schema upgrade must not hang. `blocked` fires
+    // while a peer holds an older-version connection open. onversionchange (in
+    // onsuccess) makes THIS (new) code yield to future upgrades, but it cannot
+    // make an already-running OLD tab yield — so arm a bounded reject: if the
+    // block doesn't clear within BLOCKED_TIMEOUT_MS, fail closed so callers can
+    // surface a reload prompt instead of wedging every await openDb() forever.
     req.onblocked = () => {
       console.warn('[idb] open blocked: another tab is holding an older DB version open');
+      if (blockedTimer) return;
+      blockedTimer = setTimeout(() => {
+        reject(new Error('idb open blocked: another tab holds an older DB version; reload required'));
+      }, blockedTimeoutMs);
     };
     req.onsuccess = () => {
+      if (blockedTimer) clearTimeout(blockedTimer);
       const db = req.result;
       db.onversionchange = () => {
         // A newer tab needs to upgrade the schema — yield so it isn't blocked,
@@ -46,17 +75,18 @@ export function openDb(): Promise<IDBDatabase> {
       resolve(db);
     };
     req.onerror = () => {
-      // #P1-D (adv): do NOT leave a rejected promise cached. A tab superseded by
-      // a higher DB version reopens at its (now lower) compiled DB_VERSION and
-      // gets a VersionError here; caching that rejection would make EVERY later
-      // kvGet/withStore reject forever off the same cached promise. Nulling lets
-      // the next call re-attempt (it still fails until the tab reloads to newer
-      // code, but it is not permanently poisoned, and a normal transient error
-      // can recover).
-      dbPromise = null;
+      if (blockedTimer) clearTimeout(blockedTimer);
       reject(req.error);
     };
   });
+  // #P1-D/#R10: never leave a REJECTED open cached (a superseded tab's
+  // VersionError, a blocked-timeout, or a synchronous open() throw would
+  // otherwise poison every later kvGet/withStore off the same cached promise).
+  // Null the cache on ANY rejection so the next call re-attempts a fresh open.
+  // Assignment-order matters: capture `p` in a local and compare identity, since
+  // `dbPromise = p` runs AFTER this executor has already synchronously run.
+  dbPromise = p;
+  void p.catch(() => { if (dbPromise === p) dbPromise = null; });
   return dbPromise;
 }
 
