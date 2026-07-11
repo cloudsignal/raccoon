@@ -16,10 +16,12 @@ import { TransportProvider, useChat, type ChatApi } from './context.js';
 // recoverProcessing()/drain(), #R6-2b/#R6-5b).
 afterEach(async () => { cleanup(); await closeDbForTests(); });
 
-// #R6-3b: the provider's identity key is `${instance}\0${userId}\0${sessionToken}`.
-// mountPaired / the seeded saveSession use instance 'i', user 'u1', token 't'.
-const KEY = 'i\u0000u1\u0000t';
-const OTHER_KEY = 'i\u0000other\u0000t';
+// #R6-3b/#R7-3: the provider's identity key is the JSON of {i:instance,
+// u:userId,e:epoch}. Seeded sessions/rows use instance 'i', user 'u1',
+// epoch EPOCH so the key is deterministic across the provider and the seeds.
+const EPOCH = 'e1';
+const KEY = JSON.stringify({ i: 'i', u: 'u1', e: EPOCH });
+const OTHER_KEY = JSON.stringify({ i: 'i', u: 'other', e: EPOCH });
 
 let api: ChatApi;
 function Probe() {
@@ -28,13 +30,18 @@ function Probe() {
 }
 
 async function mountPaired(transport: FakeTransport) {
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
   render(
     <TransportProvider makeTransport={() => transport}>
       <Probe />
     </TransportProvider>,
   );
   await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+  // Let the boot's deferred recoverProcessing→drain (#R6-2b) settle on the
+  // still-empty outbox before the test seeds rows, so a late mount-drain can't
+  // race the seed (claim a just-seeded row to 'sending' and fail a precondition
+  // that expects it 'pending'). Quiescence, not arbitrary timing.
+  await new Promise((r) => setTimeout(r, 20));
 }
 
 describe('TransportProvider', () => {
@@ -101,7 +108,7 @@ describe('TransportProvider', () => {
     render(
       <TransportProvider
         transportOverride={transport}
-        sessionOverride={{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] }}
+        sessionOverride={{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH }}
         pushRegistrarOverride={{ enable: async () => true, disable: async () => { disabled = true; } }}
       >
         <Probe />
@@ -116,7 +123,7 @@ describe('TransportProvider', () => {
     // Simulate a prior session that was killed mid-send: an outbox entry left
     // in 'sending' state with no chance to fire the transport's 'closed'
     // event (which is the only other thing that calls demoteSending()).
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
     const stranded = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'stranded' },
     }), KEY);
@@ -145,7 +152,7 @@ describe('TransportProvider', () => {
   });
 
   it('a cross-tab wipe arriving during boot recovery prevents the wiped session from connecting (#R6-4)', async () => {
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
 
     // Park the boot inside its lease-sweep await, deliver identity-wiped
     // from "another tab" while parked, then release. The boot continuation
@@ -177,7 +184,7 @@ describe('TransportProvider', () => {
   });
 
   it('a wipe that arrives BEFORE loadSession resolves is not ignored — the loaded session is not installed (#R6-4b)', async () => {
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
 
     // Gate the IDB session load so the wipe lands while this tab has NO
     // current identity yet (sessionRef null). The old listener returned early
@@ -203,7 +210,7 @@ describe('TransportProvider', () => {
     wiper.close();
 
     // Now the stale read resolves with the (just-wiped) session.
-    releaseLoad({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    releaseLoad({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
     await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('setup'));
 
     // It must NOT have been installed or connected.
@@ -219,8 +226,8 @@ describe('TransportProvider', () => {
     // A delayed/unrelated wipe event — different user, and separately a
     // different instance URL — must not tear down this session.
     const otherTab = new BroadcastChannel('raccoon-identity');
-    otherTab.postMessage({ type: 'identity-wiped', key: 'i\u0000someone-else\u0000t' });
-    otherTab.postMessage({ type: 'identity-wiped', key: 'other-instance\u0000u1\u0000t' });
+    otherTab.postMessage({ type: 'identity-wiped', key: JSON.stringify({ i: 'i', u: 'someone-else', e: EPOCH }) });
+    otherTab.postMessage({ type: 'identity-wiped', key: JSON.stringify({ i: 'other-instance', u: 'u1', e: EPOCH }) });
     await new Promise((r) => setTimeout(r, 30));
     otherTab.close();
 
@@ -235,7 +242,7 @@ describe('TransportProvider', () => {
     // A wipe posted for a DIFFERENT session epoch (old token) for the same
     // user@instance must not tear down this (freshly-paired) session.
     const otherTab = new BroadcastChannel('raccoon-identity');
-    otherTab.postMessage({ type: 'identity-wiped', key: 'i\u0000u1\u0000t-old-epoch' });
+    otherTab.postMessage({ type: 'identity-wiped', key: JSON.stringify({ i: 'i', u: 'u1', e: 'old-epoch' }) });
     await new Promise((r) => setTimeout(r, 30));
     otherTab.close();
 
@@ -265,13 +272,13 @@ describe('TransportProvider', () => {
     );
   }, 10_000);
 
-  it('never sends — and purges — a pending row written under a different identity (#R5-3)', async () => {
+  it('never sends a pending row written under a different identity, but LEAVES it for its owner (#R5-3/#R7-3)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport); // current identity: u1
 
-    // A row surviving in the shared per-origin store from a stale tab that
-    // was still running as user:other (e.g. its enqueue raced a wipe).
-    await outbox.enqueue(createEnvelope('msg', {
+    // A row belonging to a DIFFERENT identity's scope — could be another tab
+    // logged in as user:other, live right now.
+    const foreign = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:other', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'someone else\'s message' },
     }), OTHER_KEY);
     // A legitimate row for the current identity, to prove drain still works.
@@ -282,10 +289,11 @@ describe('TransportProvider', () => {
     act(() => { transport.setStatus('open'); }); // trigger drain
 
     await waitFor(() => expect(transport.sent.some((e) => e.id === mine.id)).toBe(true));
-    // The foreign row was neither transmitted through u1's session…
+    // The foreign row was never transmitted through u1's session…
     expect(transport.sent.some((e) => e.from === 'user:other')).toBe(false);
-    // …nor left behind to re-surface on every future drain.
-    expect((await outbox.listForChannel('coordinator')).filter((e) => e.env.from === 'user:other')).toEqual([]);
+    // …and #R7-3: it is LEFT in the store (not deleted) — it may belong to a
+    // live tab under that identity; destroying it would lose that tab's data.
+    expect((await outbox.listForChannel('coordinator')).some((e) => e.id === foreign.id)).toBe(true);
   });
 
   it('a wipe in one tab tears down other tabs running the same identity (#R5-3 cross-tab)', async () => {
@@ -294,7 +302,7 @@ describe('TransportProvider', () => {
       sink.api = useChat();
       return <div>{sink.api.phase}</div>;
     }
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
     const a: Sink = {};
     const b: Sink = {};
     const tA = new FakeTransport();
@@ -325,7 +333,7 @@ describe('TransportProvider', () => {
   });
 
   it('a foreign row whose lease is still valid at boot is requeued and sent once that lease lapses (#R5-4)', async () => {
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
     const stranded = await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'crashed mid-send' },
     }), KEY);
@@ -356,7 +364,7 @@ describe('TransportProvider', () => {
   }, 10_000);
 
   it('does not wire/connect a transport if the provider unmounts during boot recovery (#R4-10)', async () => {
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
 
     // Gate the boot's demoteSending() await so the test can unmount the
     // provider while the boot effect's async continuation is still
@@ -415,7 +423,7 @@ describe('TransportProvider', () => {
 
   it('a stale drain snapshot entry cleared mid-drain is never sent (#R4-3, Part A)', async () => {
     const transport = new FakeTransport();
-    await mountPaired(transport);
+    await mountPaired(transport); // settles the boot drain before we seed (see mountPaired)
 
     const env1 = createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'first' },

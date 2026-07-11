@@ -69,6 +69,31 @@ describe('outbox', () => {
     expect(entry.attempts).toBe(0);
   });
 
+  it('clearScope deletes only the given identity\'s rows, never another identity\'s (#R7-3)', async () => {
+    const mine = await outbox.enqueue(msg('mine'), SCOPE);
+    const theirs = await outbox.enqueue(msg('theirs'), 'other-scope');
+    await outbox.clearScope(SCOPE);
+    const rows = await outbox.listForChannel('coordinator');
+    expect(rows.some((r) => r.id === mine.id)).toBe(false); // cleared
+    expect(rows.some((r) => r.id === theirs.id)).toBe(true); // another identity's row survives
+  });
+
+  it('recoverProcessing re-drives only this identity\'s processing rows (#R7-3)', async () => {
+    const mine = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(mine.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(mine.id); // → processing (mine)
+    const foreign = await outbox.enqueue(createEnvelope('approval.response', {
+      from: 'user:other', to: 'agent:coordinator', channel: 'coordinator', payload: { refId: 'r2', choice: 'x' },
+    }), 'other-scope');
+    await outbox.markSending(foreign.id, 'other-tab', 'other-scope');
+    await outbox.acknowledgeReceipt(foreign.id); // → processing (foreign)
+
+    await outbox.recoverProcessing(SCOPE);
+    const rows = await outbox.listForChannel('coordinator');
+    expect(rows.find((r) => r.id === mine.id)!.status).toBe('pending'); // re-driven
+    expect(rows.find((r) => r.id === foreign.id)!.status).toBe('processing'); // untouched
+  });
+
   it('acknowledgeReceipt moves an approval.response row to durable processing, but a msg row settles (#R6-2b)', async () => {
     const a = await outbox.enqueue(approvalResp(), SCOPE);
     await outbox.markSending(a.id, TAB, SCOPE);

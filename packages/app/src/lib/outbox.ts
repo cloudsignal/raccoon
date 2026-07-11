@@ -319,14 +319,20 @@ export async function failByServer(id: string): Promise<void> {
  * drop or reload otherwise leaves the row in 'processing' forever. Re-sending
  * the SAME envelope is dedup-safe — the bridge re-acks the real outcome
  * ('delivered' if it already succeeded, or re-runs if it had failed and was
- * forgotten). Returns the channels touched (for a follow-up drain).
+ * forgotten).
+ *
+ * #R7-3: SCOPED to `scope` — only this identity's rows. The outbox is shared
+ * per-origin across tabs/identities; a global re-drive would resurrect a
+ * DIFFERENT identity's processing row into this session's drain. A caller
+ * with no identity (scope null) recovers nothing.
  */
-export async function recoverProcessing(): Promise<void> {
+export async function recoverProcessing(scope: string | null): Promise<void> {
+  if (!scope) return;
   const touched = await withTransaction('outbox', 'readwrite', async (s) => {
     const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
     const channels: string[] = [];
     for (const entry of all) {
-      if (entry.status !== 'processing') continue;
+      if (entry.status !== 'processing' || entry.scope !== scope) continue;
       await promisifyRequest(s.put({ ...entry, status: 'pending' }));
       channels.push(entry.channel);
     }
@@ -407,4 +413,27 @@ export async function clearAll(): Promise<void> {
   await withTransaction('outbox', 'readwrite', async (s) => {
     await promisifyRequest(s.clear());
   });
+}
+
+/**
+ * Clear ONLY the rows for one identity `scope`, in one transaction (#R7-3).
+ * A wipe/unpair must not use the global clearAll(): the outbox is shared
+ * per-origin, so clearing everything destroys a DIFFERENT identity's queued
+ * rows (e.g. another tab logged in as someone else). Legacy rows with no
+ * scope are treated as belonging to no current identity and left alone.
+ * Same single-transaction serialization guarantee as clearAll (see the
+ * module comment) so it can't interleave with a concurrent mutator.
+ */
+export async function clearScope(scope: string): Promise<void> {
+  const touched = await withTransaction('outbox', 'readwrite', async (s) => {
+    const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
+    const channels: string[] = [];
+    for (const entry of all) {
+      if (entry.scope !== scope) continue;
+      await promisifyRequest(s.delete(entry.id));
+      channels.push(entry.channel);
+    }
+    return channels;
+  });
+  for (const c of touched) notify(c);
 }
