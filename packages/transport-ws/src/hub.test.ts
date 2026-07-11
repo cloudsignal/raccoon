@@ -28,6 +28,16 @@ function pairRequest(token: string): string {
   }));
 }
 
+// #P1-C: a paired session is PROVISIONAL until the client confirms it. Raw-ws
+// tests that pair then resume through the default MemoryCredentialStore must
+// send this (the real WsClientTransport auto-sends it on pair.grant).
+function confirmGrant(ws: WebSocket, sessionToken: string): void {
+  ws.send(JSON.stringify(createEnvelope('pair.confirm', {
+    from: 'system', to: 'system', channel: 'pairing', payload: { sessionToken },
+  })));
+}
+const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+
 describe('WsHub pairing', () => {
   it('grants a session for a valid single-use token', async () => {
     hub = new WsHub({ instance: 'test', channels: ['coordinator'] });
@@ -74,6 +84,8 @@ describe('WsHub pairing', () => {
     ws.send(pairRequest(token));
     const grant = await nextMessage(ws);
     if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    confirmGrant(ws, grant.payload.sessionToken); // #P1-C: promote to durable
+    await tick();
     ws.close();
 
     const resumed = await connect(port);
@@ -82,6 +94,66 @@ describe('WsHub pairing', () => {
       resumed.once('message', (d) => resolve(JSON.parse(d.toString()))));
     expect(hello).toEqual({ ok: true, userId: 'u1' });
     resumed.close();
+  });
+
+  it('a paired-but-UNCONFIRMED session is not resumable — closing before pair.confirm leaves no live session (#P1-C)', async () => {
+    hub = new WsHub({ instance: 'test' });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    // The client abandons WITHOUT confirming (models the lost-grant window:
+    // the close frame reaches the server after the grant was already sent).
+    ws.close();
+    await tick();
+
+    const resumed = await connect(port);
+    resumed.send(JSON.stringify({ session: grant.payload.sessionToken }));
+    // The provisional session was never confirmed → not resumable.
+    expect(await nextClose(resumed)).toBe(4401);
+  });
+
+  it('an unconfirmed provisional session is reaped after its TTL (#P1-C)', async () => {
+    hub = new WsHub({ instance: 'test', provisionalSessionTtlMs: 20 });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    ws.close();
+    await tick(40); // past the 20ms provisional TTL
+    // A second pairing triggers the opportunistic sweep (createSession).
+    hub.issuePairingToken('u2');
+    const sweep = await connect(port);
+    sweep.send(pairRequest(hub.issuePairingToken('u2')));
+    await nextMessage(sweep); sweep.close();
+
+    const resumed = await connect(port);
+    resumed.send(JSON.stringify({ session: grant.payload.sessionToken }));
+    expect(await nextClose(resumed)).toBe(4401); // reaped
+  });
+
+  it('a pair.confirm for a token this socket was NOT granted does not promote it (#P1-C)', async () => {
+    hub = new WsHub({ instance: 'test' });
+    const { port } = await hub.start();
+    // Pair user A (socket a) and user B (socket b), neither confirmed.
+    const a = await connect(port); a.send(pairRequest(hub.issuePairingToken('a')));
+    const grantA = await nextMessage(a);
+    const b = await connect(port); b.send(pairRequest(hub.issuePairingToken('b')));
+    const grantB = await nextMessage(b);
+    if (grantA.kind !== 'pair.grant' || grantB.kind !== 'pair.grant') throw new Error('expected grants');
+    // Socket a tries to confirm B's token — must be ignored (guarded by the
+    // socket's OWN provisional token).
+    confirmGrant(a, grantB.payload.sessionToken);
+    await tick();
+    a.close(); b.close();
+
+    const resumed = await connect(port);
+    resumed.send(JSON.stringify({ session: grantB.payload.sessionToken }));
+    expect(await nextClose(resumed)).toBe(4401); // B stayed provisional
   });
 
   it('revokeUser closes live sockets with 4403 and kills the session', async () => {
@@ -174,6 +246,7 @@ describe('WsHub pairing', () => {
           return token;
         },
         verifySession: async (t) => sessions.get(t) ?? null,
+        confirmSession: async () => {},
         revokeUser: async (userId) => {
           for (const [t, u] of sessions) if (u === userId) sessions.delete(t);
         },
@@ -236,6 +309,7 @@ describe('WsHub pairing', () => {
       store: {
         createSession: async () => 'unused',
         verifySession: async () => verifyGate,
+        confirmSession: async () => {},
         revokeUser: async () => {},
       },
     });
@@ -295,6 +369,7 @@ describe('WsHub pairing', () => {
       store: {
         createSession: async () => { throw new Error('unused'); },
         verifySession: async () => { throw new Error('db outage'); },
+        confirmSession: async () => {},
         revokeUser: async () => {},
       },
     });
@@ -448,6 +523,7 @@ describe('WsHub pairing', () => {
           return inner.createSession(userId);
         },
         verifySession: (t: string) => inner.verifySession(t),
+        confirmSession: (t: string) => inner.confirmSession(t),
         revokeUser: (u: string) => inner.revokeUser(u),
         revokeSession: (t: string) => inner.revokeSession(t),
       },
@@ -468,6 +544,8 @@ describe('WsHub pairing', () => {
     const grant = await nextMessage(h2);
     const s2 = grant.kind === 'pair.grant' ? grant.payload.sessionToken : '';
     expect(s2).not.toBe('');
+    confirmGrant(h2, s2); // #P1-C: promote S2 to durable so h3 can resume it
+    await tick();
 
     // Release H1: it sees the revoke landed after its helloStartedAt and
     // cleans up. That cleanup must be scoped to H1's OWN just-minted
@@ -626,6 +704,7 @@ describe('WsHub pairing', () => {
           return t;
         },
         verifySession: async (t: string) => (sessions.has(t) ? 'u1' : null),
+        confirmSession: async () => {},
         revokeUser: async () => {},
         revokeSession: async (t: string) => { revoked.push(t); sessions.delete(t); },
       },
@@ -690,6 +769,7 @@ describe('WsHub pairing', () => {
           releaseCreate = () => { sessions.add(`sess-${userId}`); resolve(`sess-${userId}`); };
         }),
         verifySession: async (t: string) => (sessions.has(t) ? 'u1' : null),
+        confirmSession: async () => {},
         revokeUser: async () => {},
         revokeSession: async (t: string) => { revoked.push(t); sessions.delete(t); },
       },
@@ -722,6 +802,7 @@ describe('WsHub pairing', () => {
       store: {
         createSession: async () => new Promise<string>((resolve) => { releaseCreate = () => resolve('sess-1'); }),
         verifySession: async () => null,
+        confirmSession: async () => {},
         revokeUser: async () => { revokeUserCalls += 1; },
         // no revokeSession
       },

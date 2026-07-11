@@ -123,6 +123,17 @@ export class WsClientTransport implements Transport {
           const env = tryParseEnvelope(parsed);
           if (env?.kind === 'pair.grant') {
             this.opts = { ...this.opts, session: env.payload.sessionToken, pairingToken: undefined };
+            // #P1-C: affirmatively confirm the grant so the hub promotes the
+            // provisional session to durable/resumable. A client whose socket
+            // closed in the lost-grant window never reaches this branch, so
+            // never confirms — its provisional session is TTL-reaped instead
+            // of becoming a resumable orphan.
+            try {
+              ws.send(JSON.stringify(createEnvelope('pair.confirm', {
+                from: 'system', to: 'system', channel: 'pairing',
+                payload: { sessionToken: env.payload.sessionToken },
+              })));
+            } catch { /* best-effort; a lost confirm is backstopped by the provisional TTL */ }
             for (const h of this.grantHandlers) h(env);
             this.established();
             if (!settled) { settled = true; resolve(); }

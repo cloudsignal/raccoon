@@ -102,6 +102,7 @@ describe('WsClientTransport', () => {
     hub = new WsHub({ instance: 'test', port, store: {
       createSession: async () => { throw new Error('unused'); },
       verifySession: async (t) => (t === session ? 'u1' : null),
+      confirmSession: async () => {},
       revokeUser: async () => {},
     }});
     await hub.start();
@@ -142,6 +143,7 @@ describe('WsClientTransport', () => {
     hub = new WsHub({ instance: 'test', port, store: {
       createSession: async () => { throw new Error('unused'); },
       verifySession: async (t) => (t === session ? 'u1' : null),
+      confirmSession: async () => {},
       revokeUser: async () => {},
     }});
     await hub.start();

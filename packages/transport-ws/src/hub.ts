@@ -74,6 +74,10 @@ export interface WsHubOptions {
   staticDir?: string;
   /** Advertised in pair.grant so clients can register web-push subscriptions. */
   vapidPublicKey?: string;
+  /** #P1-C: how long a PROVISIONAL (paired-but-unconfirmed) session survives
+   *  before the default MemoryCredentialStore reaps it. Only used when no
+   *  custom `store` is supplied. Default 30_000. */
+  provisionalSessionTtlMs?: number;
   /** External pairing validation (e.g. enrollment tokens in a host DB).
    *  Checked before the built-in in-memory token map. Return the userId
    *  to grant, or null to reject. `signal` aborts when the hello deadline
@@ -155,7 +159,7 @@ export class WsHub {
     this.channels = opts.channels ?? [];
     this.host = opts.host ?? '127.0.0.1';
     this.portOpt = opts.port ?? 0;
-    this.store = opts.store ?? new MemoryCredentialStore();
+    this.store = opts.store ?? new MemoryCredentialStore({ provisionalSessionTtlMs: opts.provisionalSessionTtlMs });
     this.pairingTtlMs = opts.pairingTtlMs ?? 300_000;
     this.maxAttempts = opts.pairingAttemptsPerMinute ?? 10;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
@@ -494,7 +498,12 @@ export class WsHub {
     }
     // (The not-OPEN case is handled together with signal.aborted above, #R8-6,
     // where it also revokes the just-minted session and un-burns the token.)
-    this.attach(ws, grantUserId);
+    // #P1-C: pass the PROVISIONAL sessionToken so attach() can promote it to
+    // durable when this same socket sends pair.confirm. Until then the session
+    // is non-resumable (verifySession returns null) and TTL-reaped — so a
+    // client that closed in the lost-grant window (grantAbandoned missed it)
+    // still can't resume an orphan.
+    this.attach(ws, grantUserId, sessionToken);
     ws.send(JSON.stringify(createEnvelope('pair.grant', {
       from: 'system',
       to: userAddress(grantUserId),
@@ -509,7 +518,7 @@ export class WsHub {
     })));
   }
 
-  private attach(ws: WebSocket, userId: string): void {
+  private attach(ws: WebSocket, userId: string, provisionalToken?: string): void {
     let set = this.byUser.get(userId);
     if (!set) { set = new Set(); this.byUser.set(userId, set); }
     set.add(ws);
@@ -539,6 +548,17 @@ export class WsHub {
       try { parsed = JSON.parse(data.toString()); } catch { return; }
       const env = tryParseEnvelope(parsed);
       if (!env) return;
+      // #P1-C: the client's confirmation that it received/adopted the grant.
+      // Promote the PROVISIONAL session to durable, but ONLY if the token
+      // matches THIS socket's own provisional token — so a socket cannot
+      // confirm (and thereby make resumable) a session minted for a different
+      // pairing. Never forwarded to app handlers.
+      if (env.kind === 'pair.confirm') {
+        if (provisionalToken && env.payload.sessionToken === provisionalToken) {
+          void this.store.confirmSession(provisionalToken).catch(() => {});
+        }
+        return;
+      }
       for (const h of this.handlers) h(env, userId);
     });
   }
