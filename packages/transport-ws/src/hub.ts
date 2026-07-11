@@ -195,6 +195,13 @@ export class WsHub {
       ws.once('close', () => {
         clearTimeout(helloTimer);
         this.pendingConnections.delete(ws);
+        // #R7-5: a client DISCONNECT during hello must also abort the
+        // controller — otherwise a cooperative validatePairingToken stays
+        // outstanding after the socket is gone, and an in-flight
+        // createSession completes and mints an orphan session (the abort
+        // checks in handleHello never fire). The timeout path aborts too;
+        // this covers close-before-timeout.
+        if (!helloController.signal.aborted) helloController.abort();
       });
       ws.once('message', (data) => {
         // R4-6: do NOT clear the timer or drop pre-auth accounting here —
@@ -445,7 +452,13 @@ export class WsHub {
     // with the SAME QR (the deadline is not the client's fault), and do not
     // attach.
     if (signal.aborted) {
-      await (this.store.revokeSession?.(sessionToken) ?? this.store.revokeUser(grantUserId)).catch(() => {});
+      // #R7-5: revoke ONLY this just-minted session. Do NOT fall back to a
+      // user-wide revokeUser() here — unlike the revoked-user paths below,
+      // this user was NOT revoked; over-revoking would kill a concurrent,
+      // legitimate session of theirs. A store without revokeSession leaves
+      // this one orphan to expire on its own TTL, which is the safe
+      // direction when the alternative is harming a valid session.
+      await this.store.revokeSession?.(sessionToken).catch(() => {});
       if (builtinToken) builtinToken.used = false;
       return;
     }

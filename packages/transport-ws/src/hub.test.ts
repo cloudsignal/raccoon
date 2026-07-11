@@ -650,4 +650,93 @@ describe('WsHub pairing', () => {
     const grant = await nextMessage(ok);
     expect(grant.kind).toBe('pair.grant');
   });
+
+  it('a client DISCONNECT during hello aborts a cooperative validator (#R7-5)', async () => {
+    // The close handler cleared the deadline timer but did not abort the
+    // controller, so a cooperative validator kept running after the socket
+    // was gone. Disconnect must abort it.
+    let aborted = false;
+    let releaseValidate!: () => void;
+    hub = new WsHub({
+      instance: 'test',
+      helloTimeoutMs: 5000, // long — the DISCONNECT, not the timeout, must abort
+      validatePairingToken: (_token, signal) =>
+        new Promise<string | null>((resolve) => {
+          releaseValidate = () => resolve(null);
+          signal?.addEventListener('abort', () => { aborted = true; resolve(null); });
+        }),
+    });
+    const { port } = await hub.start();
+
+    const ws = await connect(port);
+    ws.send(pairRequest('t1'));
+    await new Promise((r) => setTimeout(r, 20)); // hello reached the parked validator
+    ws.close(); // client disconnects mid-validation
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(aborted).toBe(true);
+    releaseValidate();
+  });
+
+  it('a disconnect during createSession leaves no orphan session (#R7-5)', async () => {
+    let releaseCreate!: () => void;
+    const sessions = new Set<string>();
+    const revoked: string[] = [];
+    hub = new WsHub({
+      instance: 'test',
+      helloTimeoutMs: 5000, // the disconnect, not the timeout, drives cleanup
+      store: {
+        createSession: async (userId: string) => new Promise<string>((resolve) => {
+          releaseCreate = () => { sessions.add(`sess-${userId}`); resolve(`sess-${userId}`); };
+        }),
+        verifySession: async (t: string) => (sessions.has(t) ? 'u1' : null),
+        revokeUser: async () => {},
+        revokeSession: async (t: string) => { revoked.push(t); sessions.delete(t); },
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    await new Promise((r) => setTimeout(r, 20)); // hello parked in createSession
+    ws.close(); // client disconnects
+    await new Promise((r) => setTimeout(r, 20));
+    releaseCreate(); // createSession resolves AFTER the disconnect
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The session minted for the gone connection was revoked — no orphan.
+    expect(revoked).toContain('sess-u1');
+    expect(sessions.has('sess-u1')).toBe(false);
+  });
+
+  it('the abort-path cleanup does not user-wide revoke when the store lacks revokeSession (#R7-5)', async () => {
+    // A store without revokeSession must NOT have revokeUser called on the
+    // abort path — that would kill a concurrent legitimate session of the
+    // same user. The orphan is left to expire instead.
+    let releaseCreate!: () => void;
+    let revokeUserCalls = 0;
+    hub = new WsHub({
+      instance: 'test',
+      helloTimeoutMs: 5000,
+      store: {
+        createSession: async () => new Promise<string>((resolve) => { releaseCreate = () => resolve('sess-1'); }),
+        verifySession: async () => null,
+        revokeUser: async () => { revokeUserCalls += 1; },
+        // no revokeSession
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    await new Promise((r) => setTimeout(r, 20));
+    ws.close();
+    await new Promise((r) => setTimeout(r, 20));
+    releaseCreate();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(revokeUserCalls).toBe(0); // never user-wide revoked on the abort path
+  });
 });
