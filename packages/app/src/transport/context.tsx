@@ -10,6 +10,7 @@ import { WsClientTransport } from '@raccoon/transport-ws';
 import { kvGet, kvSet, wipeKvExceptSession } from '../lib/idb.js';
 import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
+import * as approvals from '../lib/approvals.js';
 import { clearSessionIfMatches, loadSession, saveSession, type Session } from '../lib/session.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
 import type { AppTransport, MakeTransport } from './types.js';
@@ -245,6 +246,10 @@ export function TransportProvider(props: TransportProviderProps) {
     else if (env.kind === 'approval.request') {
       dispatch({ type: 'approval', env, active: isActive(env.channel) });
       if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
+      // #R8-1: persist the request under this identity scope so a reload can
+      // re-render the interactive card (server history keeps it only as text).
+      const scope = identityScopeRef.current;
+      if (scope) void approvals.saveApproval(scope, env).catch(() => { /* durability best-effort */ });
     }
     else if (env.kind === 'ack') {
       // The server responded for this envelope — stop the local no-ack
@@ -280,7 +285,18 @@ export function TransportProvider(props: TransportProviderProps) {
         });
       }
       else if (st === 'failed') void outbox.failByServer(refId);
-      else void outbox.settle(refId);
+      else {
+        // Terminal success. If this ack settles an approval RESPONSE, prune
+        // the durable approval REQUEST (#R8-1) so a later reload does not
+        // re-render an already-answered card as un-answered (double-response
+        // risk). Read the row BEFORE settle() deletes it to recover the
+        // approval refId, and prune under the row's OWN scope.
+        void outbox.getEntry(refId).then((entry) => {
+          if (entry?.env.kind === 'approval.response' && entry.scope) {
+            void approvals.deleteApproval(entry.scope, entry.env.payload.refId).catch(() => {});
+          }
+        }).finally(() => { void outbox.settle(refId); });
+      }
       dispatch({ type: 'ack', channel: env.channel, refId, status: env.payload.status });
     } else if (env.kind === 'history.page') {
       const channel = env.payload.channel;
@@ -294,26 +310,36 @@ export function TransportProvider(props: TransportProviderProps) {
           lastRead,
           active: isActive(channel),
         });
-        // #R7-2: history carries the approval REQUEST but not this device's
-        // local response state (respondedChoice/responseEnvId), which a reload
-        // dropped. Rehydrate it from the DURABLE outbox rows so a failed
-        // response still shows its retry card, and a still-processing one
-        // still shows as sent. Dispatched AFTER 'history' so the approval
-        // messages exist for the reconcile to attach onto.
-        void outbox.listForChannel(channel).then((rows) => {
-          const responses = rows
-            .filter((r) => r.env.kind === 'approval.response' && (r.status === 'failed' || r.status === 'processing'))
-            .map((r) => {
-              const p = (r.env as AnyEnvelope & { kind: 'approval.response' }).payload;
-              return {
-                refId: p.refId,
-                choice: p.choice,
-                responseId: r.id,
-                editedText: p.editedText,
-                delivery: (r.status === 'failed' ? 'failed' : 'sent') as 'failed' | 'sent',
-              };
-            });
-          if (responses.length > 0) dispatch({ type: 'reconcile-responses', channel, responses });
+        // #R8-1 / #R7-2: a reload loses the interactive approval CARD (history
+        // reconstructs the request only as text) and this device's local
+        // response state. Rebuild both from durable, IDENTITY-SCOPED stores:
+        //  1. Re-render the approval cards from the approvals store (scoped by
+        //     key), REPLACING the history text rows — so there is a card for
+        //     the response reconcile to attach onto.
+        //  2. Rehydrate responded/failed state from the SCOPED outbox rows so
+        //     a failed response shows its retry card and a still-processing
+        //     one shows as sent.
+        // Both are scoped to the current identity so a different paired user's
+        // rows can never attach here. Ordered: cards first, then responses.
+        const scope = identityScopeRef.current;
+        if (!scope) return;
+        void approvals.listApprovals(scope, channel).then((stored) => {
+          if (stored.length > 0) dispatch({ type: 'reconcile-approvals', channel, approvals: stored.map((a) => a.env) });
+          void outbox.listForChannel(channel, scope).then((rows) => {
+            const responses = rows
+              .filter((r) => r.env.kind === 'approval.response' && (r.status === 'failed' || r.status === 'processing'))
+              .map((r) => {
+                const p = (r.env as AnyEnvelope & { kind: 'approval.response' }).payload;
+                return {
+                  refId: p.refId,
+                  choice: p.choice,
+                  responseId: r.id,
+                  editedText: p.editedText,
+                  delivery: (r.status === 'failed' ? 'failed' : 'sent') as 'failed' | 'sent',
+                };
+              });
+            if (responses.length > 0) dispatch({ type: 'reconcile-responses', channel, responses });
+          });
         });
       });
     }
@@ -495,6 +521,9 @@ export function TransportProvider(props: TransportProviderProps) {
       wipedScope ? clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))) : Promise.resolve(false),
       wipeKvExceptSession(),
       wipedScope ? outbox.clearScope(wipedScope) : Promise.resolve(),
+      // #R8-1: drop this identity's durable approval requests too, so a
+      // re-pair as a different user cannot re-render the prior user's cards.
+      wipedScope ? approvals.clearApprovalsForScope(wipedScope) : Promise.resolve(),
     ]);
     dispatch({ type: 'reset' });
   }, []);

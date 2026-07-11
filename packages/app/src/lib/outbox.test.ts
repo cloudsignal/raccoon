@@ -78,6 +78,17 @@ describe('outbox', () => {
     expect(rows.some((r) => r.id === theirs.id)).toBe(true); // another identity's row survives
   });
 
+  it('listForChannel(channel, scope) returns only that identity\'s rows; getEntry reads one (#R8-1)', async () => {
+    const mine = await outbox.enqueue(msg('mine'), SCOPE);
+    const theirs = await outbox.enqueue(msg('theirs'), 'other-scope');
+    const scoped = await outbox.listForChannel('coordinator', SCOPE);
+    expect(scoped.map((r) => r.id)).toEqual([mine.id]); // foreign row excluded
+    // Unscoped still returns everything (back-compat for callers that pass none).
+    expect((await outbox.listForChannel('coordinator')).length).toBe(2);
+    expect((await outbox.getEntry(theirs.id))!.scope).toBe('other-scope');
+    expect(await outbox.getEntry('nope')).toBeUndefined();
+  });
+
   it('recoverProcessing re-drives only this identity\'s processing rows (#R7-3)', async () => {
     const mine = await outbox.enqueue(approvalResp(), SCOPE);
     await outbox.markSending(mine.id, TAB, SCOPE);

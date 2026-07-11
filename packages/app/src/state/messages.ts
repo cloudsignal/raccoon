@@ -57,6 +57,13 @@ export type ChatAction =
   // are lost; server history carries the approval REQUEST but not the local
   // response state), so a failed response still shows its retry card.
   | { type: 'reconcile-responses'; channel: string; responses: Array<{ refId: string; choice: string; responseId: string; editedText?: string; delivery: Delivery }> }
+  // #R8-1: re-render approval CARDS from the durable, identity-scoped
+  // approvals store after a reload. Server history reconstructs an
+  // approval.request only as a text row, so without this the interactive
+  // card (and its retry affordance) is lost. REPLACES a same-id history text
+  // row with the card; never clobbers an already-live approval card (which
+  // may carry in-memory response state on a reconnect).
+  | { type: 'reconcile-approvals'; channel: string; approvals: Envelope<'approval.request'>[] }
   | { type: 'read-channel'; channel: string }
   | { type: 'reset' };
 
@@ -219,6 +226,32 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           : m,
       );
       return patch(state, action.channel, list);
+    }
+    case 'reconcile-approvals': {
+      if (action.approvals.length === 0) return state;
+      const existing = state.messages[action.channel] ?? [];
+      const byId = new Map(existing.map((m) => [m.id, m]));
+      let changed = false;
+      for (const env of action.approvals) {
+        const prior = byId.get(env.id);
+        // Leave a live approval card untouched — it may carry in-memory
+        // response state a reconnect must not wipe.
+        if (prior && prior.kind === 'approval') continue;
+        const from = parseAddress(env.from);
+        byId.set(env.id, {
+          id: env.id,
+          channel: action.channel,
+          role: 'agent',
+          sender: from.id ?? action.channel,
+          kind: 'approval',
+          text: env.payload.description,
+          approval: { ...env.payload },
+          ts: env.ts,
+        });
+        changed = true;
+      }
+      if (!changed) return state;
+      return patch(state, action.channel, [...byId.values()].sort(byTs));
     }
     case 'reconcile-responses': {
       if (action.responses.length === 0) return state;

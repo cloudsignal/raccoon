@@ -131,9 +131,23 @@ export async function listPending(): Promise<OutboxEntry[]> {
   return all.filter((e) => e.status === 'pending').sort(byCreatedAt);
 }
 
-export async function listForChannel(channel: string): Promise<OutboxEntry[]> {
+/** One entry by id, or undefined. Read-only. */
+export async function getEntry(id: string): Promise<OutboxEntry | undefined> {
+  return withStore<OutboxEntry | undefined>('outbox', 'readonly', (s) => s.get(id) as IDBRequest<OutboxEntry | undefined>);
+}
+
+/**
+ * Rows for `channel`. When `scope` is given, only rows enqueued under THAT
+ * identity (#R8-1): the outbox is a shared per-origin store, so an unscoped
+ * read would surface another paired identity's rows and let a reconcile
+ * attach a foreign response onto this identity's approval cards. Rows with no
+ * scope (pre-#R5-3) match nothing when a scope filter is supplied.
+ */
+export async function listForChannel(channel: string, scope?: string): Promise<OutboxEntry[]> {
   const all = await getAll();
-  return all.filter((e) => e.channel === channel).sort(byCreatedAt);
+  return all
+    .filter((e) => e.channel === channel && (scope === undefined || e.scope === scope))
+    .sort(byCreatedAt);
 }
 
 /** Shared get-then-put: reads the entry, computes the next version via

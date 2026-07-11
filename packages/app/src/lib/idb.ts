@@ -1,5 +1,11 @@
 const DB_NAME = 'raccoon-app';
-const DB_VERSION = 1;
+// v2 (#R8-1): added the 'approvals' store — a durable, identity-scoped record
+// of approval REQUESTS so a reload can re-render the approval card (server
+// history carries the request only as text, with no way to reconstruct the
+// interactive card).
+const DB_VERSION = 2;
+
+type StoreName = 'kv' | 'outbox' | 'approvals';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -14,6 +20,10 @@ function openDb(): Promise<IDBDatabase> {
         const outbox = db.createObjectStore('outbox', { keyPath: 'id' });
         outbox.createIndex('channel', 'channel');
       }
+      if (!db.objectStoreNames.contains('approvals')) {
+        const approvals = db.createObjectStore('approvals', { keyPath: 'key' });
+        approvals.createIndex('channel', 'channel');
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -22,7 +32,7 @@ function openDb(): Promise<IDBDatabase> {
 }
 
 export async function withStore<T>(
-  store: 'kv' | 'outbox',
+  store: StoreName,
   mode: IDBTransactionMode,
   fn: (s: IDBObjectStore) => IDBRequest<T> | void,
 ): Promise<T> {
@@ -63,7 +73,7 @@ export function promisifyRequest<T>(req: IDBRequest<T>): Promise<T> {
  * interleaved by anything.
  */
 export function withTransaction<T>(
-  store: 'kv' | 'outbox',
+  store: StoreName,
   mode: IDBTransactionMode,
   fn: (s: IDBObjectStore) => Promise<T>,
 ): Promise<T> {

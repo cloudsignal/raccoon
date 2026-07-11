@@ -188,6 +188,41 @@ describe('chatReducer', () => {
     expect(state.messages['coordinator']![0]!.delivery).toBe('sent');
   });
 
+  it('reconcile-approvals replaces a history text row with the interactive card (#R8-1)', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft', description: 'approve this?', options: ['approve', 'skip'] },
+    });
+    // Reload: history reconstructed the approval only as a text row (same id).
+    let state = chatReducer(emptyChatState, {
+      type: 'history', channel: 'coordinator', agentId: 'coordinator',
+      messages: [{ id: env.id, role: 'agent', text: 'approve this?', ts: env.ts }],
+    });
+    expect(state.messages['coordinator']![0]!.kind).toBe('text');
+
+    state = chatReducer(state, { type: 'reconcile-approvals', channel: 'coordinator', approvals: [env] });
+    const m = state.messages['coordinator']![0]!;
+    expect(m.kind).toBe('approval');
+    expect(m.approval?.refId).toBe('task-9');
+    expect(m.approval?.options).toEqual(['approve', 'skip']);
+    // No duplicate row for the same id.
+    expect(state.messages['coordinator']).toHaveLength(1);
+  });
+
+  it('reconcile-approvals does NOT clobber a live approval card with response state (#R8-1)', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft', description: 'x', options: ['approve'] },
+    });
+    let state = chatReducer(emptyChatState, { type: 'approval', env, active: true });
+    state = chatReducer(state, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve', responseId: 'resp-1' });
+    // A reconnect re-runs reconcile-approvals; the live card's in-memory
+    // response state must survive.
+    state = chatReducer(state, { type: 'reconcile-approvals', channel: 'coordinator', approvals: [env] });
+    expect(state.messages['coordinator']![0]!.respondedChoice).toBe('approve');
+    expect(state.messages['coordinator']![0]!.responseEnvId).toBe('resp-1');
+  });
+
   it('sorts merged history + live by ts', () => {
     let state = chatReducer(emptyChatState, { type: 'message', env: agentMsg('live'), active: true });
     state = chatReducer(state, {
