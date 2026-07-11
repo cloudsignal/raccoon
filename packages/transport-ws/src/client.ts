@@ -97,6 +97,10 @@ export class WsClientTransport implements Transport {
       this.ws = ws;
       this.setStatus('connecting');
       let settled = false;
+      // #R10: the adopted grant, stashed until the hub ACKs pair.confirmed.
+      // Success (established/grantHandlers/resolve) is DEFERRED until then, so a
+      // lost/failed confirm never reports a false "paired".
+      let pendingGrant: Envelope<'pair.grant'> | null = null;
 
       ws.addEventListener('open', () => {
         if (this.opts.session) {
@@ -122,19 +126,27 @@ export class WsClientTransport implements Transport {
           }
           const env = tryParseEnvelope(parsed);
           if (env?.kind === 'pair.grant') {
+            // Adopt the session token and CONFIRM, but DEFER success: the hub
+            // ACKs pair.confirmed only after it actually promotes the session.
+            // A client whose socket closed in the lost-grant window never
+            // reaches here (its provisional session is TTL-reaped); one whose
+            // confirm/promotion fails never gets the ACK, so connect() rejects
+            // on close instead of falsely reporting paired (#R10).
             this.opts = { ...this.opts, session: env.payload.sessionToken, pairingToken: undefined };
-            // #P1-C: affirmatively confirm the grant so the hub promotes the
-            // provisional session to durable/resumable. A client whose socket
-            // closed in the lost-grant window never reaches this branch, so
-            // never confirms — its provisional session is TTL-reaped instead
-            // of becoming a resumable orphan.
+            pendingGrant = env;
             try {
               ws.send(JSON.stringify(createEnvelope('pair.confirm', {
                 from: 'system', to: 'system', channel: 'pairing',
                 payload: { sessionToken: env.payload.sessionToken },
               })));
-            } catch { /* best-effort; a lost confirm is backstopped by the provisional TTL */ }
-            for (const h of this.grantHandlers) h(env);
+            } catch { /* best-effort; a lost confirm surfaces as connect() rejecting on close */ }
+            return;
+          }
+          if (env?.kind === 'pair.confirmed' && pendingGrant && env.payload.sessionToken === pendingGrant.payload.sessionToken) {
+            // #R10: the hub promoted the session — NOW report success.
+            const granted = pendingGrant;
+            pendingGrant = null;
+            for (const h of this.grantHandlers) h(granted);
             this.established();
             if (!settled) { settled = true; resolve(); }
             return;

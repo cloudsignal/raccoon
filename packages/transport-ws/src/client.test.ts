@@ -48,6 +48,34 @@ describe('WsClientTransport', () => {
     expect(fromHub.map((e) => e.kind)).toContain('ack');
   });
 
+  it('connect() does NOT report open until the hub ACKs pair.confirmed (deferred success, #R10)', async () => {
+    // A store that never promotes → the hub never sends pair.confirmed, so a
+    // transient confirm/store failure must surface as a NON-open connection,
+    // not a false "paired".
+    const sessions = new Map<string, string>();
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async (u: string) => { const t = `tok-${u}`; sessions.set(t, u); return t; },
+        verifySession: async (t: string) => sessions.get(t) ?? null,
+        confirmSession: async () => false, // never promotes → never ACKs
+        revokeUser: async () => {},
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest' });
+    const statuses: TransportStatus[] = [];
+    client.onStatus((s) => statuses.push(s));
+    let resolved = false;
+    const connectP = client.connect().then(() => { resolved = true; }).catch(() => { /* rejects on close */ });
+    await new Promise((r) => setTimeout(r, 150)); // ample for grant + confirm round-trip
+    expect(resolved).toBe(false); // no pair.confirmed → success deferred
+    expect(statuses).not.toContain('open');
+    await client.close();
+    await connectP;
+  });
+
   it('resumes with a session token', async () => {
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();
@@ -102,7 +130,7 @@ describe('WsClientTransport', () => {
     hub = new WsHub({ instance: 'test', port, store: {
       createSession: async () => { throw new Error('unused'); },
       verifySession: async (t) => (t === session ? 'u1' : null),
-      confirmSession: async () => {},
+      confirmSession: async () => true,
       revokeUser: async () => {},
     }});
     await hub.start();
@@ -143,7 +171,7 @@ describe('WsClientTransport', () => {
     hub = new WsHub({ instance: 'test', port, store: {
       createSession: async () => { throw new Error('unused'); },
       verifySession: async (t) => (t === session ? 'u1' : null),
-      confirmSession: async () => {},
+      confirmSession: async () => true,
       revokeUser: async () => {},
     }});
     await hub.start();

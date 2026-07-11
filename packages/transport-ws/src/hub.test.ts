@@ -156,6 +156,40 @@ describe('WsHub pairing', () => {
     expect(await nextClose(resumed)).toBe(4401); // B stayed provisional
   });
 
+  it('ACKs a real confirm with pair.confirmed echoing the session token (#R10)', async () => {
+    hub = new WsHub({ instance: 'test' });
+    const { port } = await hub.start();
+    const ws = await connect(port);
+    ws.send(pairRequest(hub.issuePairingToken('u1')));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    confirmGrant(ws, grant.payload.sessionToken);
+    const confirmed = await nextMessage(ws); // hub's promotion ACK
+    expect(confirmed.kind).toBe('pair.confirmed');
+    if (confirmed.kind === 'pair.confirmed') expect(confirmed.payload.sessionToken).toBe(grant.payload.sessionToken);
+    ws.close();
+  });
+
+  it('does NOT ACK (or promote) a confirm for an EXPIRED provisional session (#R10)', async () => {
+    hub = new WsHub({ instance: 'test', provisionalSessionTtlMs: 20 });
+    const { port } = await hub.start();
+    const ws = await connect(port);
+    ws.send(pairRequest(hub.issuePairingToken('u1')));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    await tick(40); // provisional TTL lapses BEFORE the confirm
+    let confirmedSeen = false;
+    ws.on('message', (d) => { if (JSON.parse(d.toString()).kind === 'pair.confirmed') confirmedSeen = true; });
+    confirmGrant(ws, grant.payload.sessionToken);
+    await tick(30);
+    expect(confirmedSeen).toBe(false); // expired → no promotion, no ACK
+    ws.close();
+    // And the session is not resumable (was never promoted).
+    const resumed = await connect(port);
+    resumed.send(JSON.stringify({ session: grant.payload.sessionToken }));
+    expect(await nextClose(resumed)).toBe(4401);
+  });
+
   it('revokeUser closes live sockets with 4403 and kills the session', async () => {
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();
@@ -246,7 +280,7 @@ describe('WsHub pairing', () => {
           return token;
         },
         verifySession: async (t) => sessions.get(t) ?? null,
-        confirmSession: async () => {},
+        confirmSession: async () => true,
         revokeUser: async (userId) => {
           for (const [t, u] of sessions) if (u === userId) sessions.delete(t);
         },
@@ -309,7 +343,7 @@ describe('WsHub pairing', () => {
       store: {
         createSession: async () => 'unused',
         verifySession: async () => verifyGate,
-        confirmSession: async () => {},
+        confirmSession: async () => true,
         revokeUser: async () => {},
       },
     });
@@ -369,7 +403,7 @@ describe('WsHub pairing', () => {
       store: {
         createSession: async () => { throw new Error('unused'); },
         verifySession: async () => { throw new Error('db outage'); },
-        confirmSession: async () => {},
+        confirmSession: async () => true,
         revokeUser: async () => {},
       },
     });
@@ -704,7 +738,7 @@ describe('WsHub pairing', () => {
           return t;
         },
         verifySession: async (t: string) => (sessions.has(t) ? 'u1' : null),
-        confirmSession: async () => {},
+        confirmSession: async () => true,
         revokeUser: async () => {},
         revokeSession: async (t: string) => { revoked.push(t); sessions.delete(t); },
       },
@@ -769,7 +803,7 @@ describe('WsHub pairing', () => {
           releaseCreate = () => { sessions.add(`sess-${userId}`); resolve(`sess-${userId}`); };
         }),
         verifySession: async (t: string) => (sessions.has(t) ? 'u1' : null),
-        confirmSession: async () => {},
+        confirmSession: async () => true,
         revokeUser: async () => {},
         revokeSession: async (t: string) => { revoked.push(t); sessions.delete(t); },
       },
@@ -802,7 +836,7 @@ describe('WsHub pairing', () => {
       store: {
         createSession: async () => new Promise<string>((resolve) => { releaseCreate = () => resolve('sess-1'); }),
         verifySession: async () => null,
-        confirmSession: async () => {},
+        confirmSession: async () => true,
         revokeUser: async () => { revokeUserCalls += 1; },
         // no revokeSession
       },

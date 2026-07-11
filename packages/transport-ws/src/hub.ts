@@ -533,33 +533,42 @@ export class WsHub {
       // out the replacement Set, disconnecting the just-reconnected user.
       if (set!.size === 0 && this.byUser.get(userId) === set) this.byUser.delete(userId);
     });
-    ws.on('message', (data) => {
-      // R5-6: current byUser membership IS the authorization, checked per
-      // frame — not the fact that this listener was once attached.
-      // revokeUser() removes the socket from byUser synchronously but only
-      // STARTS a graceful close; until the close handshake completes, frames
-      // (including ones already buffered in flight) still reach this
-      // listener. Without this gate they were dispatched as the revoked
-      // user: a buffered push.subscribe could recreate a subscription
-      // clearForUser had just removed, and ordinary frames could run whole
-      // agent turns post-revoke.
-      if (!this.byUser.get(userId)?.has(ws)) return;
-      let parsed: unknown;
-      try { parsed = JSON.parse(data.toString()); } catch { return; }
-      const env = tryParseEnvelope(parsed);
-      if (!env) return;
-      // #P1-C: the client's confirmation that it received/adopted the grant.
-      // Promote the PROVISIONAL session to durable, but ONLY if the token
-      // matches THIS socket's own provisional token — so a socket cannot
-      // confirm (and thereby make resumable) a session minted for a different
-      // pairing. Never forwarded to app handlers.
-      if (env.kind === 'pair.confirm') {
-        if (provisionalToken && env.payload.sessionToken === provisionalToken) {
-          void this.store.confirmSession(provisionalToken).catch(() => {});
+    ws.on('message', (data) => { void this.onSocketMessage(ws, userId, data, provisionalToken); });
+  }
+
+  private async onSocketMessage(ws: WebSocket, userId: string, data: unknown, provisionalToken?: string): Promise<void> {
+    // R5-6: current byUser membership IS the authorization, checked per
+    // frame — not the fact that this listener was once attached.
+    // revokeUser() removes the socket from byUser synchronously but only
+    // STARTS a graceful close; until the close handshake completes, frames
+    // (including ones already buffered in flight) still reach this
+    // listener. Without this gate they were dispatched as the revoked
+    // user: a buffered push.subscribe could recreate a subscription
+    // clearForUser had just removed, and ordinary frames could run whole
+    // agent turns post-revoke.
+    if (!this.byUser.get(userId)?.has(ws)) return;
+    let parsed: unknown;
+    try { parsed = JSON.parse(String(data)); } catch { return; }
+    const env = tryParseEnvelope(parsed);
+    if (!env) return;
+    // #P1-C/#R10: the client's confirmation that it adopted the grant. Promote
+    // the PROVISIONAL session to durable, but ONLY if the token matches THIS
+    // socket's own provisional token (no cross-session promotion). ACK with
+    // pair.confirmed ONLY on a REAL promotion (an unexpired session) so the
+    // client reports "paired" only when the session will actually resume.
+    // Never forwarded to app handlers.
+    if (env.kind === 'pair.confirm') {
+      if (provisionalToken && env.payload.sessionToken === provisionalToken) {
+        const promoted = await this.store.confirmSession(provisionalToken).catch(() => false);
+        if (promoted && this.byUser.get(userId)?.has(ws) && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify(createEnvelope('pair.confirmed', {
+            from: 'system', to: userAddress(userId), channel: 'pairing',
+            payload: { sessionToken: provisionalToken },
+          })));
         }
-        return;
       }
-      for (const h of this.handlers) h(env, userId);
-    });
+      return;
+    }
+    for (const h of this.handlers) h(env, userId);
   }
 }

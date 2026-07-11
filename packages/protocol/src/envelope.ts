@@ -83,6 +83,13 @@ const pairRequestPayload = z.object({ token: z.string().min(1), device: z.string
 // a live orphan that also burned a one-time pairing token.
 const pairConfirmPayload = z.object({ sessionToken: z.string().min(1) });
 
+// #R10: the hub's ACK that a pair.confirm actually PROMOTED an unexpired
+// provisional session to durable. The client defers reporting "paired" (and
+// persisting the session) until it receives this — so a transient
+// confirm/store failure surfaces as an honest pairing failure instead of a
+// "paired successfully" state backed by a session that will never resume.
+const pairConfirmedPayload = z.object({ sessionToken: z.string().min(1) });
+
 const pairGrantPayload = z.object({
   sessionToken: z.string().min(1),
   userId: z.string().min(1),
@@ -100,7 +107,7 @@ const pushSubscribePayload = z.object({
 
 const pushUnsubscribePayload = z.object({ endpoint: z.string().url() });
 
-export type Kind = 'msg' | 'ack' | 'typing' | 'presence' | 'approval.request' | 'approval.response' | 'history.request' | 'history.page' | 'pair.request' | 'pair.grant' | 'pair.confirm' | 'push.subscribe' | 'push.unsubscribe';
+export type Kind = 'msg' | 'ack' | 'typing' | 'presence' | 'approval.request' | 'approval.response' | 'history.request' | 'history.page' | 'pair.request' | 'pair.grant' | 'pair.confirm' | 'pair.confirmed' | 'push.subscribe' | 'push.unsubscribe';
 
 const envelopeSchema = z.discriminatedUnion('kind', [
   base.extend({ kind: z.literal('msg'), payload: msgPayload }),
@@ -114,6 +121,7 @@ const envelopeSchema = z.discriminatedUnion('kind', [
   base.extend({ kind: z.literal('pair.request'), payload: pairRequestPayload }),
   base.extend({ kind: z.literal('pair.grant'), payload: pairGrantPayload }),
   base.extend({ kind: z.literal('pair.confirm'), payload: pairConfirmPayload }),
+  base.extend({ kind: z.literal('pair.confirmed'), payload: pairConfirmedPayload }),
   base.extend({ kind: z.literal('push.subscribe'), payload: pushSubscribePayload }),
   base.extend({ kind: z.literal('push.unsubscribe'), payload: pushUnsubscribePayload }),
 ]);

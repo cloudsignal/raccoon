@@ -18,10 +18,14 @@ export interface CredentialStore {
   createSession(userId: string): Promise<string>;
   /**
    * Promote a provisional session to durable/resumable (#P1-C). Called when the
-   * hub receives the client's pair.confirm for this token. Idempotent; a no-op
-   * for an unknown token.
+   * hub receives the client's pair.confirm for this token. Returns whether an
+   * UNEXPIRED session was actually promoted (#R10): false for an unknown token
+   * OR one whose provisional TTL already lapsed (which it also reaps) — the hub
+   * ACKs (pair.confirmed) only on a true promotion, so the client never reports
+   * "paired" on a session that will never resume. Idempotent: an
+   * already-confirmed token returns true.
    */
-  confirmSession(token: string): Promise<void>;
+  confirmSession(token: string): Promise<boolean>;
   /** Resolve a token to its userId — ONLY for a CONFIRMED, non-expired session
    *  (#P1-C). Returns null for an unknown, unconfirmed, or expired-provisional
    *  token. */
@@ -56,9 +60,16 @@ export class MemoryCredentialStore implements CredentialStore {
     return token;
   }
 
-  async confirmSession(token: string): Promise<void> {
+  async confirmSession(token: string): Promise<boolean> {
     const rec = this.sessions.get(token);
-    if (rec) rec.confirmed = true; // durable; expiry no longer consulted (see verifySession)
+    if (!rec) return false;
+    if (rec.confirmed) return true; // idempotent
+    // #R10: do NOT promote an already-EXPIRED provisional session — verifySession
+    // stops consulting expiry once confirmed, so promoting an expired record
+    // would resurrect it as durable. Reap it and report no promotion.
+    if (Date.now() > rec.expiresAt) { this.sessions.delete(token); return false; }
+    rec.confirmed = true; // durable; expiry no longer consulted (see verifySession)
+    return true;
   }
 
   async verifySession(token: string): Promise<string | null> {
