@@ -296,8 +296,19 @@ export async function settleResponseAndPruneApproval(id: string): Promise<void> 
     const entry = await promisifyRequest(outboxStore.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
     if (entry.env.kind === 'approval.response' && entry.scope) {
+      // #R10: leave an ANSWERED TOMBSTONE at the approval key rather than
+      // deleting it, so a late/redelivered approval.request for the same refId
+      // can't re-create an unanswered card on reload. Read the live record (if
+      // any) and drop its env, keeping a minimal marker. Excluded from
+      // listApprovals; cleared on wipe.
       const approvalRefId = (entry.env as AnyEnvelope & { kind: 'approval.response' }).payload.refId;
-      await promisifyRequest(tx.objectStore('approvals').delete(approvalKeyOf(entry.scope, approvalRefId)));
+      const approvalsStore = tx.objectStore('approvals');
+      const key = approvalKeyOf(entry.scope, approvalRefId);
+      const existing = await promisifyRequest(approvalsStore.get(key) as IDBRequest<{ ts?: string } | undefined>);
+      await promisifyRequest(approvalsStore.put({
+        key, scope: entry.scope, channel: entry.channel, refId: approvalRefId,
+        answered: true, ts: existing?.ts ?? entry.createdAt,
+      }));
     }
     await promisifyRequest(outboxStore.delete(id));
     return entry.channel;
@@ -360,7 +371,15 @@ export async function failProcessing(id: string): Promise<boolean> {
  *  retryable 'failed' row (see retry()). */
 export async function failByServer(id: string): Promise<void> {
   const entry = await mutate(id, (entry) => (
-    { ...entry, status: 'failed', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
+    // #R10: durable status transitions are advance-only. A 'stalled' row is
+    // terminal-and-UNKNOWN (a still-running turn) — a reordered/duplicate
+    // server 'failed' ack must NOT regress it to retryable 'failed' (which
+    // #P1-A's stalled exists to prevent, else a reload re-arms a one-tap retry
+    // that could double side effects). Leave stalled; idempotent no-op if
+    // already failed.
+    entry.status === 'stalled'
+      ? undefined
+      : { ...entry, status: 'failed', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
   ));
   if (entry) notify(entry.channel);
 }
@@ -373,9 +392,12 @@ export async function failByServer(id: string): Promise<void> {
  *  effects. */
 export async function markStalled(id: string): Promise<void> {
   const entry = await mutate(id, (entry) => (
-    // Don't clobber an already-terminal-success row (a 'delivered' settle
-    // deletes it, so this only ever sees processing/sending here).
-    { ...entry, status: 'stalled', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
+    // #R10: advance-only. A reordered/late 'stalled' ack must NOT overwrite a
+    // row already terminally 'failed' (that would hide a legitimate retry
+    // affordance). Leave failed; idempotent no-op if already stalled.
+    entry.status === 'failed'
+      ? undefined
+      : { ...entry, status: 'stalled', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
   ));
   if (entry) notify(entry.channel);
 }

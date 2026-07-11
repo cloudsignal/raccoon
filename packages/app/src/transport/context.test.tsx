@@ -146,6 +146,41 @@ describe('TransportProvider', () => {
     await act(async () => { await unpairing; });
   });
 
+  it('unpair completes even if the host push disable() throws SYNCHRONOUSLY (#R10)', async () => {
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
+    const transport = new FakeTransport();
+    render(
+      <TransportProvider
+        makeTransport={() => transport}
+        pushRegistrarOverride={{ enable: async () => true, disable: () => { throw new Error('sync boom'); } }}
+      >
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(api.phase).toBe('ready'));
+    // A synchronous throw from disable() must be caught inside the bounded
+    // cleanup, not escape unpair() — the promise resolves and we reach setup.
+    await act(async () => { await api.unpair(); });
+    expect(api.phase).toBe('setup');
+    expect(await loadSession()).toBeNull();
+  });
+
+  it('a history.page arriving after the identity is wiped is dropped (null-scope fence, #R10)', async () => {
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    act(() => { transport.authFail(4403); }); // wipe → identityScopeRef null, phase setup
+    await waitFor(() => expect(api.phase).toBe('setup'));
+    // A late history.page for the just-wiped identity must NOT repopulate state.
+    act(() => {
+      transport.emit(createEnvelope('history.page', {
+        from: 'system', to: 'user:u1', channel: 'coordinator',
+        payload: { channel: 'coordinator', messages: [{ id: 'h1', role: 'agent', text: 'ghost', ts: '2020-01-01T00:00:00.000Z' }] },
+      }));
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.state.messages['coordinator'] ?? []).toHaveLength(0);
+  });
+
   it('requeues a row stranded in "sending" by a crash/reload and sends it once the transport opens (#R3-8)', async () => {
     // Simulate a prior session that was killed mid-send: an outbox entry left
     // in 'sending' state with no chance to fire the transport's 'closed'

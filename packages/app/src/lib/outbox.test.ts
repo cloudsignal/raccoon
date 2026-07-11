@@ -171,6 +171,41 @@ describe('outbox', () => {
     expect((await outbox.getEntry(e.id))!.status).toBe('stalled');
   });
 
+  it('durable status transitions are advance-only: a reordered failed does not regress a stalled row, and vice-versa (#R10)', async () => {
+    const a = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(a.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(a.id); // → processing
+    await outbox.markStalled(a.id);
+    await outbox.failByServer(a.id); // a reordered/duplicate server 'failed'
+    expect((await outbox.getEntry(a.id))!.status).toBe('stalled'); // NOT regressed to retryable
+
+    const b = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(b.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(b.id);
+    await outbox.failByServer(b.id); // terminal failed
+    await outbox.markStalled(b.id);  // a late 'stalled' must not overwrite failed
+    expect((await outbox.getEntry(b.id))!.status).toBe('failed');
+  });
+
+  it('settleResponseAndPruneApproval leaves an ANSWERED tombstone; a later saveApproval does not resurrect it unanswered (#R10)', async () => {
+    const approvals = await import('./approvals.js');
+    const reqEnv = createEnvelope('approval.request', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'req-1', title: 'T', description: 'x', options: ['approve'] },
+    });
+    await approvals.saveApproval(SCOPE, reqEnv);
+    const row = await outbox.enqueue(approvalResp(), SCOPE); // approval.response, refId 'req-1'
+    await outbox.markSending(row.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(row.id);
+    await outbox.settleResponseAndPruneApproval(row.id); // delivered → tombstone
+    expect(await approvals.listApprovals(SCOPE, 'coordinator')).toHaveLength(0); // no live card
+
+    // A late/redelivered approval.request for the SAME refId must not re-create
+    // an unanswered card.
+    await approvals.saveApproval(SCOPE, reqEnv);
+    expect(await approvals.listApprovals(SCOPE, 'coordinator')).toHaveLength(0);
+  });
+
   it('recoverProcessing never re-drives a stalled row (#P1-A)', async () => {
     const e = await outbox.enqueue(approvalResp(), SCOPE);
     await outbox.markSending(e.id, TAB, SCOPE);

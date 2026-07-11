@@ -95,14 +95,17 @@ function withEpoch(s: Session): ActiveSession {
 // reconnectable session if the hoisted clear itself failed.
 const UNPAIR_CLEANUP_TIMEOUT_MS = 3_000;
 
-/** Resolve when `p` settles OR after `ms`, whichever is first — never rejects.
- *  The underlying `p` keeps running detached; the caller just stops waiting. */
-function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+/** Run `fn` and resolve when it settles OR after `ms`, whichever is first —
+ *  never rejects. #R10: takes a THUNK, not a value, so a SYNCHRONOUS throw from
+ *  `fn` (e.g. a host disable() that throws before returning a promise) is
+ *  caught here instead of escaping unpair(). The work keeps running detached;
+ *  the caller just stops waiting. */
+function settleWithinCall(fn: () => unknown, ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
     let done = false;
     const finish = () => { if (!done) { done = true; resolve(); } };
     const t = setTimeout(finish, ms);
-    void Promise.resolve(p).catch(() => {}).finally(() => { clearTimeout(t); finish(); });
+    void Promise.resolve().then(fn).catch(() => {}).finally(() => { clearTimeout(t); finish(); });
   });
 }
 
@@ -337,6 +340,11 @@ export function TransportProvider(props: TransportProviderProps) {
       // A's history/approvals/responses can never be dispatched into identity
       // B's (or a reset) UI.
       const fenceScope = identityScopeRef.current;
+      // #R10: bail immediately if there is NO identity. Otherwise a history.page
+      // arriving after a wipe (fenceScope===null) passes the `!==` fence
+      // (null!==null is false) and dispatches history into a reset state. There
+      // is no legitimate case for rendering history with no identity.
+      if (!fenceScope) return;
       void kvGet<string>(`lastread:${channel}`).then((lastRead) => {
         if (identityScopeRef.current !== fenceScope) return; // identity changed across the await
         dispatch({
@@ -361,7 +369,7 @@ export function TransportProvider(props: TransportProviderProps) {
         //     A still-'pending'/'sending' response omitted here would leave the
         //     card looking UNANSWERED, letting the user submit a second,
         //     competing response for the same refId.
-        if (!fenceScope) return; // no identity: nothing scoped to reconcile
+        // (fenceScope is non-null — the handler bailed at entry otherwise.)
         // #P1-E1 (adv-hardened): read BOTH stores first, then dispatch the card
         // and its response state in the SAME tick with no await between them.
         // Dispatching reconcile-approvals and then awaiting the outbox read
@@ -453,7 +461,12 @@ export function TransportProvider(props: TransportProviderProps) {
           // applied — a stale claim's timeout (row since re-claimed by
           // another tab) must not mark a live in-flight send failed.
           void outbox.markFailed(entry.id, 'no ack', claimToken).then((applied) => {
-            if (applied) dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
+            // #R10: route through the MONOTONIC 'ack' path (like #P1-E4), not
+            // the ungated 'delivery' action — a terminal 'delivered' ack that
+            // arrived while this timer's markFailed CAS was pending must not be
+            // regressed to 'failed'. advanceDelivery keeps the higher-rank
+            // delivered/read; matches m.id (msg) or m.responseEnvId (approval).
+            if (applied) dispatch({ type: 'ack', channel: entry.channel, refId: entry.id, status: 'failed' });
           });
         }, ACK_TIMEOUT_MS);
         ackTimers.current.set(entry.id, timer);
@@ -472,7 +485,8 @@ export function TransportProvider(props: TransportProviderProps) {
       // delivery === 'failed' — see message-bubble.tsx / approval-card.tsx).
       const status = await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed', claimToken);
       if (status === 'failed') {
-        dispatch({ type: 'delivery', channel: entry.channel, id: entry.id, delivery: 'failed' });
+        // #R10: monotonic 'ack' route (see the ACK_TIMEOUT note above).
+        dispatch({ type: 'ack', channel: entry.channel, refId: entry.id, status: 'failed' });
       }
     }
   }, []);
@@ -1127,11 +1141,11 @@ export function TransportProvider(props: TransportProviderProps) {
     // server unsubscribe cannot prevent wipeAndReset() from running its durable
     // clear retry. The cleanup keeps running detached; we just stop waiting.
     if (props.pushRegistrarOverride) {
-      await settleWithin(Promise.resolve(props.pushRegistrarOverride.disable?.()), UNPAIR_CLEANUP_TIMEOUT_MS);
+      await settleWithinCall(() => props.pushRegistrarOverride!.disable?.(), UNPAIR_CLEANUP_TIMEOUT_MS);
     } else if (userId && transport) {
       const env = browserPushEnv();
       if (env) {
-        await settleWithin(unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
+        await settleWithinCall(() => unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
       }
     }
 
@@ -1141,7 +1155,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // clearAll()/demoteSending() serialization in wipeAndReset()).
     for (const unsub of unsubsRef.current) unsub();
     unsubsRef.current = [];
-    await settleWithin(Promise.resolve(transportRef.current?.close()), UNPAIR_CLEANUP_TIMEOUT_MS);
+    await settleWithinCall(() => transportRef.current?.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
     transportRef.current = null;
     await wipeAndReset(wiped);
     // Guarded the same way as the auth-error path: skip if a newer wipe or a

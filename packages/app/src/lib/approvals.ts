@@ -1,5 +1,5 @@
 import type { Envelope } from '@raccoon/protocol';
-import { withStore } from './idb.js';
+import { promisifyRequest, withStore, withTransaction } from './idb.js';
 
 /**
  * Durable, identity-SCOPED store of approval REQUESTS (#R8-1).
@@ -22,9 +22,21 @@ export interface StoredApproval {
   scope: string;
   channel: string;
   refId: string;
-  env: Envelope<'approval.request'>;
+  /** The request envelope — present for a LIVE (renderable) record; omitted on
+   *  an answered tombstone (#R10). */
+  env?: Envelope<'approval.request'>;
   ts: string;
+  /** #R10: an ANSWERED tombstone. A settled ('delivered') response leaves this
+   *  marker at the key instead of deleting the record, so a late/redelivered
+   *  approval.request for the same refId cannot re-create it as an UNANSWERED
+   *  card on reload. Tombstones are excluded from listApprovals (a settled
+   *  approval needs no card — its outcome is the agent's reply in history) and
+   *  cleared on wipe. */
+  answered?: boolean;
 }
+
+/** A live (renderable) stored approval — env is guaranteed present. */
+export type LiveApproval = StoredApproval & { env: Envelope<'approval.request'> };
 
 /** The 'approvals' store primary key. Exported so a cross-store cleanup
  *  transaction (outbox.settleResponseAndPruneApproval, #P1-E2) can delete the
@@ -35,26 +47,31 @@ export function keyOf(scope: string, refId: string): string {
 
 export async function saveApproval(scope: string, env: Envelope<'approval.request'>): Promise<void> {
   const refId = env.payload.refId;
-  const record: StoredApproval = {
-    key: keyOf(scope, refId),
-    scope,
-    channel: env.channel,
-    refId,
-    env,
-    ts: env.ts,
-  };
-  await withStore('approvals', 'readwrite', (s) => { s.put(record); });
+  const key = keyOf(scope, refId);
+  // #R10: single-transaction get-then-put so a LATE/redelivered approval.request
+  // cannot overwrite an answered tombstone (which would resurrect a settled
+  // approval as an unanswered card on reload). If the key is already an
+  // answered tombstone, leave it.
+  await withTransaction('approvals', 'readwrite', async (s) => {
+    const existing = await promisifyRequest(s.get(key) as IDBRequest<StoredApproval | undefined>);
+    if (existing?.answered) return;
+    const record: StoredApproval = { key, scope, channel: env.channel, refId, env, ts: env.ts };
+    await promisifyRequest(s.put(record));
+  });
 }
 
-/** All stored approval requests for this identity scope + channel, oldest first. */
-export async function listApprovals(scope: string, channel: string): Promise<StoredApproval[]> {
+/** Live (renderable) stored approval requests for this identity scope +
+ *  channel, oldest first. Excludes answered tombstones (#R10). */
+export async function listApprovals(scope: string, channel: string): Promise<LiveApproval[]> {
   const all = await withStore<StoredApproval[]>('approvals', 'readonly', (s) => s.getAll() as IDBRequest<StoredApproval[]>);
   return all
-    .filter((a) => a.scope === scope && a.channel === channel)
+    .filter((a): a is LiveApproval => a.scope === scope && a.channel === channel && !a.answered && a.env !== undefined)
     .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 }
 
-/** Prune a settled approval (its response reached a terminal 'delivered'). */
+/** Prune a settled approval (its response reached a terminal 'delivered').
+ *  Deletes the record entirely — use this only where a tombstone is not needed;
+ *  the settle path uses a tombstone (outbox.settleResponseAndPruneApproval). */
 export async function deleteApproval(scope: string, refId: string): Promise<void> {
   await withStore('approvals', 'readwrite', (s) => { s.delete(keyOf(scope, refId)); });
 }
