@@ -321,6 +321,47 @@ describe('withPushFallback', () => {
     expect(sender.sent).toHaveLength(1); // delivered again after re-enrollment
   });
 
+  it('a re-subscribe does NOT un-fence an OLD delivery that was in flight across the revoke (#R7-4)', async () => {
+    const inner = new FakeHub();
+    const base = new InMemorySubscriptionStore();
+    await base.add('u1', sub('https://push.example/old'));
+
+    // Gate the OLD delivery's store snapshot so it is in flight; return the
+    // PRE-revoke snapshot on release so only the fence — not an emptied store
+    // — can stop it.
+    const gate: { release?: () => void } = {};
+    const snapshot = await base.list('u1');
+    const store = {
+      list: async (uid: string) => {
+        if (uid === 'u1' && !gate.release) {
+          await new Promise<void>((resolve) => { gate.release = resolve; });
+          return snapshot;
+        }
+        return base.list(uid);
+      },
+      add: (uid: string, s: PushSubscriptionJson) => base.add(uid, s),
+      remove: (uid: string, ep: string) => base.remove(uid, ep),
+      clear: (uid: string) => base.clear(uid),
+    };
+    const sender = new FakeSender();
+
+    const { hub, clearForUser } = withPushFallback(inner, { store, sender });
+    expect(hub.sendToUser('u1', msgTo('u1'))).toBe(false); // offline → OLD delivery starts, parks at gated snapshot
+    await new Promise((r) => setTimeout(r, 10));
+    expect(gate.release).toBeDefined();
+
+    await clearForUser('u1'); // revoke (bumps the generation)
+    // The user re-enrolls a NEW endpoint — this lifts `revoking` membership.
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system', payload: { subscription: sub('https://fcm.googleapis.com/fcm/send/new') },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 20));
+
+    gate.release!(); // release the OLD delivery: the generation moved, so it must still abort
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sender.sent.some((s) => s.sub.endpoint === 'https://push.example/old')).toBe(false);
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();

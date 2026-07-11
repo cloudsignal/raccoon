@@ -23,23 +23,31 @@ export function withPushFallback(
 ): { hub: PushCapableHub; stop(): void; clearForUser(userId: string): Promise<void> } {
   const notify = opts.notify ?? defaultNotify;
 
-  // #R6-6b: explicit per-user REVOKING state, not a generation counter. A
-  // counter only answered "did the generation change since I started", which
-  // a delivery beginning AFTER clearForUser could not use to fence itself —
-  // it captured the already-bumped value as its own baseline and delivered
-  // anyway (the reviewer's clearForUser();sendToUser(); repro). A membership
-  // test answers the real question — "is this user revoked right now" —
-  // for deliveries that start before OR after the revoke. clearForUser adds
-  // synchronously; a fresh push.subscribe (re-enrollment) removes, so a
-  // re-paired user's delivery works again.
+  // Per-user revocation fence, in TWO parts (#R6-6b + #R7-4):
+  //  - `revoking` membership: a user is fenced from clearForUser() until a
+  //    fresh push.subscribe (re-enrollment) lifts it. Fences deliveries that
+  //    START after a revoke and before a re-subscribe (#R6-6b).
+  //  - `revokeGen` monotonic per-user counter, bumped by clearForUser() and
+  //    NEVER reset by a re-subscribe. Each delivery captures it at start and
+  //    aborts if it changed. This closes the #R7-4 gap the membership test
+  //    alone had: a re-subscribe lifting `revoking` would otherwise un-fence
+  //    an OLD delivery that had snapshotted a now-cleared subscription before
+  //    the revoke — it would then send to the stale endpoint. The generation
+  //    stays bumped across the re-subscribe, so that old delivery stays
+  //    fenced, while a NEW delivery (started after re-subscribe, capturing the
+  //    new generation) proceeds.
   const revoking = new Set<string>();
+  const revokeGen = new Map<string, number>();
+  const genOf = (userId: string): number => revokeGen.get(userId) ?? 0;
 
   const pushOut = (userId: string, payload: PushPayload): void => {
     if (revoking.has(userId)) return; // fence deliveries that START after a revoke
-    // isStale re-checks before the snapshot and before EACH send, so a
-    // delivery already in flight when the revoke lands also aborts (the only
-    // send that can't be recalled is one already handed to the network).
-    void sendPushToUser(opts.store, opts.sender, userId, payload, () => revoking.has(userId));
+    const genAtStart = genOf(userId);
+    // isStale re-checks before the snapshot and before EACH send: a delivery
+    // in flight when a revoke lands (revoking set, or the generation moved
+    // even if since re-subscribed) aborts. The only send that can't be
+    // recalled is one already handed to the network.
+    void sendPushToUser(opts.store, opts.sender, userId, payload, () => revoking.has(userId) || genOf(userId) !== genAtStart);
   };
 
   const wrapped: PushCapableHub = {
@@ -144,6 +152,7 @@ export function withPushFallback(
       // this revoke is about to remove, whether it started before or after
       // the revoke. Reactivated only by a fresh push.subscribe (re-pair).
       revoking.add(userId);
+      revokeGen.set(userId, genOf(userId) + 1); // #R7-4: bump so in-flight deliveries stay fenced across a later re-subscribe
       return enqueue(userId, () => opts.store.clear(userId));
     },
   };

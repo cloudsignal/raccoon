@@ -68,6 +68,30 @@ describe('sendPushToUser', () => {
     expect(delivered).toBe(0);
     expect(await store.list('u1')).toHaveLength(0);
   });
+
+  it('a stale 410 does NOT delete a subscription re-added on the same endpoint with fresh keys (#R7-4)', async () => {
+    const store = new InMemorySubscriptionStore();
+    const endpoint = 'https://push.example/reissued';
+    const oldSub: PushSubscriptionJson = { endpoint, keys: { p256dh: 'old', auth: 'old' } };
+    await store.add('u1', oldSub);
+
+    // The send fails 410 for the OLD sub, but WHILE it was in flight the user
+    // re-subscribed the SAME endpoint with NEW keys — the prune must target
+    // the exact old registration, not blow away the new one.
+    const newSub: PushSubscriptionJson = { endpoint, keys: { p256dh: 'new', auth: 'new' } };
+    const sender = new FakeSender();
+    sender.send = async () => {
+      // Simulate the re-subscribe landing mid-delivery.
+      await store.remove('u1', endpoint);
+      await store.add('u1', newSub);
+      const e = new Error('gone') as Error & { statusCode: number }; e.statusCode = 410; throw e;
+    };
+
+    await sendPushToUser(store, sender, 'u1', payload);
+    const rows = await store.list('u1');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual(newSub); // the re-added subscription survived
+  });
 });
 
 describe('sendPushToUser revocation fence (#R6-6)', () => {
