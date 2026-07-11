@@ -193,6 +193,28 @@ describe('chatReducer', () => {
     expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
   });
 
+  it('a late timeout-failure regresses delivered via the UNGATED delivery path but not via the monotonic ack path (#P1-E4)', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft', description: 'x', options: ['approve'] },
+    });
+    let base = chatReducer(emptyChatState, { type: 'approval', env, active: true });
+    base = chatReducer(base, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve', responseId: 'resp-1' });
+    base = chatReducer(base, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'delivered' });
+    expect(base.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
+
+    // The OLD routing dispatched the processing-timeout failure through the
+    // UNGATED 'delivery' action, which regresses a real 'delivered' → 'failed'
+    // (a false retry). This is the hazard #P1-E4 removes:
+    const viaDelivery = chatReducer(base, { type: 'delivery', channel: 'coordinator', id: 'resp-1', delivery: 'failed' });
+    expect(viaDelivery.messages['coordinator']![0]!.respondedDelivery).toBe('failed');
+
+    // The NEW routing goes through the MONOTONIC 'ack' path, where a late
+    // 'failed' (rank 2) cannot regress a genuine 'delivered' (rank 3):
+    const viaAck = chatReducer(base, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'failed' });
+    expect(viaAck.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
+  });
+
   it('retry (delivery reset) re-opens the monotonic gate so a fresh received advances again (#R8-2)', () => {
     const id = 'out-1';
     let state = chatReducer(emptyChatState, { type: 'optimistic', msg: optimistic(id, 'hi', '2020-01-01T00:00:00.000Z') });

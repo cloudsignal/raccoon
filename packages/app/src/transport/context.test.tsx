@@ -645,6 +645,74 @@ describe('TransportProvider', () => {
     await waitFor(async () => expect(await outbox.listForChannel('coordinator')).toHaveLength(0));
   });
 
+  it('reload reconciles a still-PENDING approval response so the card is answered, not re-answerable (#P1-E1)', async () => {
+    const approvals = await import('../lib/approvals.js');
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    act(() => { transport.setStatus('closed'); }); // keep the seeded response 'pending'
+    const reqEnv = createEnvelope('approval.request', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-1', title: 'Draft', description: 'approve?', options: ['approve', 'skip'] },
+    });
+    await approvals.saveApproval(KEY, reqEnv);
+    await outbox.enqueue(createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'task-1', choice: 'approve' },
+    }), KEY); // stays 'pending' (transport closed) — omitted by the old failed/processing-only filter
+
+    act(() => {
+      transport.emit(createEnvelope('history.page', {
+        from: 'system', to: 'user:u1', channel: 'coordinator',
+        payload: { channel: 'coordinator', messages: [{ id: reqEnv.id, role: 'agent', text: 'approve?', ts: reqEnv.ts }] },
+      }));
+    });
+    // The reconciled card must show the pending response as answered, so the
+    // user cannot submit a competing second response for the same refId.
+    await waitFor(() => {
+      const m = api.state.messages['coordinator']?.find((x) => x.kind === 'approval');
+      expect(m?.respondedChoice).toBe('approve');
+    });
+  });
+
+  it('history reconciliation bails if the identity changes across its awaits — no cross-identity attach (#P1-E3)', async () => {
+    const approvals = await import('../lib/approvals.js');
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    act(() => { transport.setStatus('closed'); });
+    const reqEnv = createEnvelope('approval.request', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-1', title: 'Draft', description: 'approve?', options: ['approve'] },
+    });
+    await approvals.saveApproval(KEY, reqEnv);
+
+    // Park the reconcile inside listApprovals so we can flip identity mid-flight.
+    let releaseList!: (v: unknown) => void;
+    const gate = new Promise<unknown>((r) => { releaseList = r; });
+    const listSpy = vi.spyOn(approvals, 'listApprovals').mockReturnValue(gate as Promise<never>);
+
+    act(() => {
+      transport.emit(createEnvelope('history.page', {
+        from: 'system', to: 'user:u1', channel: 'coordinator',
+        payload: { channel: 'coordinator', messages: [{ id: reqEnv.id, role: 'agent', text: 'approve?', ts: reqEnv.ts }] },
+      }));
+    });
+    await new Promise((r) => setTimeout(r, 10)); // let the handler reach the parked listApprovals
+
+    // Identity A unpairs WHILE the reconcile is parked (identityScopeRef → null,
+    // state reset).
+    await act(async () => { await api.unpair?.(); });
+    // Release with identity A's approval — the fence must drop it, not attach
+    // it into the post-unpair (identity B / reset) UI.
+    await act(async () => {
+      releaseList([{ key: `${KEY}::task-1`, scope: KEY, channel: 'coordinator', refId: 'task-1', env: reqEnv, ts: reqEnv.ts }]);
+      await gate.catch(() => {});
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    listSpy.mockRestore();
+
+    expect((api.state.messages['coordinator'] ?? []).some((m) => m.kind === 'approval')).toBe(false);
+  });
+
   it('advances the read marker for messages arriving on the active channel', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);

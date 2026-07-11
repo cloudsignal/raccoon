@@ -26,7 +26,10 @@ export interface StoredApproval {
   ts: string;
 }
 
-function keyOf(scope: string, refId: string): string {
+/** The 'approvals' store primary key. Exported so a cross-store cleanup
+ *  transaction (outbox.settleResponseAndPruneApproval, #P1-E2) can delete the
+ *  matching approval record by scope + refId. */
+export function keyOf(scope: string, refId: string): string {
   return `${scope}::${refId}`;
 }
 

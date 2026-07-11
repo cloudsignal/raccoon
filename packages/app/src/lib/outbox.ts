@@ -1,5 +1,6 @@
 import type { AnyEnvelope } from '@raccoon/protocol';
-import { promisifyRequest, withStore, withTransaction } from './idb.js';
+import { promisifyRequest, withStore, withStores, withTransaction } from './idb.js';
+import { keyOf as approvalKeyOf } from './approvals.js';
 
 // 'processing' (#R6-2b): the server acked RECEIPT of this envelope but its
 // turn's terminal outcome (success/failure) has not arrived yet. Durable and
@@ -268,6 +269,31 @@ export async function settle(id: string): Promise<void> {
     const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
     await promisifyRequest(s.delete(id));
+    return entry.channel;
+  });
+  if (channel) notify(channel);
+}
+
+/**
+ * Settle an approval RESPONSE row AND prune its durable approval REQUEST in ONE
+ * atomic transaction across the outbox + approvals stores (#P1-E2). The prior
+ * code did getEntry (tx1) → deleteApproval (tx2) → settle (tx3); a crash
+ * between the approval delete and the response settle could leave an
+ * unanswered approval REQUEST with no response record, so a reload re-rendered
+ * the card as un-answered and accepted a competing response. Both deletes now
+ * commit together or not at all. For a plain msg row (or a legacy scope-less
+ * row) it just deletes the outbox row. Returns the channel to notify.
+ */
+export async function settleResponseAndPruneApproval(id: string): Promise<void> {
+  const channel = await withStores(['outbox', 'approvals'], 'readwrite', async (tx) => {
+    const outboxStore = tx.objectStore('outbox');
+    const entry = await promisifyRequest(outboxStore.get(id) as IDBRequest<OutboxEntry | undefined>);
+    if (!entry) return undefined;
+    if (entry.env.kind === 'approval.response' && entry.scope) {
+      const approvalRefId = (entry.env as AnyEnvelope & { kind: 'approval.response' }).payload.refId;
+      await promisifyRequest(tx.objectStore('approvals').delete(approvalKeyOf(entry.scope, approvalRefId)));
+    }
+    await promisifyRequest(outboxStore.delete(id));
     return entry.channel;
   });
   if (channel) notify(channel);

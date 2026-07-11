@@ -112,6 +112,36 @@ export function withTransaction<T>(
   }));
 }
 
+/**
+ * Like withTransaction but spanning MULTIPLE stores in ONE transaction (#P1-E2)
+ * — `fn` receives the raw IDBTransaction and reads each store via
+ * tx.objectStore(name). Used to make a cross-store cleanup atomic: e.g.
+ * deleting an approval REQUEST (approvals store) and settling its response row
+ * (outbox store) together, so a crash between them can't leave an unanswered
+ * approval with no response record. Same keep-alive/abort semantics as
+ * withTransaction.
+ */
+export function withStores<T>(
+  stores: StoreName[],
+  mode: IDBTransactionMode,
+  fn: (tx: IDBTransaction) => Promise<T>,
+): Promise<T> {
+  return openDb().then((db) => new Promise<T>((resolve, reject) => {
+    const tx = db.transaction(stores, mode);
+    let result: T;
+    let ran = false;
+    fn(tx)
+      .then((r) => { result = r; ran = true; })
+      .catch((err) => {
+        reject(err);
+        try { tx.abort(); } catch { /* transaction may already be finishing */ }
+      });
+    tx.oncomplete = () => { if (ran) resolve(result); };
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error('transaction aborted'));
+  }));
+}
+
 export function kvGet<T>(key: string): Promise<T | undefined> {
   return withStore<T | undefined>('kv', 'readonly', (s) => s.get(key) as IDBRequest<T | undefined>);
 }

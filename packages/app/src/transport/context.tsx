@@ -278,7 +278,14 @@ export function TransportProvider(props: TransportProviderProps) {
           const processingTimer = setTimeout(() => {
             ackTimers.current.delete(refId);
             void outbox.failProcessing(refId).then((applied) => {
-              if (applied) dispatch({ type: 'delivery', channel: env.channel, id: refId, delivery: 'failed' });
+              // #P1-E4: route through the MONOTONIC 'ack' path, not the ungated
+              // 'delivery' action. This timer can fire and its failProcessing
+              // CAS can still win the IDB race against a 'delivered' ack that
+              // already advanced the UI — an ungated delivery:'failed' would
+              // then regress a delivered row and show a false retry. Via 'ack'
+              // status 'failed', advanceDelivery keeps a real 'delivered'
+              // (higher rank) while still advancing pending/sent → failed.
+              if (applied) dispatch({ type: 'ack', channel: env.channel, refId, status: 'failed' });
             });
           }, PROCESSING_TIMEOUT_MS);
           ackTimers.current.set(refId, processingTimer);
@@ -294,21 +301,25 @@ export function TransportProvider(props: TransportProviderProps) {
         void outbox.markStalled(refId);
       }
       else {
-        // Terminal success. If this ack settles an approval RESPONSE, prune
-        // the durable approval REQUEST (#R8-1) so a later reload does not
-        // re-render an already-answered card as un-answered (double-response
-        // risk). Read the row BEFORE settle() deletes it to recover the
-        // approval refId, and prune under the row's OWN scope.
-        void outbox.getEntry(refId).then((entry) => {
-          if (entry?.env.kind === 'approval.response' && entry.scope) {
-            void approvals.deleteApproval(entry.scope, entry.env.payload.refId).catch(() => {});
-          }
-        }).finally(() => { void outbox.settle(refId); });
+        // Terminal success. #R8-1/#P1-E2: settle the response row AND prune the
+        // durable approval REQUEST it answers in ONE atomic transaction, so a
+        // reload can't re-render an already-answered card as un-answered (a
+        // crash between two separate deletes could leave a request with no
+        // response record → double-response). For a plain msg it just settles.
+        void outbox.settleResponseAndPruneApproval(refId);
       }
       dispatch({ type: 'ack', channel: env.channel, refId, status: env.payload.status });
     } else if (env.kind === 'history.page') {
       const channel = env.payload.channel;
+      // #P1-E3: capture the identity BEFORE any await. This handler performs
+      // several awaits (kvGet, listApprovals, listForChannel); a wipe/re-pair
+      // landing across any of them flips identityScopeRef SYNCHRONOUSLY. Every
+      // continuation re-checks and bails if the identity changed, so identity
+      // A's history/approvals/responses can never be dispatched into identity
+      // B's (or a reset) UI.
+      const fenceScope = identityScopeRef.current;
       void kvGet<string>(`lastread:${channel}`).then((lastRead) => {
+        if (identityScopeRef.current !== fenceScope) return; // identity changed across the await
         dispatch({
           type: 'history',
           channel,
@@ -318,33 +329,39 @@ export function TransportProvider(props: TransportProviderProps) {
           lastRead,
           active: isActive(channel),
         });
-        // #R8-1 / #R7-2: a reload loses the interactive approval CARD (history
-        // reconstructs the request only as text) and this device's local
-        // response state. Rebuild both from durable, IDENTITY-SCOPED stores:
+        // #R8-1 / #R7-2 / #P1-E1: a reload loses the interactive approval CARD
+        // (history reconstructs the request only as text) and this device's
+        // local response state. Rebuild both from durable, IDENTITY-SCOPED
+        // stores:
         //  1. Re-render the approval cards from the approvals store (scoped by
         //     key), REPLACING the history text rows — so there is a card for
         //     the response reconcile to attach onto.
-        //  2. Rehydrate responded/failed state from the SCOPED outbox rows so
-        //     a failed response shows its retry card and a still-processing
-        //     one shows as sent.
-        // Both are scoped to the current identity so a different paired user's
-        // rows can never attach here. Ordered: cards first, then responses.
-        const scope = identityScopeRef.current;
-        if (!scope) return;
-        void approvals.listApprovals(scope, channel).then((stored) => {
+        //  2. Rehydrate responded state from the SCOPED outbox rows. #P1-E1:
+        //     reconcile EVERY surviving (non-settled) response row — pending,
+        //     sending, processing, failed, stalled — not just failed/processing.
+        //     A still-'pending'/'sending' response omitted here would leave the
+        //     card looking UNANSWERED, letting the user submit a second,
+        //     competing response for the same refId.
+        if (!fenceScope) return; // no identity: nothing scoped to reconcile
+        void approvals.listApprovals(fenceScope, channel).then((stored) => {
+          if (identityScopeRef.current !== fenceScope) return;
           if (stored.length > 0) dispatch({ type: 'reconcile-approvals', channel, approvals: stored.map((a) => a.env) });
-          void outbox.listForChannel(channel, scope).then((rows) => {
+          void outbox.listForChannel(channel, fenceScope).then((rows) => {
+            if (identityScopeRef.current !== fenceScope) return;
             const responses = rows
-              .filter((r) => r.env.kind === 'approval.response' && (r.status === 'failed' || r.status === 'processing'))
+              .filter((r) => r.env.kind === 'approval.response')
               .map((r) => {
                 const p = (r.env as AnyEnvelope & { kind: 'approval.response' }).payload;
-                return {
-                  refId: p.refId,
-                  choice: p.choice,
-                  responseId: r.id,
-                  editedText: p.editedText,
-                  delivery: (r.status === 'failed' ? 'failed' : 'sent') as 'failed' | 'sent',
-                };
+                // Map the durable send-state to a UI delivery. All of these
+                // mark the card ANSWERED (respondedChoice set), so it can't be
+                // re-answered; failed shows retry, stalled shows still-working.
+                const delivery = (
+                  r.status === 'failed' ? 'failed'
+                    : r.status === 'stalled' ? 'stalled'
+                      : r.status === 'processing' ? 'sent'
+                        : 'pending'
+                ) as 'failed' | 'stalled' | 'sent' | 'pending';
+                return { refId: p.refId, choice: p.choice, responseId: r.id, editedText: p.editedText, delivery };
               });
             if (responses.length > 0) dispatch({ type: 'reconcile-responses', channel, responses });
           });

@@ -129,6 +129,31 @@ describe('outbox', () => {
     expect(await outbox.acknowledgeReceipt('nope')).toBeUndefined();
   });
 
+  it('settleResponseAndPruneApproval removes BOTH the response row and its approval request atomically (#P1-E2)', async () => {
+    const approvals = await import('./approvals.js');
+    const reqEnv = createEnvelope('approval.request', {
+      from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'req-1', title: 'T', description: 'x', options: ['approve'] },
+    });
+    await approvals.saveApproval(SCOPE, reqEnv);
+    const row = await outbox.enqueue(approvalResp(), SCOPE); // approval.response, payload.refId 'req-1'
+    await outbox.markSending(row.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(row.id); // → processing
+
+    await outbox.settleResponseAndPruneApproval(row.id);
+
+    // Both gone in one commit — no orphaned approval request lingering to
+    // re-render an already-answered card as un-answered.
+    expect(await outbox.getEntry(row.id)).toBeUndefined();
+    expect(await approvals.listApprovals(SCOPE, 'coordinator')).toHaveLength(0);
+  });
+
+  it('settleResponseAndPruneApproval on a plain msg just settles the row (no approval to prune)', async () => {
+    const row = await outbox.enqueue(msg('hi'), SCOPE);
+    await outbox.settleResponseAndPruneApproval(row.id);
+    expect(await outbox.getEntry(row.id)).toBeUndefined();
+  });
+
   it('markStalled makes a processing row terminal + non-retryable, and a late received cannot regress it (#P1-A)', async () => {
     const e = await outbox.enqueue(approvalResp(), SCOPE);
     await outbox.markSending(e.id, TAB, SCOPE);
