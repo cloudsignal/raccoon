@@ -362,6 +362,39 @@ describe('RaccoonBridge', () => {
     expect(statuses).toEqual(['received', 'stalled', 'stalled']);
   });
 
+  it('a stalled turn that completes AFTER the deadline still persists its reply (background drain, #P1-A adv)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const box: { release: (() => void) | null } = { release: null };
+    // The turn blocks past the deadline, then yields its reply once released.
+    const slow: AgentRunner = {
+      async *run() {
+        await new Promise<void>((r) => { box.release = r; });
+        yield 'the late reply';
+      },
+    };
+    const bridge = new RaccoonBridge({ hub, runner: slow, store, turnDeadlineMs: 30 });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'approve' },
+    });
+    hub.inject(env, 'u1');
+    await new Promise((r) => setTimeout(r, 60)); // past the 30ms deadline → 'stalled'
+    expect(hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '')).toEqual(['received', 'stalled']);
+
+    // The turn now completes; the background drain must persist the reply.
+    box.release?.();
+    await settle();
+    // Persisted to the store (surfaces via history) AND best-effort sent live.
+    const page = await store.page('coordinator', { userId: 'u1', limit: 50 });
+    expect(page.messages.some((m) => m.role === 'agent' && m.text === 'the late reply')).toBe(true);
+    // No EXTRA ack beyond received/stalled — the late reply does not re-settle
+    // or re-open the stalled row.
+    const acks = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
+    expect(acks).toEqual(['received', 'stalled']);
+  });
+
   it('acks a redelivered approval.response without re-running the agent (#R2-5)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();

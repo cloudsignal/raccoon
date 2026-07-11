@@ -50,4 +50,27 @@ describe('idb multi-tab upgrade coordination (#P1-D)', () => {
 
     bumped.close();
   });
+
+  it('does not cache a rejected open — a superseded VersionError re-attempts on the next call (#P1-D adv)', async () => {
+    const dbA = await openDb();
+    const name = dbA.name;
+    const higher = dbA.version + 1;
+    // Commit a higher version (and close it), so our compiled-DB_VERSION open
+    // becomes a downgrade that errors. onversionchange closed dbA + nulled the
+    // cache already.
+    await new Promise<void>((res, rej) => {
+      const r = indexedDB.open(name, higher);
+      r.onupgradeneeded = () => { /* empty */ };
+      r.onsuccess = () => { r.result.close(); res(); };
+      r.onerror = () => rej(r.error);
+    });
+
+    const a = openDb();
+    await a.catch(() => { /* expected VersionError */ });
+    // The rejected open must NOT stay cached: the next call is a FRESH attempt
+    // (distinct promise), not the poisoned rejection returned forever.
+    const b = openDb();
+    expect(b).not.toBe(a);
+    await b.catch(() => {});
+  });
 });

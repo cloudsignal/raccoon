@@ -300,8 +300,11 @@ export class RaccoonBridge {
    *                 its outcome is UNKNOWN and its side effects may still land.
    *                 The caller must NOT treat this as a safe failure: it may
    *                 neither present success nor enable a one-tap retry (which
-   *                 would double side effects). A late reply still persists via
-   *                 the MessageStore and surfaces through history. */
+   *                 would double side effects). The turn keeps running detached;
+   *                 #P1-A (adv): we KEEP DRAINING it in the background and
+   *                 persist its eventual reply via emitReply, so the client's
+   *                 "still working — check back" is real (the reply appears in
+   *                 history / live if still connected). */
   private async runTurn(ctx: AgentContext): Promise<{ reply: string; outcome: 'ok' | 'error' | 'timeout' }> {
     let reply = '';
     const iterator = this.runner.run(ctx)[Symbol.asyncIterator]();
@@ -311,12 +314,17 @@ export class RaccoonBridge {
     });
     try {
       for (;;) {
-        const step = await Promise.race([iterator.next(), deadline]);
+        // Capture the in-flight next() so a deadline hand-off to drainLate can
+        // CONSUME it rather than leaving it orphaned — an orphaned next() would
+        // swallow the turn's next yield (the late reply), losing it.
+        const nextP = iterator.next();
+        const step = await Promise.race([nextP, deadline]);
         if (step === 'timeout') {
-          // Best-effort stop consuming; do NOT await (the underlying turn is
-          // non-cancellable in v1 — an optional AbortSignal on AgentRunner.run
-          // is a deferred follow-up).
-          void iterator.return?.(undefined).catch(() => { /* detach */ });
+          // Do NOT abandon the iterator — the underlying turn is non-cancellable
+          // in v1 and runs to completion anyway. Keep consuming it in the
+          // background and persist the eventual reply (no further ack — the
+          // client already got 'stalled'). Detached: never blocks this return.
+          void this.drainLate(ctx, iterator, reply, nextP);
           return { reply: '', outcome: 'timeout' };
         }
         if (step.done) return { reply, outcome: 'ok' };
@@ -327,6 +335,32 @@ export class RaccoonBridge {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  /** #P1-A (adv): finish consuming a timed-out turn's iterator in the
+   *  background and persist its reply, so a 'stalled' turn's eventual output is
+   *  not silently lost. Persist-only via emitReply (which appends to the store
+   *  and best-effort sends the msg) — it does NOT touch the approval ack/dedup,
+   *  so it can't re-settle or re-open the stalled row. Best-effort throughout. */
+  private async drainLate(
+    ctx: AgentContext,
+    iterator: AsyncIterator<string>,
+    soFar: string,
+    pending: Promise<IteratorResult<string>>,
+  ): Promise<void> {
+    let reply = soFar;
+    try {
+      // Resume from the in-flight next() the race left pending, then continue.
+      let step = await pending;
+      while (!step.done) {
+        reply += step.value;
+        step = await iterator.next();
+      }
+    } catch {
+      return; // the detached turn errored late — nothing to persist
+    }
+    try { await this.emitReply(ctx.userId, ctx.channel, reply); }
+    catch { /* append failed — best-effort; nothing durable to surface */ }
   }
 
   /** Persist + send the agent reply. Skips an empty reply: an empty agent turn (or

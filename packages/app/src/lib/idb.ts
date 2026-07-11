@@ -45,7 +45,17 @@ export function openDb(): Promise<IDBDatabase> {
       };
       resolve(db);
     };
-    req.onerror = () => reject(req.error);
+    req.onerror = () => {
+      // #P1-D (adv): do NOT leave a rejected promise cached. A tab superseded by
+      // a higher DB version reopens at its (now lower) compiled DB_VERSION and
+      // gets a VersionError here; caching that rejection would make EVERY later
+      // kvGet/withStore reject forever off the same cached promise. Nulling lets
+      // the next call re-attempt (it still fails until the tab reloads to newer
+      // code, but it is not permanently poisoned, and a normal transient error
+      // can recover).
+      dbPromise = null;
+      reject(req.error);
+    };
   });
   return dbPromise;
 }

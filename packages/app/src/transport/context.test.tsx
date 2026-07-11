@@ -122,22 +122,28 @@ describe('TransportProvider', () => {
   it('unpair invalidates the durable session BEFORE the unbounded push cleanup, so a hung disable() cannot leave a reconnectable session (#P1-F3)', async () => {
     await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
     const transport = new FakeTransport();
+    let releaseDisable!: () => void;
     render(
       <TransportProvider
         makeTransport={() => transport}
-        pushRegistrarOverride={{ enable: async () => true, disable: () => new Promise<void>(() => { /* never resolves — a hung host push disable */ }) }}
+        pushRegistrarOverride={{ enable: async () => true, disable: () => new Promise<void>((r) => { releaseDisable = r; }) }}
       >
         <Probe />
       </TransportProvider>,
     );
     await waitFor(() => expect(api.phase).toBe('ready'));
-    // Fire unpair but do NOT await — disable() parks forever.
-    act(() => { void api.unpair(); });
-    // The durable session must be cleared even though unpair is still stuck in
+    // Fire unpair but do NOT await — disable() is parked (unresolved).
+    let unpairing!: Promise<void>;
+    act(() => { unpairing = api.unpair(); });
+    // The durable session must be cleared even though unpair is still parked in
     // disable(); otherwise next boot's loadSession() would silently reconnect
-    // the "unpaired" device. This resolves only because the clear was hoisted
-    // ahead of the push/transport awaits.
+    // the "unpaired" device. Resolves only because the clear was hoisted ahead
+    // of the push/transport awaits.
     await waitFor(async () => expect(await loadSession()).toBeNull());
+    // Release so unpair completes and its bounded-cleanup timer is cleared (no
+    // dangling timer to flake later tests).
+    releaseDisable();
+    await act(async () => { await unpairing; });
   });
 
   it('requeues a row stranded in "sending" by a crash/reload and sends it once the transport opens (#R3-8)', async () => {

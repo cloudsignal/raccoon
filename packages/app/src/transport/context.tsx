@@ -87,6 +87,25 @@ function withEpoch(s: Session): ActiveSession {
   return { ...s, epoch: s.epoch ?? crypto.randomUUID() };
 }
 
+// #P1-F3 (adv-hardened): how long unpair() waits on a best-effort cleanup step
+// (host push disable / server unsubscribe / transport close) before moving on.
+// None of those are timeout-bounded on their own, and wipeAndReset() — which
+// retries the durable session clear — sits AFTER them; without this bound a
+// hung disable() could keep wipeAndReset from ever running, leaving a
+// reconnectable session if the hoisted clear itself failed.
+const UNPAIR_CLEANUP_TIMEOUT_MS = 3_000;
+
+/** Resolve when `p` settles OR after `ms`, whichever is first — never rejects.
+ *  The underlying `p` keeps running detached; the caller just stops waiting. */
+function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    const t = setTimeout(finish, ms);
+    void Promise.resolve(p).catch(() => {}).finally(() => { clearTimeout(t); finish(); });
+  });
+}
+
 const defaultMakeTransport: MakeTransport = (opts) => new WsClientTransport(opts) as AppTransport;
 
 /**
@@ -343,28 +362,38 @@ export function TransportProvider(props: TransportProviderProps) {
         //     card looking UNANSWERED, letting the user submit a second,
         //     competing response for the same refId.
         if (!fenceScope) return; // no identity: nothing scoped to reconcile
-        void approvals.listApprovals(fenceScope, channel).then((stored) => {
-          if (identityScopeRef.current !== fenceScope) return;
+        // #P1-E1 (adv-hardened): read BOTH stores first, then dispatch the card
+        // and its response state in the SAME tick with no await between them.
+        // Dispatching reconcile-approvals and then awaiting the outbox read
+        // before reconcile-responses left a sub-frame window where the card
+        // rendered interactive-and-UNANSWERED — a tap landing there minted a
+        // competing second response for the refId (the exact bug E1 targets).
+        // React batches two synchronous dispatches, so the card is never
+        // painted answerable while a non-settled response exists.
+        void Promise.all([
+          approvals.listApprovals(fenceScope, channel),
+          outbox.listForChannel(channel, fenceScope),
+        ]).then(([stored, rows]) => {
+          if (identityScopeRef.current !== fenceScope) return; // fence after the awaits
+          const responses = rows
+            .filter((r) => r.env.kind === 'approval.response')
+            .map((r) => {
+              const p = (r.env as AnyEnvelope & { kind: 'approval.response' }).payload;
+              // Map the durable send-state to a UI delivery. All of these mark
+              // the card ANSWERED (respondedChoice set), so it can't be
+              // re-answered; failed shows retry, stalled shows still-working.
+              const delivery = (
+                r.status === 'failed' ? 'failed'
+                  : r.status === 'stalled' ? 'stalled'
+                    : r.status === 'processing' ? 'sent'
+                      : 'pending'
+              ) as 'failed' | 'stalled' | 'sent' | 'pending';
+              return { refId: p.refId, choice: p.choice, responseId: r.id, editedText: p.editedText, delivery };
+            });
+          // Same-tick, no await between: the card exists AND is marked answered
+          // in one React commit.
           if (stored.length > 0) dispatch({ type: 'reconcile-approvals', channel, approvals: stored.map((a) => a.env) });
-          void outbox.listForChannel(channel, fenceScope).then((rows) => {
-            if (identityScopeRef.current !== fenceScope) return;
-            const responses = rows
-              .filter((r) => r.env.kind === 'approval.response')
-              .map((r) => {
-                const p = (r.env as AnyEnvelope & { kind: 'approval.response' }).payload;
-                // Map the durable send-state to a UI delivery. All of these
-                // mark the card ANSWERED (respondedChoice set), so it can't be
-                // re-answered; failed shows retry, stalled shows still-working.
-                const delivery = (
-                  r.status === 'failed' ? 'failed'
-                    : r.status === 'stalled' ? 'stalled'
-                      : r.status === 'processing' ? 'sent'
-                        : 'pending'
-                ) as 'failed' | 'stalled' | 'sent' | 'pending';
-                return { refId: p.refId, choice: p.choice, responseId: r.id, editedText: p.editedText, delivery };
-              });
-            if (responses.length > 0) dispatch({ type: 'reconcile-responses', channel, responses });
-          });
+          if (responses.length > 0) dispatch({ type: 'reconcile-responses', channel, responses });
         });
       });
     }
@@ -1093,13 +1122,16 @@ export function TransportProvider(props: TransportProviderProps) {
     // matches the wiped identity) so a concurrent re-pair's newer session is
     // not erased; wipeAndReset's own clearSessionIfMatches then no-ops.
     const wipedScope = wiped ? identityKey(wiped) : null;
-    if (wipedScope) await clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))).catch(() => { /* best-effort; wipeAndReset retries */ });
+    if (wipedScope) await clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))).catch(() => { /* best-effort; wipeAndReset re-runs it (now always reached — see the bounded awaits below) */ });
+    // #P1-F3 (adv): bound each best-effort cleanup so a hung host disable() /
+    // server unsubscribe cannot prevent wipeAndReset() from running its durable
+    // clear retry. The cleanup keeps running detached; we just stop waiting.
     if (props.pushRegistrarOverride) {
-      await props.pushRegistrarOverride.disable?.().catch(() => { /* best-effort */ });
+      await settleWithin(Promise.resolve(props.pushRegistrarOverride.disable?.()), UNPAIR_CLEANUP_TIMEOUT_MS);
     } else if (userId && transport) {
       const env = browserPushEnv();
       if (env) {
-        await unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }).catch(() => { /* best-effort */ });
+        await settleWithin(unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
       }
     }
 
@@ -1109,7 +1141,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // clearAll()/demoteSending() serialization in wipeAndReset()).
     for (const unsub of unsubsRef.current) unsub();
     unsubsRef.current = [];
-    await transportRef.current?.close();
+    await settleWithin(Promise.resolve(transportRef.current?.close()), UNPAIR_CLEANUP_TIMEOUT_MS);
     transportRef.current = null;
     await wipeAndReset(wiped);
     // Guarded the same way as the auth-error path: skip if a newer wipe or a
