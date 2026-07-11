@@ -52,6 +52,11 @@ export type ChatAction =
   | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' }
   | { type: 'typing'; channel: string; on: boolean }
   | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string; editedText?: string }
+  // #R7-2: rehydrate responded/failed state onto approval messages from
+  // DURABLE outbox rows after a reload (in-memory respondedChoice/responseEnvId
+  // are lost; server history carries the approval REQUEST but not the local
+  // response state), so a failed response still shows its retry card.
+  | { type: 'reconcile-responses'; channel: string; responses: Array<{ refId: string; choice: string; responseId: string; editedText?: string; delivery: Delivery }> }
   | { type: 'read-channel'; channel: string }
   | { type: 'reset' };
 
@@ -195,6 +200,25 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ? { ...m, respondedChoice: action.choice, respondedDelivery: 'pending' as const, responseEnvId: action.responseId, respondedEditedText: action.editedText }
           : m,
       );
+      return patch(state, action.channel, list);
+    }
+    case 'reconcile-responses': {
+      if (action.responses.length === 0) return state;
+      const byRef = new Map(action.responses.map((r) => [r.refId, r]));
+      const list = (state.messages[action.channel] ?? []).map((m) => {
+        if (m.kind !== 'approval' || !m.approval) return m;
+        const r = byRef.get(m.approval.refId);
+        // Only fill in a response the message doesn't already have (don't
+        // clobber live in-session state with a durable snapshot).
+        if (!r || m.respondedChoice !== undefined) return m;
+        return {
+          ...m,
+          respondedChoice: r.choice,
+          respondedDelivery: r.delivery,
+          responseEnvId: r.responseId,
+          respondedEditedText: r.editedText,
+        };
+      });
       return patch(state, action.channel, list);
     }
     case 'read-channel':

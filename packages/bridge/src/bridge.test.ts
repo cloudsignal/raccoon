@@ -418,6 +418,43 @@ describe('RaccoonBridge', () => {
     }
   });
 
+  it('a send that throws mid-approval does not strand the key on running — a redelivery re-runs to a terminal outcome (#R7-1a)', async () => {
+    // hub.sendToUser can throw on a broken socket. If it threw while the key
+    // was still 'running' (e.g. the 'received' ack or typing start), the old
+    // code left it stuck: a redelivery saw 'running' and only re-emitted
+    // 'received', so the client sat in 'processing' forever.
+    let sendCalls = 0;
+    let runs = 0;
+    class ThrowingHub extends FakeHub {
+      sendToUser(userId: string, env: AnyEnvelope): boolean {
+        sendCalls += 1;
+        if (sendCalls === 1) throw new Error('socket broke'); // the first send (the 'received' ack)
+        return super.sendToUser(userId, env);
+      }
+    }
+    const hub = new ThrowingHub();
+    const store = new InMemoryMessageStore();
+    const runner: AgentRunner = { async *run() { runs += 1; yield 'ok'; } };
+    const bridge = new RaccoonBridge({ hub, runner, store });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'Approve' },
+    });
+    hub.inject(env, 'u1');
+    await settle();
+
+    // The first attempt's 'received' ack threw → the key must NOT be stuck on
+    // 'running'. A redelivery re-runs the turn to a real terminal outcome
+    // (delivered), rather than being deduped into another 'received'.
+    hub.inject(env, 'u1');
+    await settle();
+
+    expect(runs).toBeGreaterThanOrEqual(1);
+    const delivered = hub.sent.filter((s) => s.env.kind === 'ack' && s.env.payload.status === 'delivered');
+    expect(delivered.length).toBeGreaterThanOrEqual(1); // reached a terminal outcome
+  });
+
   it('approval dedup eviction never removes a key whose agent turn is still running, even at cap 1 (#R4-7)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();

@@ -97,6 +97,38 @@ describe('chatReducer', () => {
     expect(state.messages['coordinator']![0]!.respondedChoice).toBe('approve');
   });
 
+  it('reconcile-responses rehydrates a failed response onto a history-loaded approval, but never clobbers live state (#R7-2)', () => {
+    // Simulate a reload: history brings back the approval REQUEST with no
+    // local response state.
+    const env = createEnvelope('approval.request', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft', description: 'body', options: ['approve', 'edit'] },
+    });
+    let state = chatReducer(emptyChatState, { type: 'approval', env, active: false });
+    expect(state.messages['coordinator']![0]!.respondedChoice).toBeUndefined();
+
+    // A durable failed outbox row rehydrates the responded/failed state → the
+    // retry card can render.
+    state = chatReducer(state, {
+      type: 'reconcile-responses',
+      channel: 'coordinator',
+      responses: [{ refId: 'task-9', choice: 'edit', responseId: 'resp-1', editedText: 'my draft', delivery: 'failed' }],
+    });
+    const m = state.messages['coordinator']![0]!;
+    expect(m.respondedChoice).toBe('edit');
+    expect(m.respondedDelivery).toBe('failed');
+    expect(m.responseEnvId).toBe('resp-1');
+    expect(m.respondedEditedText).toBe('my draft');
+
+    // A second reconcile must NOT clobber the (now live) response state.
+    state = chatReducer(state, {
+      type: 'reconcile-responses',
+      channel: 'coordinator',
+      responses: [{ refId: 'task-9', choice: 'approve', responseId: 'resp-2', delivery: 'sent' }],
+    });
+    expect(state.messages['coordinator']![0]!.respondedChoice).toBe('edit'); // unchanged
+  });
+
   it('tracks approval-response delivery via responseEnvId through ack and failure (#R2-5)', () => {
     const env = createEnvelope('approval.request', {
       from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',

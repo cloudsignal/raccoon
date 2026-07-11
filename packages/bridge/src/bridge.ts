@@ -90,11 +90,6 @@ export class RaccoonBridge {
     }
   }
 
-  private approvalAck(userId: string, channel: string, envId: string, status: 'received' | 'delivered' | 'failed'): void {
-    this.hub.sendToUser(userId, createEnvelope('ack', {
-      from: agentAddress(channel), to: userAddress(userId), channel, payload: { refId: envId, status },
-    }));
-  }
 
   /**
    * Runs `run()` (the durable-persistence step) AT MOST ONCE per key.
@@ -207,7 +202,9 @@ export class RaccoonBridge {
       // Duplicate: never re-run. Re-emit the outcome-appropriate ack so a
       // client that lost the original can converge — 'delivered' if the turn
       // already succeeded, 'received' while it is still running.
-      this.approvalAck(userId, channel, env.id, prior === 'ok' ? 'delivered' : 'received');
+      this.safeSend(userId, createEnvelope('ack', {
+        from: agent, to, channel, payload: { refId: env.id, status: prior === 'ok' ? 'delivered' : 'received' },
+      }));
       return;
     }
 
@@ -215,36 +212,51 @@ export class RaccoonBridge {
     // Only 'ok' entries are eviction-eligible; a 'running' turn is never
     // evicted (same #R4-7 rule as `persisted`).
     this.evictCompleted(this.approvalSeen, this.dedupCap, (v) => v === 'ok');
-    this.approvalAck(userId, channel, env.id, 'received'); // server got it; client → 'processing'
 
-    this.hub.sendToUser(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
+    // #R7-1a: EVERYTHING from here is inside try/finally. A send that throws
+    // (hub.sendToUser can throw on a broken socket) — the 'received' ack, the
+    // typing start, or the turn itself — must NOT leave the key stuck on
+    // 'running', or a redelivery would only ever re-emit 'received' and the
+    // client would sit in 'processing' forever. On any failure the finally
+    // block DELETES the key (so a redelivery cleanly re-runs) and best-effort
+    // emits the terminal 'failed' ack; on success it records 'ok' and emits
+    // the terminal 'delivered'. All sends are best-effort (safeSend) so a
+    // failed terminal send can't itself re-strand the key.
     let ok = false;
     try {
+      this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'received' } }));
+      this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
       const { reply, failed } = await this.runTurn({
         userId, channel, text: editedText ?? choice, messageId: env.id,
         approval: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
       });
       if (!failed) { await this.emitReply(userId, channel, reply); ok = true; }
     } catch {
-      // emitReply (store.append) or an unexpected throw: treat as failure.
+      // A store/emitReply throw (or anything unexpected): treat as failure.
       ok = false;
     } finally {
-      this.hub.sendToUser(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
+      this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
+      if (ok) {
+        this.approvalSeen.set(key, 'ok');
+        this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'delivered' } })); // TERMINAL success
+      } else {
+        // #R6-2/#R7-1a: forget the envelope so a redelivery/retry re-runs, and
+        // tell the client machine-readably (it holds the row in 'processing';
+        // only a terminal ack releases it), plus surface the error text.
+        this.approvalSeen.delete(key);
+        this.safeSend(userId, createEnvelope('ack', { from: agent, to, channel, payload: { refId: env.id, status: 'failed' } }));
+        this.safeSend(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
+      }
     }
+  }
 
-    if (ok) {
-      this.approvalSeen.set(key, 'ok');
-      this.approvalAck(userId, channel, env.id, 'delivered'); // TERMINAL success → client settles
-    } else {
-      // #R6-2: keep the decision retryable end to end. Forget the envelope so
-      // a redelivery/retry re-runs (matching claim()'s failed-append
-      // semantics), tell the client machine-readably (it holds the row in
-      // 'processing' and only a terminal ack releases it), and surface the
-      // error text.
-      this.approvalSeen.delete(key);
-      this.approvalAck(userId, channel, env.id, 'failed');
-      this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
-    }
+  /** hub.sendToUser can throw (a broken underlying socket). Bridge control
+   *  flow — especially the approval dedup/outcome bookkeeping (#R7-1a) — must
+   *  never be derailed by a transport send failure, so all outbound sends go
+   *  through here. */
+  private safeSend(userId: string, env: AnyEnvelope): void {
+    try { this.hub.sendToUser(userId, env); }
+    catch (err) { console.error('[raccoon-bridge] send failed:', err); }
   }
 
   /** Drain one agent turn to a string, never throwing. */

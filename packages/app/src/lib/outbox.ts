@@ -269,6 +269,11 @@ export async function acknowledgeReceipt(id: string): Promise<void> {
   const result = await withTransaction('outbox', 'readwrite', async (s) => {
     const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
     if (!entry) return undefined;
+    // #R7-2: a 'failed' row is TERMINAL. A delayed/duplicate 'received' ack
+    // must NOT regress it back to 'processing' — that would silently un-fail
+    // a row the user is looking at a retry affordance for, and (with the
+    // failed→pending retry CAS) make "tap to retry" a no-op. Leave it failed.
+    if (entry.status === 'failed') return undefined;
     if (entry.env.kind === 'approval.response') {
       await promisifyRequest(s.put({ ...entry, status: 'processing', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
     } else {
@@ -277,6 +282,23 @@ export async function acknowledgeReceipt(id: string): Promise<void> {
     return entry.channel;
   });
   if (result) notify(result);
+}
+
+/** Transition a row that is stuck in 'processing' to terminal 'failed'
+ *  (#R7-1b). Processing-only CAS: the client arms a timeout when a row enters
+ *  'processing' (server acked receipt) and calls this if no terminal ack
+ *  arrives — a never-settling server turn otherwise leaves the client spinning
+ *  in 'processing' forever on a stable connection (recovery else only runs on
+ *  reconnect). Leaves a retryable 'failed' row. No-ops if the row already
+ *  settled (delivered→deleted, or already failed). Returns whether it applied. */
+export async function failProcessing(id: string): Promise<boolean> {
+  const entry = await mutate(id, (entry) => (
+    entry.status === 'processing'
+      ? { ...entry, status: 'failed', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
+      : undefined
+  ));
+  if (entry) notify(entry.channel);
+  return entry !== undefined;
 }
 
 /** Mark a row terminally failed on a server 'failed' ack (#R6-2/#R6-2b).

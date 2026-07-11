@@ -9,6 +9,9 @@ afterEach(async () => { await closeDbForTests(); });
 const msg = (text: string) => createEnvelope('msg', {
   from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text },
 });
+const approvalResp = () => createEnvelope('approval.response', {
+  from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { refId: 'req-1', choice: 'Approve' },
+});
 const TAB = 'test-tab-1';
 const FROM = 'user:u1';
 const SCOPE = 'ws://x/::user:u1';
@@ -64,6 +67,36 @@ describe('outbox', () => {
     const entry = (await outbox.listPending())[0]!;
     expect(entry.status).toBe('pending');
     expect(entry.attempts).toBe(0);
+  });
+
+  it('acknowledgeReceipt moves an approval.response row to durable processing, but a msg row settles (#R6-2b)', async () => {
+    const a = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(a.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(a.id);
+    expect((await outbox.listForChannel('coordinator'))[0]!.status).toBe('processing');
+
+    const m = await outbox.enqueue(msg('m'), SCOPE);
+    await outbox.markSending(m.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(m.id);
+    expect((await outbox.listForChannel('coordinator')).some((r) => r.id === m.id)).toBe(false); // settled
+  });
+
+  it('a delayed received ACK does NOT regress a failed row back to processing (#R7-2)', async () => {
+    const e = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(e.id, TAB, SCOPE);
+    await outbox.failByServer(e.id); // terminal failed
+    await outbox.acknowledgeReceipt(e.id); // a late/duplicate 'received' ack
+    expect((await outbox.listForChannel('coordinator'))[0]!.status).toBe('failed'); // still failed, not processing
+  });
+
+  it('failProcessing transitions a stuck processing row to retryable failed, and no-ops otherwise (#R7-1b)', async () => {
+    const e = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(e.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(e.id); // → processing
+    expect(await outbox.failProcessing(e.id)).toBe(true);
+    expect((await outbox.listForChannel('coordinator'))[0]!.status).toBe('failed');
+    // No-op once terminal (or on a non-processing row).
+    expect(await outbox.failProcessing(e.id)).toBe(false);
   });
 
   it('releaseOwnedSending returns this tab\'s in-flight entries to pending', async () => {
