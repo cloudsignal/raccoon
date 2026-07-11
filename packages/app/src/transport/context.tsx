@@ -68,8 +68,22 @@ const ChatContext = createContext<ChatApi | null>(null);
  * not claimable by the new one. Falls back to the token only for a
  * pre-migration session with no epoch.
  */
-function identityKey(s: { instance: string; userId: string; epoch?: string; sessionToken: string }): string {
-  return JSON.stringify({ i: s.instance, u: s.userId, e: s.epoch ?? `tok:${s.sessionToken}` });
+function identityKey(s: { instance: string; userId: string; epoch: string }): string {
+  return JSON.stringify({ i: s.instance, u: s.userId, e: s.epoch });
+}
+
+/**
+ * Ensure a session carries an epoch (#R8-5). The standard pairing/boot paths
+ * always set one (minted at pairing, persisted + lazily migrated on load).
+ * A HOST override may omit it — the documented host API permits a stable
+ * placeholder sessionToken, so we must NEVER derive the key from the token
+ * (that would make re-pairs share an identity AND broadcast a secret). Mint a
+ * per-mount random epoch instead. A host that wants cross-tab wipe
+ * coordination for its sessions supplies its own persisted `epoch`.
+ */
+type ActiveSession = Session & { epoch: string };
+function withEpoch(s: Session): ActiveSession {
+  return { ...s, epoch: s.epoch ?? crypto.randomUUID() };
 }
 
 const defaultMakeTransport: MakeTransport = (opts) => new WsClientTransport(opts) as AppTransport;
@@ -131,12 +145,12 @@ export function TransportProvider(props: TransportProviderProps) {
   const makeTransport = props.makeTransport ?? defaultMakeTransport;
   const [phase, setPhase] = useState<'loading' | 'setup' | 'ready'>('loading');
   const [status, setStatus] = useState<TransportStatus>('closed');
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession] = useState<ActiveSession | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [state, dispatch] = useReducer(chatReducer, emptyChatState);
 
   const transportRef = useRef<AppTransport | null>(null);
-  const sessionRef = useRef<Session | null>(null);
+  const sessionRef = useRef<ActiveSession | null>(null);
   const activeRef = useRef<string | null>(null);
   const stateRef = useRef<ChatState>(state);
   // statusNowRef is updated synchronously inside the onStatus handler (before any
@@ -635,11 +649,14 @@ export function TransportProvider(props: TransportProviderProps) {
       // (delivered asynchronously) but sessionRef.current is authoritative for all
       // imperative code paths (sendMessage, respondApproval, requestHistory).
       if (props.sessionOverride) {
+        // #R8-5: guarantee a non-secret epoch (host may omit it) so the
+        // identity key never derives from the secret sessionToken.
+        const overrideSession = withEpoch(props.sessionOverride);
         sessionGenRef.current += 1;
-        sessionRef.current = props.sessionOverride;
-        validUserIdRef.current = props.sessionOverride.userId;
-        identityScopeRef.current = identityKey(props.sessionOverride);
-        setSession(props.sessionOverride);
+        sessionRef.current = overrideSession;
+        validUserIdRef.current = overrideSession.userId;
+        identityScopeRef.current = identityKey(overrideSession);
+        setSession(overrideSession);
       }
       const override = props.transportOverride;
       let overrideCancelled = false;
@@ -718,6 +735,10 @@ export function TransportProvider(props: TransportProviderProps) {
     void loadSession().then(async (loaded) => {
       if (cancelled) return;
       if (!loaded) { setPhase('setup'); return; }
+      // loadSession guarantees an epoch (persisted at pairing, lazily migrated
+      // on load); withEpoch is a passthrough here that also satisfies the
+      // epoch-required identityKey type.
+      const session = withEpoch(loaded);
       // #R6-4b: a wipe for this exact identity may have arrived from another
       // tab WHILE this IDB read was in flight (the load snapshotted before
       // the other tab's clear committed, or raced it). Installing it now
@@ -727,8 +748,8 @@ export function TransportProvider(props: TransportProviderProps) {
       // matches the tombstoned identity. If the user re-paired in the interim
       // (a newer session was saved), an unconditional clearSession() would
       // delete that valid new session; clearSessionIfMatches leaves it.
-      if (wipeTombstonesRef.current.has(identityKey(loaded))) {
-        await clearSessionIfMatches(identityKey(loaded), identityKey).catch(() => { /* best-effort */ });
+      if (wipeTombstonesRef.current.has(identityKey(session))) {
+        await clearSessionIfMatches(identityKey(session), (s) => identityKey(withEpoch(s))).catch(() => { /* best-effort */ });
         setPhase('setup');
         return;
       }
@@ -739,10 +760,10 @@ export function TransportProvider(props: TransportProviderProps) {
       // update correctly detects it should no longer apply.
       sessionGenRef.current += 1;
       const bootGen = sessionGenRef.current;
-      sessionRef.current = loaded;
-      validUserIdRef.current = loaded.userId;
-      identityScopeRef.current = identityKey(loaded);
-      setSession(loaded);
+      sessionRef.current = session;
+      validUserIdRef.current = session.userId;
+      identityScopeRef.current = identityKey(session);
+      setSession(session);
       // R3-8: see the matching comment in the transportOverride branch above —
       // must complete before wireTransport so the boot drain() can't miss rows
       // stranded in 'sending' by a crash/reload in the previous session.
@@ -761,7 +782,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // the captured `loaded` session here would resurrect an identity that
       // was just torn down.
       if (cancelled || sessionGenRef.current !== bootGen) return;
-      const transport = makeTransport({ url: loaded.url, session: loaded.sessionToken, device: 'raccoon-app' });
+      const transport = makeTransport({ url: session.url, session: session.sessionToken, device: 'raccoon-app' });
       wireTransport(transport);
       setPhase('ready');
       try { await transport.connect(); } catch { /* reconnect loop handles it */ }
@@ -813,10 +834,11 @@ export function TransportProvider(props: TransportProviderProps) {
     // since-superseded wipe's deferred state update (see the auth-error
     // handler / unpair()) correctly detects it should no longer apply.
     sessionGenRef.current += 1;
-    sessionRef.current = next;
-    validUserIdRef.current = next.userId;
-    identityScopeRef.current = identityKey(next);
-    setSession(next);
+    const nextSession = withEpoch(next); // #R8-5: ensure a non-secret epoch
+    sessionRef.current = nextSession;
+    validUserIdRef.current = nextSession.userId;
+    identityScopeRef.current = identityKey(nextSession);
+    setSession(nextSession);
     setPhase('ready');
     void saveSession(next); // persist async; state is already updated
   }, [makeTransport, wireTransport]);

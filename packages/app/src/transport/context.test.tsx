@@ -662,6 +662,7 @@ describe('TransportProvider', () => {
       userId: 'u-host',
       instance: 'host-instance',
       channels: ['coordinator', 'assistant'],
+      epoch: 'host-epoch', // #R8-5: a host SHOULD supply a persisted non-secret epoch
     };
 
     it('session is the supplied sessionOverride', async () => {
@@ -711,6 +712,35 @@ describe('TransportProvider', () => {
       );
       await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
       expect(api.session?.channels).toEqual(['coordinator', 'assistant']);
+    });
+
+    it('a host override WITHOUT an epoch never derives the identity key from the secret sessionToken (#R8-5)', async () => {
+      // The documented host API permits a stable placeholder sessionToken and
+      // may omit epoch (e.g. GTM wiring passes sessionToken:"gtm"). The
+      // identity key (stamped on outbox rows and broadcast in wipes) must NOT
+      // derive from that secret token — a per-mount epoch is minted instead.
+      const noEpoch = { url: 'wss://x/', sessionToken: 'super-secret-token', userId: 'u1', instance: 'gtm', channels: ['coordinator'] };
+      const transport = new FakeTransport();
+      render(
+        <TransportProvider transportOverride={transport} sessionOverride={noEpoch}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+
+      // A queued message is stamped with the identity scope (= the key).
+      act(() => { transport.setStatus('closed'); }); // keep it queued
+      act(() => { api.sendMessage('coordinator', 'hi'); });
+      await waitFor(async () => expect((await outbox.listForChannel('coordinator')).length).toBe(1));
+      const row = (await outbox.listForChannel('coordinator'))[0]!;
+      expect(row.scope).toBeTruthy();
+      expect(row.scope).not.toContain('super-secret-token'); // token never in the key
+      // The scope is the structured identity key with a minted epoch, not a token.
+      const parsed = JSON.parse(row.scope!);
+      expect(parsed.u).toBe('u1');
+      expect(parsed.i).toBe('gtm');
+      expect(typeof parsed.e).toBe('string');
+      expect(parsed.e).not.toBe('super-secret-token');
     });
 
     it('sendMessage produces an envelope with from: user:<userId>', async () => {
