@@ -69,6 +69,23 @@ const ACK_DELIVERY: Record<'received' | 'delivered' | 'read' | 'failed', Deliver
   failed: 'failed',
 };
 
+// #R8-2: server acks must move delivery MONOTONICALLY forward. Acks can be
+// reordered or redelivered by the transport, so a delayed 'received' (→sent)
+// must not overwrite a terminal 'failed' (which would hide the retry
+// affordance) nor downgrade a 'delivered'/'read'. 'failed' is terminal-but-
+// recoverable: a genuine 'delivered'/'read' (higher rank) still overrides it,
+// but a stale 'sent' (lower rank) does not; and a late 'failed' cannot regress
+// a real 'delivered'. A user RETRY is the one intended backward move — it goes
+// through the separate 'delivery' action (reset to 'pending'), which is NOT
+// gated here, so the next 'received' legitimately advances pending→sent again.
+const DELIVERY_RANK: Record<Delivery, number> = {
+  pending: 0, sent: 1, failed: 2, delivered: 3, read: 4,
+};
+function advanceDelivery(current: Delivery | undefined, next: Delivery): Delivery {
+  if (current === undefined) return next;
+  return DELIVERY_RANK[next] > DELIVERY_RANK[current] ? next : current;
+}
+
 function byTs(a: ChatMessage, b: ChatMessage): number {
   return a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0;
 }
@@ -185,9 +202,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return patch(state, action.channel, list);
     }
     case 'ack': {
+      const next = ACK_DELIVERY[action.status];
       const list = (state.messages[action.channel] ?? []).map((m) => {
-        if (m.id === action.refId) return { ...m, delivery: ACK_DELIVERY[action.status] };
-        if (m.responseEnvId === action.refId) return { ...m, respondedDelivery: ACK_DELIVERY[action.status] };
+        if (m.id === action.refId) return { ...m, delivery: advanceDelivery(m.delivery, next) };
+        if (m.responseEnvId === action.refId) return { ...m, respondedDelivery: advanceDelivery(m.respondedDelivery, next) };
         return m;
       });
       return patch(state, action.channel, list);

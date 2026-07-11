@@ -149,6 +149,45 @@ describe('chatReducer', () => {
     expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('failed');
   });
 
+  it('a stale received ack does not un-fail a failed response, but a real delivered still recovers it (#R8-2)', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'Draft', description: 'x', options: ['approve'] },
+    });
+    let state = chatReducer(emptyChatState, { type: 'approval', env, active: true });
+    state = chatReducer(state, { type: 'responded', channel: 'coordinator', refId: 'task-9', choice: 'approve', responseId: 'resp-1' });
+    // Terminal failure (server or client processing-timeout).
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'failed' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('failed');
+
+    // A DELAYED 'received' ack (reordered from the original send) must not
+    // flip failed back to sent and hide the retry affordance.
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'received' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('failed');
+
+    // A genuine 'delivered' (the turn actually succeeded) has higher rank and
+    // still recovers the row out of failed.
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'delivered' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
+
+    // A late 'failed' can no longer regress a real 'delivered'.
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: 'resp-1', status: 'failed' });
+    expect(state.messages['coordinator']![0]!.respondedDelivery).toBe('delivered');
+  });
+
+  it('retry (delivery reset) re-opens the monotonic gate so a fresh received advances again (#R8-2)', () => {
+    const id = 'out-1';
+    let state = chatReducer(emptyChatState, { type: 'optimistic', msg: optimistic(id, 'hi', '2020-01-01T00:00:00.000Z') });
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: id, status: 'failed' });
+    expect(state.messages['coordinator']![0]!.delivery).toBe('failed');
+    // User retry uses the 'delivery' action (ungated) to reset to pending...
+    state = chatReducer(state, { type: 'delivery', channel: 'coordinator', id, delivery: 'pending' });
+    expect(state.messages['coordinator']![0]!.delivery).toBe('pending');
+    // ...and the resend's fresh 'received' legitimately advances pending→sent.
+    state = chatReducer(state, { type: 'ack', channel: 'coordinator', refId: id, status: 'received' });
+    expect(state.messages['coordinator']![0]!.delivery).toBe('sent');
+  });
+
   it('sorts merged history + live by ts', () => {
     let state = chatReducer(emptyChatState, { type: 'message', env: agentMsg('live'), active: true });
     state = chatReducer(state, {

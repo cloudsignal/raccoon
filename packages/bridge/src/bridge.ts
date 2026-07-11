@@ -3,6 +3,15 @@ import type { AgentContext, AgentRunner, MessageStore, OutboundHub } from './typ
 
 const DEFAULT_HISTORY_CAP = 200;
 const DEFAULT_DEDUP_CAP = 500;
+// #R8-2: a turn that never completes (a hung agent/tool call) must not leave
+// the client spinning in 'processing' forever. The bridge bounds how long it
+// WAITS for a turn; past the deadline it abandons the wait and reports the
+// turn failed, so a terminal 'failed' ack reaches the client (which then
+// shows a retry affordance). The underlying runner turn is not forcibly
+// cancellable — the bridge stops consuming it (its own generator/dispatch
+// runs to completion detached); a late reply still persists and reaches the
+// client via history.
+const DEFAULT_TURN_DEADLINE_MS = 90_000;
 const GENERIC_ERROR = 'Something went wrong handling that.';
 
 export class RaccoonBridge {
@@ -51,12 +60,15 @@ export class RaccoonBridge {
   // as `persisted`).
   private readonly approvalSeen = new Map<string, 'running' | 'ok'>();
 
-  constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; historyLimitCap?: number; dedupCap?: number }) {
+  private readonly turnDeadlineMs: number;
+
+  constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; historyLimitCap?: number; dedupCap?: number; turnDeadlineMs?: number }) {
     this.hub = opts.hub;
     this.runner = opts.runner;
     this.store = opts.store;
     this.cap = opts.historyLimitCap ?? DEFAULT_HISTORY_CAP;
     this.dedupCap = opts.dedupCap ?? DEFAULT_DEDUP_CAP;
+    this.turnDeadlineMs = opts.turnDeadlineMs ?? DEFAULT_TURN_DEADLINE_MS;
   }
 
   /** Subscribe to the hub. Returns an unsubscribe function. */
@@ -258,14 +270,33 @@ export class RaccoonBridge {
     catch (err) { console.error('[raccoon-bridge] send failed:', err); }
   }
 
-  /** Drain one agent turn to a string, never throwing. */
+  /** Drain one agent turn to a string, never throwing. Bounds the WAIT at
+   *  `turnDeadlineMs` (#R8-2): if the runner hasn't finished by then, stop
+   *  consuming it and report `failed` so the caller emits a terminal ack —
+   *  the client leaves 'processing' instead of spinning forever. The runner's
+   *  own generator/dispatch runs to completion detached; a late reply still
+   *  persists (and surfaces via history). */
   private async runTurn(ctx: AgentContext): Promise<{ reply: string; failed: boolean }> {
     let reply = '';
+    const iterator = this.runner.run(ctx)[Symbol.asyncIterator]();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), this.turnDeadlineMs);
+    });
     try {
-      for await (const chunk of this.runner.run(ctx)) reply += chunk;
-      return { reply, failed: false };
+      for (;;) {
+        const step = await Promise.race([iterator.next(), deadline]);
+        if (step === 'timeout') {
+          void iterator.return?.(undefined).catch(() => { /* detach */ });
+          return { reply: '', failed: true };
+        }
+        if (step.done) return { reply, failed: false };
+        reply += step.value;
+      }
     } catch {
       return { reply: '', failed: true };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

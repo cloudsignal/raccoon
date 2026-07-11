@@ -318,6 +318,45 @@ describe('RaccoonBridge', () => {
     const last = hub.sent[4]!.env; if (last.kind === 'ack') expect(last.payload.status).toBe('delivered');
   });
 
+  it('bounds a hung approval turn with a terminal failed ack, and a retry re-runs (#R8-2)', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let runs = 0;
+    const box: { release: (() => void) | null } = { release: null };
+    // First run hangs forever (never yields, never returns); a later delivery
+    // completes. Models an agent/tool call that wedges the turn.
+    const hangThenOk: AgentRunner = {
+      async *run() {
+        runs += 1;
+        if (runs === 1) { await new Promise<void>(() => { /* never resolves */ }); }
+        else { await new Promise<void>((r) => { box.release = r; }); yield 'recovered'; }
+      },
+    };
+    const bridge = new RaccoonBridge({ hub, runner: hangThenOk, store, turnDeadlineMs: 30 });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'approve' },
+    });
+    hub.inject(env, 'u1');
+    await new Promise((r) => setTimeout(r, 80)); // past the 30ms deadline
+
+    const acks1 = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
+    // The hung turn does NOT strand the client: after 'received' it gets a
+    // terminal 'failed', not an eternal 'processing'.
+    expect(acks1).toEqual(['received', 'failed']);
+
+    // A retry (same envelope id) re-runs the turn — the failed key was cleared,
+    // so it is NOT deduped into another 'received'-only ack.
+    hub.inject(env, 'u1');
+    await settle();
+    expect(runs).toBe(2);
+    box.release?.();
+    await settle();
+    const statuses = hub.sent.filter((s) => s.env.kind === 'ack').map((a) => a.env.kind === 'ack' ? a.env.payload.status : '');
+    expect(statuses).toEqual(['received', 'failed', 'received', 'delivered']);
+  });
+
   it('acks a redelivered approval.response without re-running the agent (#R2-5)', async () => {
     const hub = new FakeHub();
     const store = new InMemoryMessageStore();
