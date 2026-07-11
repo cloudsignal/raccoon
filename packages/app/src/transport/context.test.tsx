@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createEnvelope } from '@raccoon/protocol';
 import { closeDbForTests, kvGet, kvSet } from '../lib/idb.js';
@@ -9,7 +9,12 @@ import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
 import { TransportProvider, useChat, type ChatApi } from './context.js';
 
-afterEach(async () => { await closeDbForTests(); });
+// Unmount every rendered provider BEFORE resetting the DB — the boot effect's
+// cleanup clears its periodic lease sweep, BroadcastChannels, and timers, so a
+// prior test's provider can't run async outbox work against the next test's
+// shared fake-IndexedDB (a cross-test flake once 'open' began scheduling
+// recoverProcessing()/drain(), #R6-2b/#R6-5b).
+afterEach(async () => { cleanup(); await closeDbForTests(); });
 
 // #R6-3b: the provider's identity key is `${instance}\0${userId}\0${sessionToken}`.
 // mountPaired / the seeded saveSession use instance 'i', user 'u1', token 't'.
