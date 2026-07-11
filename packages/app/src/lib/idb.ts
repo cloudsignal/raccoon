@@ -9,7 +9,7 @@ type StoreName = 'kv' | 'outbox' | 'approvals';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
-function openDb(): Promise<IDBDatabase> {
+export function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -25,7 +25,26 @@ function openDb(): Promise<IDBDatabase> {
         approvals.createIndex('channel', 'channel');
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    // #P1-D: a multi-tab PWA schema upgrade must not hang. Without these
+    // handlers, a tab holding an older-version connection blocks a newer tab's
+    // open indefinitely, and every await openDb() (i.e. every kvGet/withStore)
+    // wedges. `blocked` is transient — do NOT reject (onsuccess still fires
+    // once the other tab yields); just surface it so a genuine hang is
+    // diagnosable.
+    req.onblocked = () => {
+      console.warn('[idb] open blocked: another tab is holding an older DB version open');
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        // A newer tab needs to upgrade the schema — yield so it isn't blocked,
+        // and drop the cached connection so the next openDb() reconnects at
+        // the new version (a transaction on this now-closed db would throw).
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
     req.onerror = () => reject(req.error);
   });
   return dbPromise;
