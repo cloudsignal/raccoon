@@ -283,6 +283,44 @@ describe('withPushFallback', () => {
     expect(sender.sent).toHaveLength(0);
   });
 
+  it('a delivery STARTED AFTER clearForUser is fenced too (#R6-6b)', async () => {
+    // The generation-counter fence's gap: a delivery beginning AFTER
+    // clearForUser captured the ALREADY-bumped generation as its own
+    // baseline, saw "unchanged", and delivered. The reviewer's repro:
+    // clearForUser(); then a message → one push sent while the store ended
+    // empty. An explicit revoking state fences deliveries that start after
+    // the revoke, not just ones in flight before it.
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    await store.add('u1', sub('https://push.example/1'));
+    const sender = new FakeSender();
+    const { hub, clearForUser } = withPushFallback(inner, { store, sender });
+
+    void clearForUser('u1'); // revoke first…
+    expect(hub.sendToUser('u1', msgTo('u1'))).toBe(false); // …then an offline message → push path
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(sender.sent).toHaveLength(0); // nothing delivered to the revoked user
+  });
+
+  it('a re-subscribe after revocation reactivates delivery for that user (#R6-6b)', async () => {
+    const inner = new FakeHub();
+    const store = new InMemorySubscriptionStore();
+    const sender = new FakeSender();
+    const { hub, clearForUser } = withPushFallback(inner, { store, sender });
+
+    await clearForUser('u1'); // u1 revoked (fenced)
+    // A fresh enrollment (re-pair) for the same userId must reactivate push.
+    inner.emit(createEnvelope('push.subscribe', {
+      from: 'user:u1', to: 'system', channel: 'system', payload: { subscription: sub('https://fcm.googleapis.com/fcm/send/new') },
+    }), 'u1');
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(hub.sendToUser('u1', msgTo('u1'))).toBe(false); // offline → push
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sender.sent).toHaveLength(1); // delivered again after re-enrollment
+  });
+
   it('delivers over socket when online, pushes when offline', async () => {
     const inner = new FakeHub();
     const store = new InMemorySubscriptionStore();

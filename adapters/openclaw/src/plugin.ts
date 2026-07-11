@@ -88,8 +88,16 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
     // withPushFallback's offline fallback) even though their pairing and
     // live sockets are gone.
     revoke: async (userId: string) => {
+      // #R6-6b: raise the push revocation fence BEFORE tearing down the
+      // pairing. clearForUser marks the user revoking SYNCHRONOUSLY (before
+      // the returned promise), so calling it first means any push delivery
+      // triggered by revokePairing() closing the user's live sockets (a final
+      // buffered message finding no socket → offline push path) is already
+      // fenced. Awaiting hub revocation before starting push cleanup — the
+      // old order — left exactly that window open.
+      const pushCleared = clearPushForUser?.(userId) ?? Promise.resolve();
       await revokePairing(hub, userId);
-      await clearPushForUser?.(userId);
+      await pushCleared;
     },
     buildId: opts.buildId ?? 'dev',
   };
