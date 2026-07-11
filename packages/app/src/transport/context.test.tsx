@@ -765,6 +765,44 @@ describe('TransportProvider', () => {
       expect(api.session).toEqual(hostSession);
     });
 
+    it('accepts a host transport WITHOUT onGrant (non-pairing transport) and reaches ready + sends (#A2)', async () => {
+      // A CloudSignal/MQTT-style transport authenticates out-of-band and never
+      // issues a pair.grant, so it omits onGrant. It must satisfy AppTransport
+      // (onGrant optional) without the `as unknown as AppTransport` cast.
+      const sent: import('@raccoon/protocol').AnyEnvelope[] = [];
+      let statusHandler: ((s: import('@raccoon/protocol').TransportStatus) => void) | null = null;
+      const noGrant: import('./types.js').AppTransport = {
+        connect: async () => { statusHandler?.('open'); },
+        close: async () => { statusHandler?.('closed'); },
+        send: async (e) => { sent.push(e); },
+        onEnvelope: () => () => {},
+        onStatus: (h) => { statusHandler = h; return () => { statusHandler = null; }; },
+        onAuthError: () => () => {},
+        // NOTE: no onGrant — a non-pairing transport.
+      };
+      render(
+        <TransportProvider transportOverride={noGrant} sessionOverride={hostSession}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      act(() => { api.sendMessage('coordinator', 'hi from a non-pairing transport'); });
+      await waitFor(() => expect(sent.some((e) => e.kind === 'msg')).toBe(true));
+    });
+
+    it('boots a host session that omits url/sessionToken (no placeholders needed) (#A3)', async () => {
+      const transport = new FakeTransport();
+      const leanHost = { userId: 'u-host', instance: 'host-instance', channels: ['coordinator'], epoch: 'host-epoch' };
+      render(
+        <TransportProvider transportOverride={transport} sessionOverride={leanHost}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(api.session?.userId).toBe('u-host');
+      expect(api.session?.url).toBeUndefined();
+    });
+
     it('does not wire/connect the override transport if the provider unmounts during boot recovery (#R4-10)', async () => {
       let releaseDemote!: () => void;
       const demoteGate = new Promise<void>((r) => { releaseDemote = r; });

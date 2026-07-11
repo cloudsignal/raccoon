@@ -52,8 +52,13 @@ export { UpdateGate } from './components/update-gate.js';
 
 // Transport layer
 export { TransportProvider, useChat } from './transport/context.js';
-export type { ChatApi, TransportProviderProps } from './transport/context.js';
+export type { ChatApi, TransportProviderProps, PushRegistrar } from './transport/context.js';
 export type { AppTransport, MakeTransport } from './transport/types.js';
+
+// #A4 (vendor-neutral): the push-registrar factory belongs on the public
+// surface so a host wiring a VAPID-over-HTTP registrar does not deep-import
+// '@raccoon/app/src/lib/push-registrar-http.js'.
+export { createHttpPushRegistrar } from './lib/push-registrar-http.js';
 
 // Session type — hosts using transportOverride need this for sessionOverride
 export type { Session } from './lib/session.js';

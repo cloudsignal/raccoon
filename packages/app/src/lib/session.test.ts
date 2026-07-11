@@ -73,6 +73,18 @@ describe('session store', () => {
     expect(await loadSession()).toBeNull();
   });
 
+  it('round-trips a host session with url/sessionToken omitted, and identityKey stays epoch-based (#A3)', async () => {
+    const hostSession: Session = { userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'epoch-1' };
+    await saveSession(hostSession);
+    const loaded = await loadSession();
+    expect(loaded).toEqual(hostSession);
+    expect(loaded?.url).toBeUndefined();
+    expect(loaded?.sessionToken).toBeUndefined();
+    // The identity key a host uses is derived from the epoch, never url/token.
+    const keyOf = (s: Session) => `${s.instance}:${s.userId}:${s.epoch}`;
+    expect(keyOf(loaded!)).toBe('i:u1:epoch-1');
+  });
+
   it('rejects corrupt stored values', async () => {
     const { kvSet } = await import('./idb.js');
     await kvSet('session', { nope: true });

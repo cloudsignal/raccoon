@@ -858,6 +858,11 @@ export function TransportProvider(props: TransportProviderProps) {
       // the captured `loaded` session here would resurrect an identity that
       // was just torn down.
       if (cancelled || sessionGenRef.current !== bootGen) return;
+      // #A3: this default boot path DIALS the WS transport from session.url, so
+      // it needs one. A WS-paired session always has it; a host-managed session
+      // (url now optional) never reaches here — it boots via sessionOverride +
+      // transportOverride. Guard the widened type: no url ⇒ nothing to dial.
+      if (!session.url) { setPhase('setup'); return; }
       const transport = makeTransport({ url: session.url, session: session.sessionToken, device: 'raccoon-app' });
       wireTransport(transport);
       setPhase('ready');
@@ -884,10 +889,17 @@ export function TransportProvider(props: TransportProviderProps) {
     const payload = parsePairingPayload(json);
     setAuthError(null);
     const transport = makeTransport({ url: payload.instanceUrl, pairingToken: payload.token, device: 'raccoon-app' });
+    // #A2: interactive pairing requires the transport to support pair.grant. A
+    // non-pairing transport (host-managed session) never reaches this path —
+    // it's driven by sessionOverride, not pairWithPayload.
+    if (!transport.onGrant) {
+      setAuthError('This transport does not support interactive pairing.');
+      return;
+    }
     // Register the grant handler before connect; defer full wiring until after the grant
     // so that the connect-phase status change doesn't trigger React state updates outside act.
     const granted = new Promise<Session>((resolve) => {
-      transport.onGrant((g) => resolve({
+      transport.onGrant!((g) => resolve({
         url: payload.instanceUrl,
         sessionToken: g.payload.sessionToken,
         userId: g.payload.userId,
