@@ -18,7 +18,14 @@ interface CloudSignalClientLike {
   }): Promise<void>;
   subscribe(topic: string, qos?: 0 | 1 | 2): Promise<unknown>;
   unsubscribe(topic: string): Promise<unknown>;
-  transmit(topic: string, message: string, options?: { qos?: 0 | 1 | 2; retain?: boolean }): void;
+  // #R10: the real @cloudsignal/mqtt-client transmit() returns a Promise that
+  // resolves on the publish callback (a PUBACK at QoS>=1) and rejects on a
+  // publish error. Typing it as `void` meant send() didn't await broker
+  // acceptance, so a PUBACK failure was silently swallowed while the client
+  // synthesised a 'received' ack and deleted the durable outbox row — losing
+  // the message. Accept both shapes (a QoS-0 fake may return void); send()
+  // awaits it either way.
+  transmit(topic: string, message: string, options?: { qos?: 0 | 1 | 2; retain?: boolean }): void | Promise<void>;
   destroy(): void;
   onMessage(handler: (topic: string, message: string) => void): void;
   onConnectionStatusChange: ((connected: boolean) => void) | null;
@@ -126,7 +133,11 @@ export class CloudSignalTransport implements Transport {
     const ctx = this.ctx;
     const msgs = this.opts.codec.encode(env, ctx);
     for (const msg of msgs) {
-      this.csClient.transmit(msg.topic, msg.payload, {
+      // #R10: AWAIT the publish so a broker/PUBACK failure becomes a send()
+      // rejection. The app's outbox then keeps the durable row as retryable
+      // (markSendFailed) and the history decorator skips synthesising
+      // 'received' — instead of losing the message while the UI shows sent.
+      await this.csClient.transmit(msg.topic, msg.payload, {
         qos: msg.qos ?? 0,
         retain: msg.retain ?? false,
       });

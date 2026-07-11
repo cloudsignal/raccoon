@@ -19,6 +19,9 @@ function createFakeCloudSignalClient() {
   // Exposed callback setters (mirror real SDK's property assignment model)
   let onConnectionStatusChangeCb: ((connected: boolean) => void) | null = null;
   let onAuthErrorCb: ((err: Error) => void) | null = null;
+  // #R10: let a test control what transmit() returns (a rejecting or deferred
+  // publish promise) to model a broker/PUBACK failure.
+  let transmitImpl: (() => void | Promise<void>) | null = null;
 
   const client = {
     get onConnectionStatusChange() { return onConnectionStatusChangeCb; },
@@ -34,8 +37,9 @@ function createFakeCloudSignalClient() {
       subscribed.push(topic);
     },
     async unsubscribe(_topic: string): Promise<void> {},
-    transmit(topic: string, message: string, options?: { qos?: 0 | 1 | 2; retain?: boolean }) {
+    transmit(topic: string, message: string, options?: { qos?: 0 | 1 | 2; retain?: boolean }): void | Promise<void> {
       transmitted.push([topic, message, options]);
+      if (transmitImpl) return transmitImpl();
     },
     destroy() {
       destroyCalled = true;
@@ -59,6 +63,7 @@ function createFakeCloudSignalClient() {
     get destroyCalled() { return destroyCalled; },
     get subscribed() { return subscribed; },
     get transmitted() { return transmitted; },
+    setTransmitImpl(fn: (() => void | Promise<void>) | null) { transmitImpl = fn; },
   };
 
   return client;
@@ -261,6 +266,34 @@ describe('CloudSignalTransport', () => {
       });
 
       await expect(transport.send(env)).rejects.toThrow('transport not open');
+    });
+
+    it('rejects send() when the broker publish/PUBACK fails (#R10)', async () => {
+      const fake = createFakeCloudSignalClient();
+      const transport = makeTransport({ ClientImpl: () => fake });
+      await transport.connect();
+      fake.setTransmitImpl(() => Promise.reject(new Error('puback failed')));
+      const env = createEnvelope('msg', { from: 'user:u1', to: 'agent:bot', channel: 'main', payload: { text: 'hi' } });
+      // Awaiting the publish means a PUBACK failure surfaces as a send()
+      // rejection (so the outbox keeps the row retryable) instead of a silent
+      // loss under a synthesised 'received' ack.
+      await expect(transport.send(env)).rejects.toThrow('puback failed');
+    });
+
+    it('does not resolve send() until the publish promise settles (#R10)', async () => {
+      const fake = createFakeCloudSignalClient();
+      const transport = makeTransport({ ClientImpl: () => fake });
+      await transport.connect();
+      let release!: () => void;
+      fake.setTransmitImpl(() => new Promise<void>((r) => { release = r; }));
+      const env = createEnvelope('msg', { from: 'user:u1', to: 'agent:bot', channel: 'main', payload: { text: 'hi' } });
+      let settled = false;
+      const p = transport.send(env).then(() => { settled = true; });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(settled).toBe(false); // still pending — broker hasn't PUBACKed
+      release();
+      await p;
+      expect(settled).toBe(true);
     });
   });
 
