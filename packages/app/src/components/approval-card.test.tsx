@@ -71,8 +71,9 @@ describe('ApprovalCard', () => {
       expect(first).toBeTruthy();
     });
 
-    // The server received the response (settles the outbox row)… then its
-    // approval turn failed terminally, surfaced as a second, FAILED ack.
+    // #R6-2b: 'received' moves the durable row to 'processing' (NOT deleted);
+    // the turn then fails terminally, surfaced as a 'failed' ack that marks
+    // the row retryable.
     const ackWith = (status: 'received' | 'failed') => createEnvelope('ack', {
       from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
       payload: { refId: first!.id, status },
@@ -86,16 +87,49 @@ describe('ApprovalCard', () => {
     const retry = await screen.findByRole('button', { name: /tap to retry/i });
     await user.click(retry);
 
-    // The retry re-sends the SAME decision as a FRESH envelope (the old
-    // outbox row was settled by the received ack and cannot be revived).
+    // The retry re-drives the SAME durable row — same envelope id, which the
+    // bridge re-runs (it forgot the failed approval). The old model deleted
+    // the row on 'received' and could only mint a fresh envelope; the row now
+    // survives, so the same id is re-sent (dedup-correct correlation).
     await waitFor(() => {
       const responses = transport.sent.filter((e) => e.kind === 'approval.response');
       expect(responses).toHaveLength(2);
       const second = responses[1]!;
-      expect(second.id).not.toBe(first!.id);
+      expect(second.id).toBe(first!.id);
       if (second.kind === 'approval.response') {
         expect(second.payload).toMatchObject({ refId: 'task-9', choice: 'edit', editedText: 'Better draft' });
       }
+    });
+  });
+
+  it('a durable "processing" approval whose terminal ack is lost is recovered on reconnect (#R6-2b)', async () => {
+    const transport = await mount();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Approve' }));
+    let first: Envelope<'approval.response'> | undefined;
+    await waitFor(() => {
+      first = transport.sent.find((e) => e.kind === 'approval.response') as Envelope<'approval.response'> | undefined;
+      expect(first).toBeTruthy();
+    });
+
+    // Server acks receipt (row → durable 'processing'), then the terminal ack
+    // is LOST (socket drop). The row must NOT be deleted.
+    act(() => {
+      transport.emit(createEnvelope('ack', {
+        from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+        payload: { refId: first!.id, status: 'received' },
+      }));
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Reconnect: the processing row is re-driven — the same envelope is
+    // re-sent so the bridge can re-answer with the real terminal outcome.
+    act(() => { transport.setStatus('closed'); });
+    act(() => { transport.setStatus('open'); });
+
+    await waitFor(() => {
+      const responses = transport.sent.filter((e) => e.kind === 'approval.response' && e.id === first!.id);
+      expect(responses.length).toBeGreaterThanOrEqual(2); // original + recovery re-send
     });
   });
 

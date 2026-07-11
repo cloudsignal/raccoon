@@ -60,6 +60,10 @@ describe('TransportProvider', () => {
   it('unpair wipes local identity state (outbox + kv + chat state) so a re-pair cannot leak the prior user', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
+    // Close the transport before seeding so the queued row is not immediately
+    // drained by the open connection (an open transport correctly sends
+    // pending rows) — we want it to stay queued to prove unpair wipes it.
+    act(() => { transport.setStatus('closed'); });
     // Seed prior-user local state: a queued outbox entry + a read marker.
     await outbox.enqueue(createEnvelope('msg', {
       from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'A private draft' },
@@ -539,7 +543,7 @@ describe('TransportProvider', () => {
     await waitFor(() => expect(transport.sent.some((e) => e.kind === 'history.request')).toBe(true));
   });
 
-  it('approval responses wait for a server ack before settling, and surface as failed on timeout (#R2-5)', async () => {
+  it('approval responses stay durable through "received" and settle only on the terminal ack (#R2-5/#R6-2b)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
     act(() => { api.respondApproval('coordinator', 'task-9', 'approve'); });
@@ -551,10 +555,22 @@ describe('TransportProvider', () => {
     // receives this must not silently claim success (the old fire-and-forget bug).
     expect(await outbox.listForChannel('coordinator')).toHaveLength(1);
 
+    // #R6-2b: 'received' is NOT terminal for an approval — the row moves to a
+    // durable 'processing' state (still present), so a later lost terminal ack
+    // can still be recovered. It must NOT be deleted here.
     act(() => {
       transport.emit(createEnvelope('ack', {
         from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
         payload: { refId: responseEnv.id, status: 'received' },
+      }));
+    });
+    await waitFor(async () => expect((await outbox.listForChannel('coordinator'))[0]?.status).toBe('processing'));
+
+    // Only the terminal 'delivered' ack settles it.
+    act(() => {
+      transport.emit(createEnvelope('ack', {
+        from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+        payload: { refId: responseEnv.id, status: 'delivered' },
       }));
     });
     await waitFor(async () => expect(await outbox.listForChannel('coordinator')).toHaveLength(0));

@@ -1,7 +1,13 @@
 import type { AnyEnvelope } from '@raccoon/protocol';
 import { promisifyRequest, withStore, withTransaction } from './idb.js';
 
-export type OutboxStatus = 'pending' | 'sending' | 'failed';
+// 'processing' (#R6-2b): the server acked RECEIPT of this envelope but its
+// turn's terminal outcome (success/failure) has not arrived yet. Durable and
+// kept out of listPending() — it is neither retryable-yet nor safe to
+// delete: deleting on mere receipt lost the retry path when the terminal ack
+// was dropped (socket drop / reload / hung turn). recoverProcessing() re-drives
+// these on boot/reconnect (dedup-safe: the bridge re-acks the real outcome).
+export type OutboxStatus = 'pending' | 'sending' | 'processing' | 'failed';
 
 export interface OutboxEntry {
   id: string;
@@ -246,6 +252,65 @@ export async function settle(id: string): Promise<void> {
     return entry.channel;
   });
   if (channel) notify(channel);
+}
+
+/**
+ * Handle a server 'received' ack (#R6-2b). 'received' means the SERVER got
+ * the envelope — terminal for a plain msg (its reply arrives as a separate
+ * envelope; there is no post-receipt failure), so that settles. For an
+ * approval.response the turn can still succeed OR fail after receipt, and
+ * that terminal ack can be lost (socket drop / reload / hung turn) — so keep
+ * the row in a durable 'processing' state until a terminal ack ('delivered'
+ * or 'failed') arrives, rather than deleting it and losing the retry path.
+ * Authoritative (server-driven), so not claim-token gated; clears the
+ * send-claim bookkeeping either way.
+ */
+export async function acknowledgeReceipt(id: string): Promise<void> {
+  const result = await withTransaction('outbox', 'readwrite', async (s) => {
+    const entry = await promisifyRequest(s.get(id) as IDBRequest<OutboxEntry | undefined>);
+    if (!entry) return undefined;
+    if (entry.env.kind === 'approval.response') {
+      await promisifyRequest(s.put({ ...entry, status: 'processing', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
+    } else {
+      await promisifyRequest(s.delete(id)); // msg: receipt is terminal
+    }
+    return entry.channel;
+  });
+  if (result) notify(result);
+}
+
+/** Mark a row terminally failed on a server 'failed' ack (#R6-2/#R6-2b).
+ *  Authoritative (the server says the turn failed for this envelope), so —
+ *  unlike markFailed's local ack-timeout path (#R6-7) — it is NOT claim-token
+ *  gated: it applies regardless of which tab currently owns the row. Leaves a
+ *  retryable 'failed' row (see retry()). */
+export async function failByServer(id: string): Promise<void> {
+  const entry = await mutate(id, (entry) => (
+    { ...entry, status: 'failed', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }
+  ));
+  if (entry) notify(entry.channel);
+}
+
+/**
+ * Re-drive rows stuck in 'processing' by moving them back to 'pending'
+ * (#R6-2b). Called on boot and on reconnect: a terminal ack lost to a socket
+ * drop or reload otherwise leaves the row in 'processing' forever. Re-sending
+ * the SAME envelope is dedup-safe — the bridge re-acks the real outcome
+ * ('delivered' if it already succeeded, or re-runs if it had failed and was
+ * forgotten). Returns the channels touched (for a follow-up drain).
+ */
+export async function recoverProcessing(): Promise<void> {
+  const touched = await withTransaction('outbox', 'readwrite', async (s) => {
+    const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
+    const channels: string[] = [];
+    for (const entry of all) {
+      if (entry.status !== 'processing') continue;
+      await promisifyRequest(s.put({ ...entry, status: 'pending' }));
+      channels.push(entry.channel);
+    }
+    return channels;
+  });
+  for (const c of touched) notify(c);
 }
 
 /**

@@ -309,10 +309,13 @@ describe('RaccoonBridge', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]!.text).toBe('Better draft'); // editedText preferred over raw choice
     expect(seen[0]!.approval).toEqual({ refId: 'req-1', choice: 'edit', editedText: 'Better draft' });
-    // Ack first (R2-5 reliability), then typing + the agent reply.
-    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg']);
-    const reply = hub.sent[3]!.env;
+    // received ack (R2-5) → typing → reply msg → typing stop → terminal
+    // 'delivered' ack (#R6-2b) so the client settles its durable row.
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'msg', 'typing', 'ack']);
+    const first = hub.sent[0]!.env; if (first.kind === 'ack') expect(first.payload.status).toBe('received');
+    const reply = hub.sent[2]!.env;
     if (reply.kind === 'msg') expect(reply.payload.text).toBe('handled Better draft');
+    const last = hub.sent[4]!.env; if (last.kind === 'ack') expect(last.payload.status).toBe('delivered');
   });
 
   it('acks a redelivered approval.response without re-running the agent (#R2-5)', async () => {
@@ -331,9 +334,13 @@ describe('RaccoonBridge', () => {
     hub.inject(env, 'u1'); // redelivery: same envelope id
     await settle();
 
-    expect(runs).toBe(1);
+    expect(runs).toBe(1); // redelivery never re-runs the agent
     const acks = hub.sent.filter((s) => s.env.kind === 'ack');
-    expect(acks).toHaveLength(2); // both deliveries ack, so the client settles either way
+    // First delivery: 'received' then terminal 'delivered'. Redelivery (turn
+    // already 'ok'): re-emits the terminal 'delivered' so a client that lost
+    // the first one still settles — never 'received', which would strand it
+    // in 'processing' (#R6-2b).
+    expect(acks.map((a) => a.env.kind === 'ack' ? a.env.payload.status : '')).toEqual(['received', 'delivered', 'delivered']);
     for (const a of acks) if (a.env.kind === 'ack') expect(a.env.payload.refId).toBe(env.id);
   });
 
@@ -376,6 +383,39 @@ describe('RaccoonBridge', () => {
     expect(runs).toBe(2);
     const reply = hub.sent.filter((s) => s.env.kind === 'msg').at(-1)!.env;
     if (reply.kind === 'msg') expect(reply.payload.text).toBe('approved!');
+  });
+
+  it('a redelivery AFTER success re-emits the terminal delivered ack, never received (#R6-2b)', async () => {
+    // The stuck-processing bug: the client keeps its outbox row in a durable
+    // 'processing' state on 'received' and only a TERMINAL ack releases it.
+    // A redelivery of an already-succeeded approval must therefore re-emit
+    // 'delivered', not 'received' — otherwise a client that lost the first
+    // 'delivered' (socket drop / reload) re-drives the envelope and is put
+    // right back into 'processing' with nothing ever settling it.
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    let runs = 0;
+    const runner: AgentRunner = { async *run() { runs += 1; yield 'done'; } };
+    const bridge = new RaccoonBridge({ hub, runner, store });
+    bridge.start();
+    const env = createEnvelope('approval.response', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { refId: 'req-1', choice: 'Approve' },
+    });
+    hub.inject(env, 'u1');
+    await settle();
+    hub.sent.length = 0; // ignore the first delivery's acks; focus on the redelivery
+
+    hub.inject(env, 'u1'); // redelivery after success
+    await settle();
+
+    expect(runs).toBe(1); // not re-run
+    const acks = hub.sent.filter((s) => s.env.kind === 'ack');
+    expect(acks).toHaveLength(1);
+    if (acks[0]!.env.kind === 'ack') {
+      expect(acks[0]!.env.payload.status).toBe('delivered'); // terminal, not 'received'
+      expect(acks[0]!.env.payload.refId).toBe(env.id);
+    }
   });
 
   it('approval dedup eviction never removes a key whose agent turn is still running, even at cap 1 (#R4-7)', async () => {

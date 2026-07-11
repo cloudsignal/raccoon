@@ -38,12 +38,18 @@ export class RaccoonBridge {
   // Bounded FIFO — insertion-ordered Map, oldest COMPLETED entry evicted past
   // the cap.
   private readonly persisted = new Map<string, { promise: Promise<boolean>; turnDone: boolean }>();
-  // approval.response has no persistence step to gate the ack on (the ack
-  // there just means "the server received this envelope", which is always
-  // true once we're running this code), but it has the SAME turn-eviction
-  // hazard as `persisted` above — hence the same turnDone-gated eviction,
-  // via a Map instead of a plain seen-Set.
-  private readonly approvalSeen = new Map<string, boolean>();
+  // approval.response dedup + OUTCOME tracking (#R6-2b). Value is the turn's
+  // state for that (userId, envelopeId):
+  //   'running' — the turn is in flight; a duplicate re-acks 'received'.
+  //   'ok'      — the turn succeeded; a duplicate re-acks the terminal
+  //               'delivered' so a client that lost the first terminal ack
+  //               (socket drop / reload) can still settle instead of being
+  //               stuck in the durable 'processing' state.
+  // A FAILED turn deletes the key entirely (so a retry re-runs — see the
+  // failure path in handleApprovalResponse). Only 'ok' entries are eviction-
+  // eligible; a 'running' entry is never evicted mid-turn (same #R4-7 rule
+  // as `persisted`).
+  private readonly approvalSeen = new Map<string, 'running' | 'ok'>();
 
   constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; historyLimitCap?: number; dedupCap?: number }) {
     this.hub = opts.hub;
@@ -84,23 +90,10 @@ export class RaccoonBridge {
     }
   }
 
-  /** Mark a (userId, envelopeId) seen for approval.response's simple, always-
-   *  succeeds dedup. Returns true if it was ALREADY seen, plus a
-   *  markTurnDone() the caller invokes once ITS turn (only when this was
-   *  NOT already seen) finishes — see evictCompleted / #R4-7 — and an
-   *  unmark() for a FAILED turn (#R6-2): a failed turn must forget the key
-   *  entirely (mirroring claim()'s failed-append semantics), so a
-   *  redelivery/retry of the same envelope gets a clean re-run instead of
-   *  being dropped as a duplicate of an attempt that never happened. */
-  private markApprovalSeen(key: string): { alreadySeen: boolean; markTurnDone: () => void; unmark: () => void } {
-    if (this.approvalSeen.has(key)) return { alreadySeen: true, markTurnDone: () => {}, unmark: () => {} };
-    this.approvalSeen.set(key, false);
-    this.evictCompleted(this.approvalSeen, this.dedupCap, (done) => done);
-    return {
-      alreadySeen: false,
-      markTurnDone: () => { if (this.approvalSeen.has(key)) this.approvalSeen.set(key, true); },
-      unmark: () => { this.approvalSeen.delete(key); },
-    };
+  private approvalAck(userId: string, channel: string, envId: string, status: 'received' | 'delivered' | 'failed'): void {
+    this.hub.sendToUser(userId, createEnvelope('ack', {
+      from: agentAddress(channel), to: userAddress(userId), channel, payload: { refId: envId, status },
+    }));
   }
 
   /**
@@ -192,64 +185,65 @@ export class RaccoonBridge {
     }
   }
 
-  /** Route a user's approval decision to the agent as a turn. Previously dropped,
-   *  which left the requesting agent waiting forever while the UI showed
-   *  "Responded". Approval responses are fire-and-forget from the client (no ack),
-   *  so we only dedup and run the turn. */
+  /** Route a user's approval decision to the agent as a turn.
+   *
+   *  Ack lifecycle (#R6-2 / #R6-2b): the client keeps its outbox row in a
+   *  durable 'processing' state on 'received' and only settles it on a
+   *  TERMINAL ack — 'delivered' (success) or 'failed'. So this must emit a
+   *  terminal ack for every outcome, and re-emit the right one on a
+   *  duplicate: a client that lost the first terminal ack (socket drop,
+   *  reload) re-drives the same envelope, and dedup must tell it the real
+   *  outcome instead of stranding it. 'received' before a duplicate that has
+   *  already SUCCEEDED would leave the client stuck in 'processing' forever. */
   private async handleApprovalResponse(env: Extract<AnyEnvelope, { kind: 'approval.response' }>, userId: string): Promise<void> {
     const channel = env.channel;
     const agent = agentAddress(channel);
     const to = userAddress(userId);
     const { refId, choice, editedText } = env.payload;
+    const key = `${userId}:${env.id}`;
 
-    // Ack unconditionally, including on a redelivery: this envelope has no
-    // durable-persistence step to gate on (unlike handleMsg's append), so
-    // there is no "silently swallowed" risk in acking a duplicate. The ack
-    // gives the client round-trip confirmation — without it, "Responded" was
-    // shown the instant the browser accepted the send buffer, so a connection
-    // drop between that and the server actually receiving it silently lost
-    // the decision while the UI claimed success.
-    this.hub.sendToUser(userId, createEnvelope('ack', {
-      from: agent, to, channel, payload: { refId: env.id, status: 'received' },
-    }));
+    const prior = this.approvalSeen.get(key);
+    if (prior !== undefined) {
+      // Duplicate: never re-run. Re-emit the outcome-appropriate ack so a
+      // client that lost the original can converge — 'delivered' if the turn
+      // already succeeded, 'received' while it is still running.
+      this.approvalAck(userId, channel, env.id, prior === 'ok' ? 'delivered' : 'received');
+      return;
+    }
 
-    const { alreadySeen, markTurnDone, unmark } = this.markApprovalSeen(`${userId}:${env.id}`);
-    if (alreadySeen) return;
+    this.approvalSeen.set(key, 'running');
+    // Only 'ok' entries are eviction-eligible; a 'running' turn is never
+    // evicted (same #R4-7 rule as `persisted`).
+    this.evictCompleted(this.approvalSeen, this.dedupCap, (v) => v === 'ok');
+    this.approvalAck(userId, channel, env.id, 'received'); // server got it; client → 'processing'
 
-    // R4-7: see handleMsg's matching comment — markTurnDone() only after the
-    // turn (success OR failure) fully resolves.
+    this.hub.sendToUser(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
+    let ok = false;
     try {
-      this.hub.sendToUser(userId, createEnvelope('typing', {
-        from: agent, to, channel, payload: { state: 'start' },
-      }));
-
       const { reply, failed } = await this.runTurn({
         userId, channel, text: editedText ?? choice, messageId: env.id,
         approval: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
       });
-
-      this.hub.sendToUser(userId, createEnvelope('typing', {
-        from: agent, to, channel, payload: { state: 'stop' },
-      }));
-
-      if (failed) {
-        // #R6-2: a failed approval turn must remain retryable END TO END.
-        // Forget the envelope (a redelivery re-runs, matching claim()'s
-        // failed-append semantics) and tell the client machine-readably —
-        // the 'received' ack above already settled its outbox row and hid
-        // the approval controls, so without this second, FAILED ack the
-        // client showed "Responded" forever while the runner-side approval
-        // mapping (released by its rollback, #R6-1) sat unreachable.
-        unmark();
-        this.hub.sendToUser(userId, createEnvelope('ack', {
-          from: agent, to, channel, payload: { refId: env.id, status: 'failed' },
-        }));
-        this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
-        return;
-      }
-      await this.emitReply(userId, channel, reply);
+      if (!failed) { await this.emitReply(userId, channel, reply); ok = true; }
+    } catch {
+      // emitReply (store.append) or an unexpected throw: treat as failure.
+      ok = false;
     } finally {
-      markTurnDone();
+      this.hub.sendToUser(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'stop' } }));
+    }
+
+    if (ok) {
+      this.approvalSeen.set(key, 'ok');
+      this.approvalAck(userId, channel, env.id, 'delivered'); // TERMINAL success → client settles
+    } else {
+      // #R6-2: keep the decision retryable end to end. Forget the envelope so
+      // a redelivery/retry re-runs (matching claim()'s failed-append
+      // semantics), tell the client machine-readably (it holds the row in
+      // 'processing' and only a terminal ack releases it), and surface the
+      // error text.
+      this.approvalSeen.delete(key);
+      this.approvalAck(userId, channel, env.id, 'failed');
+      this.hub.sendToUser(userId, createEnvelope('msg', { from: agent, to, channel, payload: { text: GENERIC_ERROR } }));
     }
   }
 
