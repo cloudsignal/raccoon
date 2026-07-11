@@ -568,6 +568,62 @@ describe('createRaccoonOutbound', () => {
     expect(result.messageId).toBe(env.id);
   });
 
+  it('a disabled button is not offered as an approval choice (#R7-6)', async () => {
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined },
+    });
+    await adapter.sendPayload!({
+      ...makeCtx('Deploy?', 'user:alice'),
+      payload: {
+        text: 'Deploy?',
+        presentation: {
+          blocks: [{
+            type: 'buttons',
+            buttons: [
+              { label: 'Allow', action: { type: 'command', command: 'approve x allow-once' } },
+              { label: 'Deny', disabled: true, action: { type: 'command', command: 'approve x deny' } },
+            ],
+          }],
+        },
+      },
+    });
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('approval.request');
+    if (env.kind === 'approval.request') expect(env.payload.options).toEqual(['Allow']); // Deny filtered out
+    const labelToChoice = remember.mock.calls[0]![2];
+    expect(labelToChoice.has('Deny')).toBe(false); // never a live choice
+  });
+
+  it('a presentation with DUPLICATE labels is not rendered as ambiguous buttons — it degrades to text (#R7-6)', async () => {
+    // Two 'Allow' buttons with DIFFERENT commands: the wire carries only the
+    // label, so a click could execute the wrong command. Reject the
+    // actionable rendering (degrade to a plain msg) rather than guess.
+    mockChunk.mockReturnValue(['Confirm']);
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined },
+    });
+    await adapter.sendPayload!({
+      ...makeCtx('Confirm', 'user:alice'),
+      payload: {
+        text: 'Confirm',
+        presentation: {
+          blocks: [{
+            type: 'buttons',
+            buttons: [
+              { label: 'Allow', action: { type: 'command', command: 'approve a allow-once' } },
+              { label: 'Allow', action: { type: 'command', command: 'approve b deny' } },
+            ],
+          }],
+        },
+      },
+    });
+    const env = hub.envelopes[0]!;
+    expect(env.kind).toBe('msg'); // degraded — NOT an approval.request
+    expect(remember).not.toHaveBeenCalled(); // no ambiguous label→command mapping recorded
+  });
+
   it('sendPayload resolves a select OPTION\'s command action to a real slash command, not bracket text (#R6-9b)', async () => {
     // Real SDK 2026.6.11: MessagePresentationOption has action?: like a
     // button. An exec approval rendered as a SELECT (not buttons) whose

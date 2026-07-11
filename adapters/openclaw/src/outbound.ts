@@ -257,13 +257,27 @@ async function deliverPresentation(
   const buttons = findPresentationButtons(presentation);
   const selectOptions = buttons === null ? findPresentationSelect(presentation) : null;
 
-  if (buttons !== null || selectOptions !== null) {
-    const choices: Array<{ label: string; choice: ApprovalChoice }> = buttons !== null
-      ? buttons.map((b) => ({ label: b.label, choice: resolveChoice(b) }))
+  // #R7-6: build the actionable choice list defensively.
+  //  - Disabled buttons are NOT choices (a disabled control must never become
+  //    a live approval option). Options have no `disabled` field in the SDK.
+  //  - Labels are the ONLY identifier carried over the wire (the OAM
+  //    approval.request payload has just `options: string[]`, and the response
+  //    echoes the clicked label). Duplicate labels are therefore fundamentally
+  //    ambiguous — a last-wins map could execute the WRONG action for a click.
+  //    Rather than guess, reject the actionable rendering and fall through to
+  //    a plain-text listing (no executable buttons), which is safe.
+  const rawChoices: Array<{ label: string; choice: ApprovalChoice }> | null = buttons !== null
+    ? buttons.filter((b) => !b.disabled).map((b) => ({ label: b.label, choice: resolveChoice(b) }))
+    : selectOptions !== null
       // #R6-9b: select options carry the same action?/value/label shape as
       // buttons — resolve them the same action-aware way.
-      : selectOptions!.map((o) => ({ label: o.label, choice: resolveChoice(o) }));
+      ? selectOptions.map((o) => ({ label: o.label, choice: resolveChoice(o) }))
+      : null;
+  const hasDuplicateLabels = rawChoices !== null
+    && new Set(rawChoices.map((c) => c.label)).size !== rawChoices.length;
+  const choices = rawChoices !== null && rawChoices.length > 0 && !hasDuplicateLabels ? rawChoices : null;
 
+  if (choices !== null) {
     const refId = ulid();
     const title = presentation.title?.trim()
       || (fallbackText.trim().length > 0 ? fallbackText.trim() : 'Approval required');
