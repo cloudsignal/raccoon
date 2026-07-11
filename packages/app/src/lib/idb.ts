@@ -37,6 +37,7 @@ export function openDb(): Promise<IDBDatabase> {
       return;
     }
     let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false; // #R10: track whether the blocked-timeout already rejected
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
@@ -59,12 +60,18 @@ export function openDb(): Promise<IDBDatabase> {
       console.warn('[idb] open blocked: another tab is holding an older DB version open');
       if (blockedTimer) return;
       blockedTimer = setTimeout(() => {
+        settled = true;
         reject(new Error('idb open blocked: another tab holds an older DB version; reload required'));
       }, blockedTimeoutMs);
     };
     req.onsuccess = () => {
       if (blockedTimer) clearTimeout(blockedTimer);
       const db = req.result;
+      // #R10: if the blocked-timeout already rejected, the block later cleared
+      // and this open succeeded LATE. An IDBOpenDBRequest can't be aborted, so
+      // just close the now-leaked connection instead of resolving a promise the
+      // caller already gave up on (and which the p.catch has nulled).
+      if (settled) { db.close(); return; }
       db.onversionchange = () => {
         // A newer tab needs to upgrade the schema — yield so it isn't blocked,
         // and drop the cached connection so the next openDb() reconnects at
@@ -76,6 +83,7 @@ export function openDb(): Promise<IDBDatabase> {
     };
     req.onerror = () => {
       if (blockedTimer) clearTimeout(blockedTimer);
+      settled = true;
       reject(req.error);
     };
   });

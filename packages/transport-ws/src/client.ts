@@ -19,6 +19,10 @@ type WsLike = {
 type WsCtor = new (url: string) => WsLike;
 
 const AUTH_CLOSE_CODES = new Set([4401, 4403, 4429]);
+// #R10: max wait for the hub's pair.confirmed after sending pair.confirm; on
+// expiry the client closes the socket so connect() rejects and reconnects
+// (resuming the now-adopted session) rather than hanging on a lost ACK.
+const CONFIRM_ACK_TIMEOUT_MS = 10_000;
 
 export interface WsClientOptions {
   url: string;
@@ -101,6 +105,12 @@ export class WsClientTransport implements Transport {
       // Success (established/grantHandlers/resolve) is DEFERRED until then, so a
       // lost/failed confirm never reports a false "paired".
       let pendingGrant: Envelope<'pair.grant'> | null = null;
+      // #R10 (adv): if pair.confirmed is LOST while the socket stays open, the
+      // client would hang forever waiting. Bound the wait: close the socket so
+      // connect() rejects and the reconnect resumes with the now-adopted
+      // (server-side durable) session token.
+      let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearConfirmTimer = () => { if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
 
       ws.addEventListener('open', () => {
         if (this.opts.session) {
@@ -140,10 +150,13 @@ export class WsClientTransport implements Transport {
                 payload: { sessionToken: env.payload.sessionToken },
               })));
             } catch { /* best-effort; a lost confirm surfaces as connect() rejecting on close */ }
+            clearConfirmTimer();
+            confirmTimer = setTimeout(() => { try { ws.close(); } catch { /* already closing */ } }, CONFIRM_ACK_TIMEOUT_MS);
             return;
           }
           if (env?.kind === 'pair.confirmed' && pendingGrant && env.payload.sessionToken === pendingGrant.payload.sessionToken) {
             // #R10: the hub promoted the session — NOW report success.
+            clearConfirmTimer();
             const granted = pendingGrant;
             pendingGrant = null;
             for (const h of this.grantHandlers) h(granted);
@@ -159,6 +172,7 @@ export class WsClientTransport implements Transport {
       });
 
       ws.addEventListener('close', (event: { code: number }) => {
+        clearConfirmTimer();
         const wasOpen = this.status === 'open';
         this.setStatus('closed');
         this.ws = null;
