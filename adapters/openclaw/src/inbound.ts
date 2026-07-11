@@ -110,6 +110,7 @@ export function buildRaccoonInboundRunner(
 function buildApprovalText(
   approval: NonNullable<AgentContext['approval']>,
   resolved: ApprovalChoice | undefined,
+  editValidated: boolean,
 ): string {
   if (resolved?.isCommand && approval.editedText === undefined) {
     // Normalize to EXACTLY one leading slash (#R5-2): OpenClaw supplies
@@ -118,8 +119,16 @@ function buildApprovalText(
     // OpenClaw's command parser does not recognize as a command at all.
     return `/${resolved.value.replace(/^\/+/, '')}`;
   }
-  const tag = `[approval.response refId=${approval.refId} choice=${resolved?.value ?? approval.choice}]`;
-  return approval.editedText !== undefined ? `${tag} ${approval.editedText}` : tag;
+  if (approval.editedText !== undefined) {
+    // #R7-CQ: only correlate the edit to its refId if it passed validation
+    // (this user's own, still-valid, real approval). An unvalidated edit is
+    // delivered as a plain, uncorrelated message — it must not tag itself to
+    // a refId it has no authorized claim to.
+    return editValidated
+      ? `[approval.response refId=${approval.refId} choice=${approval.choice}] ${approval.editedText}`
+      : approval.editedText;
+  }
+  return `[approval.response refId=${approval.refId} choice=${resolved?.value ?? approval.choice}]`;
 }
 
 async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIterable<string> {
@@ -176,8 +185,17 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
   const resolvedApproval = ctx.approval && ctx.approval.editedText === undefined
     ? opts.approvalValues?.resolve(ctx.approval.refId, ctx.userId, ctx.approval.choice)
     : undefined;
+  // #R7-CQ: an EDITED response never reserves (above), but it must still be a
+  // VALIDATED answer to this user's own, still-valid, real approval before it
+  // is correlated to that refId. Otherwise a crafted edit could tag itself to
+  // ANOTHER user's / an expired / an unlisted-choice refId. Validate
+  // (read-only: ownership + TTL + exact-choice); if it fails, drop the refId
+  // correlation and treat the text as a plain, uncorrelated message.
+  const editValidated = ctx.approval !== undefined
+    && ctx.approval.editedText !== undefined
+    && (opts.approvalValues?.validate(ctx.approval.refId, ctx.userId, ctx.approval.choice) ?? false);
   const approvalText = ctx.approval
-    ? buildApprovalText(ctx.approval, resolvedApproval?.choice)
+    ? buildApprovalText(ctx.approval, resolvedApproval?.choice, editValidated)
     : ctx.text;
 
   // Build a minimal FinalizedMsgContext from the Raccoon AgentContext.

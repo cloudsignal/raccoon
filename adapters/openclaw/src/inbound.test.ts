@@ -299,6 +299,42 @@ describe('buildRaccoonInboundRunner', () => {
     expect(bodies[1]).toBe('/approve req-8 allow-once'); // the real click still executed
   });
 
+  it('an edited response is correlated to its refId only when it VALIDATES against the caller\'s own approval (#R7-CQ)', async () => {
+    const bodies: string[] = [];
+    mockDispatch.mockImplementation(async (arg) => {
+      bodies.push((arg.ctxPayload as { Body: string }).Body);
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    const store = createApprovalValueStore();
+    // The approval belongs to a DIFFERENT user; ctx.userId does not own it.
+    store.remember('req-x', 'someone-else', new Map([['Approve', { value: 'approve req-x allow-once', isCommand: true }]]));
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+
+    // An edited response from ctx.userId, tagging another user's refId, must
+    // NOT be correlated (no bracket tag / refId leakage) — just plain text.
+    await (async () => {
+      for await (const _ of runner.run({
+        ...ctx, text: 'sneaky', approval: { refId: 'req-x', choice: 'Approve', editedText: 'sneaky' },
+      })) { /* drain */ }
+    })();
+    expect(bodies[0]).toBe('sneaky');
+    expect(bodies[0]).not.toContain('req-x'); // no cross-user refId correlation
+
+    // The SAME user's own valid approval, edited, IS correlated.
+    store.remember('req-y', ctx.userId, new Map([['Approve', { value: 'approve req-y allow-once', isCommand: true }]]));
+    await (async () => {
+      for await (const _ of runner.run({
+        ...ctx, text: 'my note', approval: { refId: 'req-y', choice: 'Approve', editedText: 'my note' },
+      })) { /* drain */ }
+    })();
+    expect(bodies[1]).toContain('req-y'); // correlated
+    expect(bodies[1]).toContain('my note');
+    expect(bodies[1]).not.toMatch(/^\//); // still not a command (edited)
+  });
+
   it('a transient dispatch failure does not burn the approval — the retry still resolves the command (#R5-8)', async () => {
     let capturedBody: string | undefined;
     mockDispatch

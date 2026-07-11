@@ -263,7 +263,7 @@ describe('createRaccoonOutbound', () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
       hub, channel: 'coordinator',
-      approvalValues: { remember, resolve: () => undefined },
+      approvalValues: { remember, resolve: () => undefined, validate: () => false },
     });
     const ctx = {
       ...makeCtx('Choose:', 'user:alice'),
@@ -519,7 +519,7 @@ describe('createRaccoonOutbound', () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
       hub, channel: 'coordinator',
-      approvalValues: { remember, resolve: () => undefined },
+      approvalValues: { remember, resolve: () => undefined, validate: () => false },
     });
     await adapter.sendPayload!({
       ...makeCtx('Choose:', 'user:alice'),
@@ -571,7 +571,7 @@ describe('createRaccoonOutbound', () => {
   it('a disabled button is not offered as an approval choice (#R7-6)', async () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
-      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined },
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined, validate: () => false },
     });
     await adapter.sendPayload!({
       ...makeCtx('Deploy?', 'user:alice'),
@@ -602,7 +602,7 @@ describe('createRaccoonOutbound', () => {
     mockChunk.mockReturnValue(['Confirm']);
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
-      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined },
+      hub, channel: 'coordinator', approvalValues: { remember, resolve: () => undefined, validate: () => false },
     });
     await adapter.sendPayload!({
       ...makeCtx('Confirm', 'user:alice'),
@@ -633,7 +633,7 @@ describe('createRaccoonOutbound', () => {
     const remember = vi.fn();
     const adapter = createRaccoonOutbound({
       hub, channel: 'coordinator',
-      approvalValues: { remember, resolve: () => undefined },
+      approvalValues: { remember, resolve: () => undefined, validate: () => false },
     });
     await adapter.sendPayload!({
       ...makeCtx('Approve deploy?', 'user:alice'),

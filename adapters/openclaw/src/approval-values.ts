@@ -108,6 +108,15 @@ export interface ApprovalValueStore {
    * from both dispatching for one approval.)
    */
   resolve(refId: string, userId: string, label: string): ResolvedApproval | undefined;
+  /**
+   * Validate a (refId, userId, label) triple WITHOUT reserving or consuming
+   * (#R7-CQ). Same ownership + TTL + exact-choice checks as resolve(), but
+   * read-only: used for an EDITED response, which never executes the command
+   * (so it must not reserve, #R6-1b) yet still must be an authorized answer to
+   * THIS user's own, still-valid, real approval before it is correlated to
+   * that refId. Returns true only if all checks pass.
+   */
+  validate(refId: string, userId: string, label: string): boolean;
 }
 
 interface StoredApproval {
@@ -125,6 +134,13 @@ export function createApprovalValueStore(cap = DEFAULT_CAP, ttlMs = DEFAULT_TTL_
         const oldest = byRefId.keys().next().value;
         if (oldest !== undefined) byRefId.delete(oldest);
       }
+    },
+    validate(refId, userId, label) {
+      const stored = byRefId.get(refId);
+      if (!stored) return false;
+      if (stored.userId !== userId) return false;                 // ownership
+      if (Date.now() - stored.issuedAt > ttlMs) return false;     // TTL (read-only: don't evict here)
+      return stored.choices.has(label);                           // exact-choice
     },
     resolve(refId, userId, label) {
       const stored = byRefId.get(refId);
