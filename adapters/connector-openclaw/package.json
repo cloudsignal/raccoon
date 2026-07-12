@@ -20,7 +20,7 @@
   },
   "openclaw": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ],
     "channel": {
       "id": "raccoon",
@@ -32,10 +32,12 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./openclaw.plugin.json": "./openclaw.plugin.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "openclaw.plugin.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json"
