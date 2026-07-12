@@ -31,6 +31,14 @@ export interface WsClientOptions {
   device?: string;
   WebSocketImpl?: WsCtor;
   maxBackoffMs?: number;
+  /**
+   * #R10: max wait (ms) for the hub's pair.confirmed after sending pair.confirm
+   * before the client closes the socket to force a resume of the now-adopted
+   * session. Defaults to {@link CONFIRM_ACK_TIMEOUT_MS} (10s). Injectable so
+   * deployments can tune the lost-ACK recovery latency (and tests can drive it
+   * without a real 10s wait) — same role as {@link WsClientOptions.maxBackoffMs}.
+   */
+  confirmAckTimeoutMs?: number;
 }
 
 export class WsClientTransport implements Transport {
@@ -151,7 +159,7 @@ export class WsClientTransport implements Transport {
               })));
             } catch { /* best-effort; a lost confirm surfaces as connect() rejecting on close */ }
             clearConfirmTimer();
-            confirmTimer = setTimeout(() => { try { ws.close(); } catch { /* already closing */ } }, CONFIRM_ACK_TIMEOUT_MS);
+            confirmTimer = setTimeout(() => { try { ws.close(); } catch { /* already closing */ } }, this.opts.confirmAckTimeoutMs ?? CONFIRM_ACK_TIMEOUT_MS);
             return;
           }
           if (env?.kind === 'pair.confirmed' && pendingGrant && env.payload.sessionToken === pendingGrant.payload.sessionToken) {

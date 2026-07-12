@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createEnvelope, type AnyEnvelope, type TransportStatus } from '@raccoon/protocol';
+import WebSocket from 'ws';
 import { WsHub } from './hub.js';
-import { WsClientTransport } from './client.js';
+import { WsClientTransport, type WsClientOptions } from './client.js';
 
 let hub: WsHub;
 let client: WsClientTransport;
@@ -11,6 +12,34 @@ function msgTo(agent: string, text: string): AnyEnvelope {
   return createEnvelope('msg', {
     from: 'user:u1', to: `agent:${agent}`, channel: agent, payload: { text },
   });
+}
+
+// A client-side WebSocket ctor that DROPS incoming `pair.confirmed` frames,
+// simulating a confirm ACK lost in transit AFTER the hub already durably
+// promoted the session. Everything else passes through to a real `ws` socket.
+type WsImpl = NonNullable<WsClientOptions['WebSocketImpl']>;
+function dropConfirmedWs(): WsImpl {
+  class DropConfirmed {
+    private ws: WebSocket;
+    constructor(url: string) { this.ws = new WebSocket(url); }
+    get readyState(): number { return this.ws.readyState; }
+    send(data: string): void { this.ws.send(data); }
+    close(code?: number, reason?: string): void { this.ws.close(code, reason); }
+    addEventListener(type: string, listener: (event: { data?: unknown; code?: number }) => void): void {
+      if (type === 'message') {
+        this.ws.addEventListener('message', (event: { data: unknown }) => {
+          try {
+            const parsed = JSON.parse(String(event.data)) as { kind?: string };
+            if (parsed?.kind === 'pair.confirmed') return; // dropped in transit
+          } catch { /* non-JSON — pass through */ }
+          listener(event);
+        });
+      } else {
+        this.ws.addEventListener(type as 'open', listener as () => void);
+      }
+    }
+  }
+  return DropConfirmed as unknown as WsImpl;
 }
 
 describe('WsClientTransport', () => {
@@ -142,6 +171,62 @@ describe('WsClientTransport', () => {
     await client.send(msgTo('coordinator', 'after-restart'));
     const got = await echoed;
     expect(got.kind).toBe('msg');
+  });
+
+  it('recovers a LOST pair.confirmed by resuming the durably-adopted session, with no ghost session (#R10)', async () => {
+    // The hub DOES promote (confirmSession → true) and sends pair.confirmed,
+    // but the client's socket drops that frame. The client must NOT hang and
+    // must NOT re-pair: it closes the socket on the confirm-ack timeout, then
+    // reconnects RESUMING the session it adopted at grant time — the same one
+    // the hub durably promoted. No second createSession (no ghost session).
+    let createCount = 0;
+    const sessions = new Map<string, string>();
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async (u: string) => {
+          createCount += 1;
+          const t = `sess-${u}-${createCount}`;
+          sessions.set(t, u);
+          return t;
+        },
+        verifySession: async (t: string) => sessions.get(t) ?? null,
+        confirmSession: async () => true, // durably promotes → hub emits pair.confirmed
+        revokeUser: async () => {},
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    client = new WsClientTransport({
+      url: `ws://127.0.0.1:${port}/`,
+      pairingToken: token,
+      device: 'vitest',
+      WebSocketImpl: dropConfirmedWs(), // pair.confirmed never reaches the client
+      confirmAckTimeoutMs: 200,         // fire the lost-ACK recovery fast (vs 10s default)
+      maxBackoffMs: 300,
+    });
+
+    const opened = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5_000);
+      client.onStatus((s) => { if (s === 'open') { clearTimeout(timer); resolve(true); } });
+    });
+
+    // The FIRST dial rejects: with pair.confirmed dropped, the confirm-ack timer
+    // closes the socket and connect() rejects on that handshake-phase close.
+    // Recovery happens on the background reconnect.
+    await client.connect().catch(() => { /* expected: lost ACK closes the first dial */ });
+
+    // The reconnect resumes the adopted+promoted session and reports open — with
+    // exactly ONE createSession (the initial provisional), proving no ghost and
+    // that the client resumed rather than re-paired.
+    expect(await opened).toBe(true);
+    expect(createCount).toBe(1);
+
+    // The resumed connection is fully live: the hub receives a subsequent send.
+    const echoed = new Promise<AnyEnvelope>((resolve) => hub.onEnvelope((env) => resolve(env)));
+    await client.send(msgTo('coordinator', 'after-recovery'));
+    expect((await echoed).kind).toBe('msg');
   });
 
   it('reconnects a session-backed client that starts while the hub is down (#4 offline-start)', async () => {
