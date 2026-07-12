@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import jsQR from 'jsqr';
+// jsqr ships as CJS (module.exports = fn) with an ESM-style `export default`
+// .d.ts. NodeNext types the default as the namespace, but the value is callable
+// at runtime under both the lib build and Bundler test/dev resolution. Bind it
+// to the real callable via an explicit function type, preferring `.default`.
+import * as jsqr from 'jsqr';
+type JsQR = (data: Uint8ClampedArray, width: number, height: number, opts?: jsqr.Options) => jsqr.QRCode | null;
+const jsQR: JsQR = ((jsqr as unknown as { default?: JsQR }).default ?? (jsqr as unknown as JsQR));
 
 export function QrScanner(props: { onResult: (text: string) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);

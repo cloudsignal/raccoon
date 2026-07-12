@@ -19,5 +19,6 @@
     "@cloudsignal/pwa-sdk": {
       "optional": true
     }
-  }
+  },
+  "private": true
 }

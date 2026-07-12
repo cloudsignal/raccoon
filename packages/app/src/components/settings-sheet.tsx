@@ -1,4 +1,5 @@
 import { useChat } from '../transport/context.js';
+import { RACCOON_BUILD_ID } from '../build-id.js';
 
 export function SettingsSheet(props: { open: boolean; onClose: () => void }) {
   const { session, unpair } = useChat();
@@ -21,7 +22,7 @@ export function SettingsSheet(props: { open: boolean; onClose: () => void }) {
         >
           Unpair this device
         </button>
-        <p className="mt-3 text-center text-xs text-ink-faint">build {__RACCOON_BUILD_ID__}</p>
+        <p className="mt-3 text-center text-xs text-ink-faint">build {RACCOON_BUILD_ID}</p>
       </div>
     </div>
   );

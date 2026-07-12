@@ -1,14 +1,14 @@
 /**
  * @raccoon/app — library surface for host embedding.
  *
- * A downstream host app imports from this file via the vendored source path.
- * Do NOT add build/exports-map entries here — the host resolves this file
- * directly.
+ * This is the package ROOT entry (see package.json "exports"). A host installs
+ * @raccoon/app and imports from the package name — never a /src path.
  *
  * Host-embedding contract (already-authenticated transport):
  *
- *   import { App, TransportProvider, UpdateGate } from '@raccoon/app/src/lib.js';
- *   import type { AppTransport, Session } from '@raccoon/app/src/lib.js';
+ *   import { App, TransportProvider, UpdateGate } from '@raccoon/app';
+ *   import type { AppTransport, Session } from '@raccoon/app';
+ *   import '@raccoon/app/styles.css';
  *
  *   const myTransport = new MyTransport({ ... }); // any AppTransport the host owns + authenticates
  *   const mySession: Session = {
@@ -55,9 +55,8 @@ export { TransportProvider, useChat } from './transport/context.js';
 export type { ChatApi, TransportProviderProps, PushRegistrar } from './transport/context.js';
 export type { AppTransport, MakeTransport } from './transport/types.js';
 
-// #A4 (vendor-neutral): the push-registrar factory belongs on the public
-// surface so a host wiring a VAPID-over-HTTP registrar does not deep-import
-// '@raccoon/app/src/lib/push-registrar-http.js'.
+// The push-registrar factory belongs on the public surface so a host wiring a
+// VAPID-over-HTTP registrar does not reach into internal modules.
 export { createHttpPushRegistrar } from './lib/push-registrar-http.js';
 
 // Session type — hosts using transportOverride need this for sessionOverride

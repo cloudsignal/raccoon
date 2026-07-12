@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { isUpdateHeld } from '../lib/update-hold.js';
 import { runUpdateCheck } from '../lib/update-check.js';
+import { RACCOON_BUILD_ID } from '../build-id.js';
 
 const CHECK_INTERVAL_MS = 60_000;
 
@@ -36,7 +37,7 @@ export function UpdateGate() {
 
     const check = (): void => {
       void runUpdateCheck({
-        buildId: __RACCOON_BUILD_ID__,
+        buildId: RACCOON_BUILD_ID,
         fetchVersion,
         updateRegistrations,
         purgeShellCache,

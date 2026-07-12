@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import raw from '../raccoon.config.json';
+import raw from '../raccoon.config.json' with { type: 'json' };
 
 export type ChannelTone = 'navy' | 'amber' | 'violet' | 'rose' | 'emerald';
 
