@@ -3,10 +3,10 @@ import { kvDeleteIf, kvGet, kvSet, kvUpdate } from './idb.js';
 
 const sessionSchema = z.object({
   // #A3 (vendor-neutral): url + sessionToken are WS-transport auth fields. A
-  // host-managed session (CloudSignal/MQTT authed out-of-band) has no use for
-  // them — the provider in override mode reads neither (identityKey uses the
-  // epoch, never the token; the transport is supplied, not dialed from url).
-  // Optional so a host no longer has to pass placeholder ''/'gtm' values.
+  // host-managed session (authed out-of-band) has no use for them — the
+  // provider in override mode reads neither (identityKey uses the epoch, never
+  // the token; the transport is supplied, not dialed from url). Optional so a
+  // host no longer has to pass placeholder ''/dummy values.
   url: z.string().min(1).optional(),
   sessionToken: z.string().min(1).optional(),
   userId: z.string().min(1),

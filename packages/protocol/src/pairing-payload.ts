@@ -1,8 +1,8 @@
 import { z } from 'zod';
 
 // #A1 (vendor-neutral): `transport` is a NON-BINDING descriptor of the realtime
-// transport a host runs, not a WS-only literal. A CloudSignal/MQTT-backed host
-// (e.g. GTM) advertises transport:'cloudsignal' instead of lying with 'ws';
+// transport a host runs, not a WS-only literal. A host on a managed/broker-backed
+// transport advertises its own transport id instead of lying with 'ws';
 // omitting it is also valid (the client resolves the transport from its own
 // wiring). Kept backward-compatible: legacy {transport:'ws'} payloads still
 // parse, and 'ws' remains the build default. A future protocol rev folds this

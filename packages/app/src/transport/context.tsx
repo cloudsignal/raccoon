@@ -766,7 +766,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // outbox rows from a prior mount are stranded (unclaimable). A host
         // with durable local state MUST supply a stable, non-secret epoch.
         // Warn in dev rather than reject (rejecting would break the documented
-        // token-less override path); GTM already supplies one.
+        // token-less override path); a managed host with durable state supplies one.
         if (props.sessionOverride.epoch === undefined && process.env.NODE_ENV !== 'production') {
           console.warn('[raccoon] sessionOverride has no epoch: a fresh one is minted per mount, stranding durable outbox rows across remounts. Supply a stable non-secret epoch.');
         }

@@ -80,8 +80,8 @@ function isPrivateIp(rawHost: string): boolean {
  * True if `endpoint` is a plausible, non-internal standard web-push endpoint:
  * a well-formed https URL whose host matches a known push vendor and is not
  * localhost or a literal private / loopback / link-local / metadata / ULA IP.
- * Vendor-scheme endpoints (e.g. `cloudsignal:<id>`) are NOT web-push URLs and
- * must be validated by their vendor, not here.
+ * Non-URL vendor-scheme endpoints (e.g. a custom `scheme:<id>`) are NOT
+ * web-push URLs and must be validated by their vendor, not here.
  */
 export function isSafeWebPushEndpoint(endpoint: string): boolean {
   let url: URL;
