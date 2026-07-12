@@ -1,40 +1,106 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CredentialStore } from './credential-store.js';
 
 const DEFAULT_PROVISIONAL_SESSION_TTL_MS = 30_000;
 
+// Locks this process holds, cleaned up on exit (covers a graceful shutdown that
+// forgot to close(); a crash leaves a stale lock that the next owner reclaims
+// after an isAlive check).
+const heldLocks = new Set<string>();
+let exitHookInstalled = false;
+function installExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on('exit', () => {
+    for (const lock of heldLocks) { try { unlinkSync(lock); } catch { /* best-effort */ } }
+  });
+}
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM'; } // EPERM = exists, not ours
+}
+
 /**
- * A {@link CredentialStore} that PERSISTS confirmed sessions to a JSON file, so
- * they survive a process restart — the missing piece for production durability
- * (the in-memory MemoryCredentialStore loses every session when the connector
- * process bounces, forcing all paired devices to re-pair).
+ * A {@link CredentialStore} that PERSISTS confirmed sessions to a JSON file so
+ * they survive a process restart. Correctness under persistence failure is the
+ * whole point here (a swallowed write error must never masquerade as a durable
+ * confirm or a durable revoke):
  *
- * Design:
- * - Only CONFIRMED (durable) sessions are written to disk. Provisional
- *   (unconfirmed) sessions are in-memory only: they are short-lived (a 30s TTL)
- *   and a restart mid-pairing legitimately means "scan the QR again", so there
- *   is nothing worth persisting there.
- * - Writes are atomic (temp file + rename) and the file is mode 0600 — it holds
- *   bearer session tokens.
- * - A corrupt/unreadable file is treated as empty (start fresh; a re-pair
- *   recovers) rather than crashing the connector on boot.
+ * - Writes are atomic (temp file + rename) and mode 0600 (bearer tokens).
+ * - A persistence failure PROPAGATES. confirmSession() only reports success
+ *   after the disk commit succeeds (on failure it rolls the promotion back and
+ *   throws — WsHub treats that as "not promoted", so no pair.confirmed ACK).
+ * - revokeUser()/revokeSession() NEVER report a durable revocation while the
+ *   token remains on disk: if the commit fails they roll the in-memory removal
+ *   back (so a retry re-attempts it) and throw, instead of silently succeeding
+ *   and letting the revoked token resurrect on the next restart.
+ * - Single-writer: the constructor acquires an exclusive lock (`<path>.lock`,
+ *   O_EXCL). A second live process on the same path fails fast rather than
+ *   silently clobbering the file (which could lose sessions or resurrect a
+ *   revocation). A stale lock from a dead process is reclaimed. Call close()
+ *   (or exit the process) to release.
  *
- * Semantics match MemoryCredentialStore exactly (provisional-until-confirmed,
- * verify only confirmed + non-expired, idempotent confirm), so it is a drop-in
- * for WsHub's `store`.
+ * Only CONFIRMED sessions are persisted; provisional (unconfirmed) sessions are
+ * in-memory only (short-lived, re-pair on restart). A corrupt file loads as
+ * empty rather than crashing the connector on boot.
  */
 export class FileCredentialStore implements CredentialStore {
   private readonly confirmed = new Map<string, string>(); // token -> userId (durable, persisted)
   private readonly provisional = new Map<string, { userId: string; expiresAt: number }>(); // in-memory only
   private readonly path: string;
+  private readonly lockPath: string;
   private readonly provisionalTtlMs: number;
+  private closed = false;
 
   constructor(opts: { path: string; provisionalSessionTtlMs?: number }) {
     this.path = opts.path;
+    this.lockPath = `${opts.path}.lock`;
     this.provisionalTtlMs = opts.provisionalSessionTtlMs ?? DEFAULT_PROVISIONAL_SESSION_TTL_MS;
+    mkdirSync(dirname(this.path), { recursive: true }); // ensure the dir for lock + store (throws loudly on a bad path)
+    this.acquireLock();
     this.load();
+    installExitHook();
+  }
+
+  private acquireLock(): void {
+    // In-process: another live store instance in THIS process holds it (same pid,
+    // so the file-based stale check below can't tell it apart from our own leftover).
+    if (heldLocks.has(this.lockPath)) {
+      throw new Error(
+        `FileCredentialStore: ${this.path} is already locked by another store instance in this process; ` +
+        'a session store must have a single writer.',
+      );
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        writeFileSync(this.lockPath, String(process.pid), { flag: 'wx', mode: 0o600 }); // O_EXCL
+        heldLocks.add(this.lockPath);
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        let ownerPid = 0;
+        try { ownerPid = Number.parseInt(readFileSync(this.lockPath, 'utf8').trim(), 10); } catch { /* unreadable */ }
+        if (Number.isInteger(ownerPid) && ownerPid > 0 && ownerPid !== process.pid && isProcessAlive(ownerPid)) {
+          throw new Error(
+            `FileCredentialStore: ${this.path} is locked by another live process (pid ${ownerPid}); ` +
+            'a session store must have a single writer. Point each connector account at its own store path.',
+          );
+        }
+        try { unlinkSync(this.lockPath); } catch { /* raced away */ } // stale (dead owner / our leftover) — reclaim
+      }
+    }
+    throw new Error(`FileCredentialStore: could not acquire the lock at ${this.lockPath}`);
+  }
+
+  /** Release the exclusive lock. Idempotent. Call on graceful shutdown. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    heldLocks.delete(this.lockPath);
+    try { unlinkSync(this.lockPath); } catch { /* already gone */ }
   }
 
   private load(): void {
@@ -47,30 +113,27 @@ export class FileCredentialStore implements CredentialStore {
         }
       }
     } catch {
-      // Corrupt/unreadable store → start empty. Losing durability is bad, but
-      // crashing the connector on boot is worse; a re-pair restores sessions.
+      // Corrupt/unreadable store → start empty (a re-pair restores sessions);
+      // crashing the connector on boot would be worse.
     }
   }
 
+  /** Atomically write the confirmed set. THROWS on any fs failure — callers must
+   *  treat a throw as "not durable" and roll their in-memory change back. */
   private persist(): void {
     const obj: Record<string, string> = {};
     for (const [token, userId] of this.confirmed) obj[token] = userId;
-    try {
-      mkdirSync(dirname(this.path), { recursive: true });
-      const tmp = `${this.path}.tmp`;
-      writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 });
-      renameSync(tmp, this.path); // atomic replace — a crash mid-write can't corrupt the live file
-    } catch {
-      // Best-effort: a failed write means the current process keeps its
-      // in-memory sessions; only cross-restart durability is at risk.
-    }
+    mkdirSync(dirname(this.path), { recursive: true });
+    const tmp = `${this.path}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 });
+    renameSync(tmp, this.path); // atomic replace — a crash mid-write cannot corrupt the live file
   }
 
   async createSession(userId: string): Promise<string> {
     this.sweepExpiredProvisional();
     const token = randomBytes(32).toString('base64url');
     this.provisional.set(token, { userId, expiresAt: Date.now() + this.provisionalTtlMs });
-    return token; // provisional: NOT persisted until confirmed
+    return token; // provisional: not persisted until confirmed
   }
 
   async confirmSession(token: string): Promise<boolean> {
@@ -78,9 +141,18 @@ export class FileCredentialStore implements CredentialStore {
     const rec = this.provisional.get(token);
     if (!rec) return false;
     if (Date.now() > rec.expiresAt) { this.provisional.delete(token); return false; }
-    this.provisional.delete(token);
+    // Promote in memory, then COMMIT to disk. Report success only after the
+    // commit lands; on failure roll back and throw so the promotion is not
+    // reported durable (WsHub's confirmSession().catch(()=>false) => no ACK).
     this.confirmed.set(token, rec.userId);
-    this.persist(); // durable from here — survives restart
+    this.provisional.delete(token);
+    try {
+      this.persist();
+    } catch (err) {
+      this.confirmed.delete(token);
+      this.provisional.set(token, rec); // still TTL-bounded; a retry can re-confirm
+      throw err;
+    }
     return true;
   }
 
@@ -93,16 +165,29 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async revokeUser(userId: string): Promise<void> {
-    let changed = false;
-    for (const [token, uid] of this.confirmed) if (uid === userId) { this.confirmed.delete(token); changed = true; }
+    const removed: Array<[string, string]> = [];
+    for (const [token, uid] of this.confirmed) if (uid === userId) { removed.push([token, uid]); this.confirmed.delete(token); }
     for (const [token, rec] of this.provisional) if (rec.userId === userId) this.provisional.delete(token);
-    if (changed) this.persist();
+    if (removed.length === 0) return; // nothing durable to remove
+    try {
+      this.persist();
+    } catch (err) {
+      for (const [token, uid] of removed) this.confirmed.set(token, uid); // roll back — never claim a durable revoke while the token is still on disk
+      throw err;
+    }
   }
 
   async revokeSession(token: string): Promise<void> {
-    const had = this.confirmed.delete(token);
+    const userId = this.confirmed.get(token);
     this.provisional.delete(token);
-    if (had) this.persist();
+    if (userId === undefined) return; // nothing durable to remove
+    this.confirmed.delete(token);
+    try {
+      this.persist();
+    } catch (err) {
+      this.confirmed.set(token, userId); // roll back — see revokeUser
+      throw err;
+    }
   }
 
   private sweepExpiredProvisional(): void {

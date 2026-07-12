@@ -14,7 +14,28 @@
 //     can assert the REAL runner (not an echo placeholder) is what gets wired,
 //     and that the allowlist gate is applied.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Isolate each test's session store to a fresh temp dir (via RACCOON_STORE_PATH,
+// which gateway.startAccount's FileCredentialStore honors). Without this, every
+// startAccount('default') would build a store at ./.raccoon-store/default in the
+// REPO — littering the tree AND colliding on the store's single-writer lock
+// across tests. Each test gets its own path, so locks never collide.
+let prevStorePath: string | undefined;
+let storeDir: string | undefined;
+beforeEach(() => {
+  prevStorePath = process.env['RACCOON_STORE_PATH'];
+  storeDir = mkdtempSync(join(tmpdir(), 'raccoon-gw-store-'));
+  process.env['RACCOON_STORE_PATH'] = storeDir;
+});
+afterEach(() => {
+  if (prevStorePath === undefined) delete process.env['RACCOON_STORE_PATH'];
+  else process.env['RACCOON_STORE_PATH'] = prevStorePath;
+  if (storeDir) { rmSync(storeDir, { recursive: true, force: true }); storeDir = undefined; }
+});
 
 // Mock the inbound runner factory so we can assert it is the wired runner.
 vi.mock('./inbound.js', () => ({

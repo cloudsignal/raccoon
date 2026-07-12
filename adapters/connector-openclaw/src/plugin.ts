@@ -93,6 +93,9 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
       stopPush?.();
       stopPush = null;
       await hub.stop();
+      // Release the session store's exclusive resources (e.g. a FileCredentialStore
+      // file lock) so a restart on the same store path can re-acquire it.
+      await opts.sessionStore?.close?.();
     },
     /** Issue a pairing QR for a user — used by the CLI. */
     pair: (userId: string) => issuePairing(hub, { userId, instanceUrl: opts.instanceUrl }),

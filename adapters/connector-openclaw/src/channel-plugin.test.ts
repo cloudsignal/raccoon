@@ -1,4 +1,24 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Isolate each test's gateway session store to a fresh temp dir (see the same
+// block in gateway.test.ts) — startAccount builds a FileCredentialStore at
+// RACCOON_STORE_PATH; without this it would litter ./.raccoon-store in the repo
+// and collide on the store's single-writer lock across tests.
+let prevStorePath: string | undefined;
+let storeDir: string | undefined;
+beforeEach(() => {
+  prevStorePath = process.env['RACCOON_STORE_PATH'];
+  storeDir = mkdtempSync(join(tmpdir(), 'raccoon-cp-store-'));
+  process.env['RACCOON_STORE_PATH'] = storeDir;
+});
+afterEach(() => {
+  if (prevStorePath === undefined) delete process.env['RACCOON_STORE_PATH'];
+  else process.env['RACCOON_STORE_PATH'] = prevStorePath;
+  if (storeDir) { rmSync(storeDir, { recursive: true, force: true }); storeDir = undefined; }
+});
 
 // channel-plugin.ts now composes the full plugin (T7), pulling in gateway.ts →
 // inbound.ts / outbound.ts → these bundled SDK modules whose internal relative

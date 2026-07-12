@@ -236,7 +236,10 @@ async function doStart(
     hub: channel.hub,
     channel: channelName,
     instanceUrl: account.instanceUrl,
-    stop: () => channel.stop(),
+    // The gateway CREATED sessionStore, so the gateway releases its lock on stop
+    // — independent of the channel (a test's fake channel won't). close() is
+    // idempotent, so the real createRaccoonChannel.stop() closing it too is fine.
+    stop: async () => { await channel.stop(); await sessionStore.close?.(); },
     revoke: (userId: string) => channel.revoke(userId),
   };
   running.set(accountId, entry);

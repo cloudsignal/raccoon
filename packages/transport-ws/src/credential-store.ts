@@ -32,6 +32,12 @@ export interface CredentialStore {
   verifySession(token: string): Promise<string | null>;
   revokeUser(userId: string): Promise<void>;
   /**
+   * Release any exclusive resource the store holds (e.g. a file lock). Optional;
+   * call on graceful shutdown so a subsequent process on the same backing store
+   * can acquire it. In-memory stores don't implement it.
+   */
+  close?(): void | Promise<void>;
+  /**
    * Revoke ONE session by its token (#R5-10). Optional: implement it so the
    * hub's stale-authentication cleanup — a hello that raced a revokeUser()
    * and must undo the session it just minted/validated — can target exactly
