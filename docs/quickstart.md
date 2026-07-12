@@ -77,7 +77,7 @@ function Shell() {
 ```
 
 For the standalone, self-serving build (the hub serves the PWA on its own
-port), run `npm run build:app` in the monorepo and pass the `dist/` path as
+port), run `npm run build:app` in the monorepo and pass the `dist-standalone/` path as
 `staticDir` to the hub. See [`packages/app/README.md`](../packages/app/README.md).
 
 ## Path B — an existing OpenClaw agent

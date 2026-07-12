@@ -53,7 +53,7 @@ default. The account model is a single account (`"default"`).
 | `port` | `RACCOON_PORT` | (none) | Hub HTTP/WS port the gateway binds. Required to be "configured". |
 | `channels` | `RACCOON_CHANNELS` (CSV) | `["coordinator"]` | OAM channels the hub serves. |
 | `instance` | `RACCOON_INSTANCE` | (none) | Instance display name. |
-| `staticDir` | `RACCOON_STATIC_DIR` | (none) | Filesystem path to the built Raccoon PWA (`@raccoon/app` `dist`) to serve. |
+| `staticDir` | `RACCOON_STATIC_DIR` | (none) | Filesystem path to the built Raccoon PWA (`@raccoon/app` `dist-standalone`) to serve. |
 | `allowFrom` | (none) | `[]` | Raccoon user ids allowed to DM the agent (the allowlist). |
 | `dmPolicy` | (none) | `allowlist` | DM gate policy (`allowlist` \| `open` \| `disabled`). |
 
@@ -188,7 +188,7 @@ envelopes, one per chunk, order preserved:
    ```bash
    docker run -d --name raccoon-smoke \
      -v "$SMOKE/state":/home/node/.openclaw \
-     -v "$(pwd)/packages/app/dist":/raccoon-app:ro \
+     -v "$(pwd)/packages/app/dist-standalone":/raccoon-app:ro \
      -e OPENCLAW_GATEWAY_TOKEN=... \
      -e RACCOON_HOST=0.0.0.0 -e RACCOON_STATIC_DIR=/raccoon-app \
      -e RACCOON_INSTANCE_URL=ws://127.0.0.1:8790/ \

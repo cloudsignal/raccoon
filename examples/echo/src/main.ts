@@ -2,7 +2,8 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { startDemo } from './echo.js';
 
-const appDist = fileURLToPath(new URL('../../../packages/app/dist', import.meta.url));
+// The standalone PWA lives in dist-standalone/ (dist/ is the library output).
+const appDist = fileURLToPath(new URL('../../../packages/app/dist-standalone', import.meta.url));
 
 if (!existsSync(appDist)) {
   console.error('App build not found. Run: npm run build:app');

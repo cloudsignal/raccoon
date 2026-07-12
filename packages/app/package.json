@@ -5,17 +5,17 @@
   "type": "module",
   "main": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
-  "files": ["dist", "src/styles.css", "raccoon.config.json"],
+  "files": ["dist", "raccoon.config.json"],
   "exports": {
     ".": {
       "types": "./dist/lib.d.ts",
       "default": "./dist/lib.js"
     },
-    "./styles.css": "./src/styles.css"
+    "./styles.css": "./dist/styles.css"
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tailwindcss -i ./src/styles.css -o ./dist/styles.css --minify",
     "build:standalone": "vite build",
     "preview": "vite preview"
   },
@@ -31,6 +31,7 @@
     "zod": "^4.3.5"
   },
   "devDependencies": {
+    "@tailwindcss/cli": "^4.0.0",
     "@tailwindcss/vite": "^4.0.0",
     "@testing-library/react": "^16.1.0",
     "@testing-library/user-event": "^14.5.0",

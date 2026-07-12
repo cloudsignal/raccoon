@@ -28,6 +28,12 @@ function raccoonAssets(): Plugin {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), raccoonAssets()],
+  // The standalone PWA build writes to dist-standalone/, NOT dist/. dist/ is the
+  // LIBRARY output (tsc: lib.js + .d.ts + compiled styles.css); vite's default
+  // dist/ would clobber it (emptyOutDir wipes lib.js; each build removed the
+  // other's artifacts). Keeping them separate lets `npm run build` and
+  // `npm run build:standalone` coexist. Hosts serve dist-standalone via staticDir.
+  build: { outDir: 'dist-standalone' },
   define: { __RACCOON_BUILD_ID__: JSON.stringify(buildId) },
   resolve: {
     // Resolve workspace deps to SOURCE so `npm run build:app` is self-contained
