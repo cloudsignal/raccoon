@@ -1,10 +1,15 @@
-# @raccoon/openclaw
+# @raccoon/connector-openclaw
 
-OpenClaw plugin for [Raccoon](../../README.md). It stands up a Raccoon
-WebSocket hub (serving the installable Raccoon PWA) inside the OpenClaw
+First-party OpenClaw connector for [Raccoon](../../README.md). It stands up a
+Raccoon WebSocket hub (serving the installable Raccoon PWA) inside the OpenClaw
 gateway process and bridges it to an agent, so a user can chat with your
-OpenClaw agent from the Raccoon app, paired by QR, DM-gated by an
-allowlist.
+OpenClaw agent from the Raccoon app, paired by QR, DM-gated by an allowlist.
+
+`openclaw` is a **peer dependency** — install it yourself. See
+[../../docs/compatibility.md](../../docs/compatibility.md) for the supported
+OpenClaw version matrix, and
+[../../docs/connector-authoring.md](../../docs/connector-authoring.md) for the
+public ports this connector implements.
 
 ## Status: CHANNEL-NATIVE (2026-07-09)
 
@@ -30,8 +35,11 @@ channel-native plugin:
 - `register()` runs in several registration modes and more than once even in
   `'full'` mode (boot + agent-runtime pre-warm); the entry gates on
   `api.registrationMode === 'full'` and the idempotent guard.
-- `types/openclaw-sdk.d.ts` mirrors the real declarations 1:1 for the subset
-  we call, typechecked against the real `.d.ts` extracted from the npm tarball.
+- **No handwritten type shims.** The connector imports the real published types
+  directly from `openclaw/plugin-sdk/*` and compiles against them; its build
+  fails loudly if an entry point moves. The one derived helper
+  (`src/openclaw-missing-types.ts`) is `Awaited<ReturnType<…>>` of a real public
+  SDK function, not a hand-copied shape.
 
 ## Configuration
 
@@ -128,7 +136,7 @@ envelopes, one per chunk, order preserved:
    the gateway provides it):
 
    ```bash
-   npx esbuild adapters/openclaw/src/index.ts --bundle --platform=node \
+   npx esbuild adapters/connector-openclaw/src/index.ts --bundle --platform=node \
      --format=esm --target=node20 --external:openclaw --external:"openclaw/*" \
      --external:bufferutil --external:utf-8-validate \
      --outfile="$SMOKE/state/extensions/raccoon/index.js"
@@ -139,7 +147,7 @@ envelopes, one per chunk, order preserved:
    - `index.js` (the bundle)
    - `package.json` (`"openclaw": { "extensions": ["./index.js"] }`)
    - `openclaw.plugin.json`: REQUIRED by current OpenClaw. Copy the one shipped
-     at `adapters/openclaw/openclaw.plugin.json`. The top-level `channels`
+     at `adapters/connector-openclaw/openclaw.plugin.json`. The top-level `channels`
      array is what marks this manifest as owning the `raccoon` channel id (not
      a `kind` field); `channelConfigs.raccoon.schema` is the cold-path config
      schema (setup and Control UI read it before the plugin runtime loads) and

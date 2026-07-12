@@ -6,7 +6,13 @@ Speaks OAM v0.1 over a pluggable transport: built-in WebSocket (zero
 dependencies), any MQTT broker, or CloudSignal (identity, ACL
 enforcement, push, NAT relay).
 
-Status: Plan C complete. Protocol, ws transport, push, and installable PWA.
+Status: **v0.1** — a vendor-neutral core (protocol, WebSocket transport, bridge,
+pairing, push, installable PWA) plus a first-party OpenClaw connector. Core
+carries no CloudSignal / GTM / broker dependency; a second connector or a
+managed transport plugs in through the public ports (see
+[docs/connector-authoring.md](docs/connector-authoring.md)).
+
+**New here? Start with [docs/quickstart.md](docs/quickstart.md) (5 minutes).**
 
 ## Try it
 
@@ -32,14 +38,26 @@ branding config, update architecture, and push setup.
 | --- | --- |
 | `@raccoon/protocol` | OAM v0.1 envelope types and codec |
 | `@raccoon/pairing` | QR pairing token generation and verification |
-| `@raccoon/transport-ws` | Built-in WebSocket hub (`WsHub`) |
-| `@raccoon/bridge` | Agent framework adapters (OpenClaw, NanoClaw) |
+| `@raccoon/transport-ws` | Built-in WebSocket hub (`WsHub`) + client |
+| `@raccoon/bridge` | `RaccoonBridge` + the framework ports a connector implements |
 | `@raccoon/push` | VAPID key generation, Web Push delivery, subscription store |
-| `@raccoon/transport-mqtt` | MQTT transport (any broker, pluggable codec) |
-| `@raccoon/transport-cloudsignal` | CloudSignal transport (identity-secured, managed push) |
-| `@raccoon/app` | Installable push-capable chat PWA (static build) |
-| `adapters/openclaw` | OpenClaw channel-native plugin |
+| `@raccoon/app` | Installable push-capable chat PWA (static build + host-embed surface) |
+| `@raccoon/connector-openclaw` | First-party OpenClaw channel connector (`openclaw` peer dep) |
 
-Packages are consumed from the workspace (clone and build, as under "Try it");
-they are not yet published to npm, so `main` points at TypeScript source. npm
-publishing with compiled outputs lands in a later release.
+Every package above ships compiled `dist/` + emitted `.d.ts` with an `exports`
+map, and installs as a plain npm package (no workspace, sibling repo, vendored
+tree, or `/src` import required). `npm run release:verify` proves this by
+packing every package and building a fresh external consumer against the
+tarballs.
+
+**Not part of the v0.1 core** (marked `private`, not published):
+`@raccoon/transport-mqtt` and `@raccoon/transport-cloudsignal` — managed-transport
+experiments that consume the public core ports from outside the neutral release.
+
+## Docs
+
+- [docs/quickstart.md](docs/quickstart.md) — stand up a backend + PWA in 5 minutes
+- [docs/connector-authoring.md](docs/connector-authoring.md) — public ports, package-boundary diagram, second-connector example
+- [docs/compatibility.md](docs/compatibility.md) — package versions + the OpenClaw version matrix
+- [docs/security.md](docs/security.md) — TLS/WSS, transit encryption, and why this is not E2EE
+- [PROTOCOL.md](PROTOCOL.md) — the OAM v0.1 wire protocol
