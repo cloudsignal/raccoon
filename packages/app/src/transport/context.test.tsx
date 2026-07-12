@@ -74,6 +74,39 @@ describe('TransportProvider', () => {
     expect(api.session?.userId).toBe('u1');
   });
 
+  it('pairing survives a rejected connect() and completes on the recovery grant — session persisted + ready (#R10)', async () => {
+    // Models a lost pair.confirmed: the initial connect() REJECTS, then the
+    // transport recovers in the background and re-emits the grant. pairWithPayload
+    // must NOT abort on the connect() rejection — it must persist the recovered
+    // session and reach 'ready'. Pre-fix, the connect() throw aborted pairing:
+    // nothing was saved and phase never left 'setup' (a ghost pairing).
+    const transport = new FakeTransport();
+    transport.failConnect = true; // first dial rejects
+    render(
+      <TransportProvider makeTransport={() => transport}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(api.phase).toBe('setup'));
+    const pairing = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://h:1/', transport: 'ws', token: 'tok' }));
+    await act(async () => {
+      // connect() has rejected; pairing is now waiting for the recovery grant.
+      await new Promise((r) => setTimeout(r, 10));
+      // Recovery: the transport reconnects (resume) and re-emits the adopted grant.
+      transport.grant(createEnvelope('pair.grant', {
+        from: 'system', to: 'user:u1', channel: 'pairing',
+        payload: { sessionToken: 's-recovered', userId: 'u1', instance: 'echo', channels: ['coordinator'] },
+      }));
+      await pairing;
+    });
+    await waitFor(() => expect(api.phase).toBe('ready'));
+    expect(api.session?.userId).toBe('u1');
+    // Logical pairing: the recovered session is DURABLY persisted (survives reload).
+    const saved = await loadSession();
+    expect(saved?.sessionToken).toBe('s-recovered');
+    expect(saved?.userId).toBe('u1');
+  });
+
   it('unpair wipes local identity state (outbox + kv + chat state) so a re-pair cannot leak the prior user', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);

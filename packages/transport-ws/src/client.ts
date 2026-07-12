@@ -49,6 +49,14 @@ export class WsClientTransport implements Transport {
   private everOpened = false;
   private backoffMs = 500;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // #R10: a pair.grant this instance ADOPTED but has not yet surfaced to
+  // grantHandlers. Instance-scoped (not per-dial) so that if pair.confirmed is
+  // lost and the client recovers on a later reconnect via session resume, the
+  // resume can still surface the grant — otherwise the host that paired never
+  // learns the session token, never persists it, and never reports paired (a
+  // ghost pairing: durable server session, nothing on the client). Cleared the
+  // instant it is emitted (confirmed path OR recovery-resume), so it fires once.
+  private adoptedGrant: Envelope<'pair.grant'> | null = null;
 
   private envelopeHandlers = new Set<(env: AnyEnvelope) => void>();
   private statusHandlers = new Set<(s: TransportStatus) => void>();
@@ -152,6 +160,7 @@ export class WsClientTransport implements Transport {
             // on close instead of falsely reporting paired (#R10).
             this.opts = { ...this.opts, session: env.payload.sessionToken, pairingToken: undefined };
             pendingGrant = env;
+            this.adoptedGrant = env; // surfaced by established() on confirm OR recovery-resume
             try {
               ws.send(JSON.stringify(createEnvelope('pair.confirm', {
                 from: 'system', to: 'system', channel: 'pairing',
@@ -163,11 +172,10 @@ export class WsClientTransport implements Transport {
             return;
           }
           if (env?.kind === 'pair.confirmed' && pendingGrant && env.payload.sessionToken === pendingGrant.payload.sessionToken) {
-            // #R10: the hub promoted the session — NOW report success.
+            // #R10: the hub promoted the session — NOW report success. established()
+            // surfaces the adopted grant (exactly once) and flips to open.
             clearConfirmTimer();
-            const granted = pendingGrant;
             pendingGrant = null;
-            for (const h of this.grantHandlers) h(granted);
             this.established();
             if (!settled) { settled = true; resolve(); }
             return;
@@ -211,6 +219,17 @@ export class WsClientTransport implements Transport {
   private established(): void {
     this.everOpened = true;
     this.backoffMs = 500;
+    // #R10: surface an adopted-but-unsurfaced pairing grant. On the normal
+    // confirmed path this fires immediately; on a recovery resume after a lost
+    // pair.confirmed it fires when the resume succeeds (the resume itself proves
+    // the session is durable server-side). A plain app-supplied session never
+    // adopts a grant, so this is a no-op there. Emitted before 'open' so a host
+    // has the session in hand when it observes the transport go live.
+    const grant = this.adoptedGrant;
+    if (grant) {
+      this.adoptedGrant = null;
+      for (const h of this.grantHandlers) h(grant);
+    }
     this.setStatus('open');
   }
 

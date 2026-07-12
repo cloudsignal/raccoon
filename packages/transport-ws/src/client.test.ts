@@ -207,6 +207,13 @@ describe('WsClientTransport', () => {
       maxBackoffMs: 300,
     });
 
+    // Capture grants: recovery MUST re-surface the adopted grant so a host that
+    // paired learns the session token (persists it, reports paired). Without it,
+    // the socket opens but the pairing is a ghost (durable server session, no
+    // client-side session) — the exact defect this test guards.
+    const grants: string[] = [];
+    client.onGrant((g) => grants.push(g.payload.sessionToken));
+
     const opened = new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), 5_000);
       client.onStatus((s) => { if (s === 'open') { clearTimeout(timer); resolve(true); } });
@@ -222,6 +229,10 @@ describe('WsClientTransport', () => {
     // that the client resumed rather than re-paired.
     expect(await opened).toBe(true);
     expect(createCount).toBe(1);
+
+    // The grant was surfaced exactly once, carrying the durably-promoted session
+    // token — so a host can persist it and report a real (non-ghost) pairing.
+    expect(grants).toEqual(['sess-u1-1']);
 
     // The resumed connection is fully live: the hub receives a subsequent send.
     const echoed = new Promise<AnyEnvelope>((resolve) => hub.onEnvelope((env) => resolve(env)));

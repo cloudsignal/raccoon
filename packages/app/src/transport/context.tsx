@@ -22,6 +22,13 @@ export const ACK_TIMEOUT_MS = 10_000;
 // while — but bounded, so a hung server turn can't spin forever.
 export const PROCESSING_TIMEOUT_MS = 120_000;
 const HISTORY_LIMIT = 50;
+// #R10: during interactive pairing, connect() can REJECT on a lost pair.confirmed
+// even though the transport recovers in the background and re-emits the grant.
+// If connect() rejected, wait this long for that recovery grant (or a terminal
+// auth error) before declaring the pairing dead. Comfortably covers a reconnect
+// cycle (backoff + resume round-trip); a terminal auth error fails fast and does
+// not wait this out.
+const PAIR_RECOVERY_GRACE_MS = 8_000;
 
 export interface ChatApi {
   phase: 'loading' | 'setup' | 'ready';
@@ -965,11 +972,41 @@ export function TransportProvider(props: TransportProviderProps) {
         epoch: crypto.randomUUID(),
       }));
     });
+    // Fail fast on a terminal auth rejection (bad/expired token) instead of
+    // waiting out the recovery grace below. The .catch keeps a post-pairing
+    // rejection (a later revocation, handled by the wired onAuthError) from
+    // surfacing as an unhandled rejection once `granted` has already won.
+    let sawAuthError = false;
+    const authFailed = new Promise<never>((_, reject) => {
+      transport.onAuthError((code) => { sawAuthError = true; reject(new Error(`pairing rejected (code ${code})`)); });
+    });
+    authFailed.catch(() => { /* handled via the race / swallowed post-pair */ });
     // Finding 3: wire the transport BEFORE connect so the initial 'open' status
     // emission during connect() is captured rather than missed.
     wireTransport(transport);
-    await transport.connect();
-    const next = await granted;
+    // #R10: connect() can REJECT on a lost pair.confirmed even though the
+    // transport recovers in the background and RE-EMITS the grant. So do NOT let
+    // a connect() rejection abort pairing — wait for the grant (initial OR
+    // recovered) or a terminal auth error. Only if connect() failed AND no
+    // grant/auth-error arrives within the recovery window is the pairing dead.
+    const connected = await transport.connect().then(() => true, () => false);
+    let next: Session;
+    try {
+      next = connected
+        ? await Promise.race([granted, authFailed])
+        : await Promise.race([
+            granted,
+            authFailed,
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('pairing recovery timed out')), PAIR_RECOVERY_GRACE_MS)),
+          ]);
+    } catch {
+      setAuthError(sawAuthError
+        ? 'Pairing was rejected. Ask for a fresh QR code and try again.'
+        : 'Could not reach the server to finish pairing. Check the connection and scan a fresh QR code.');
+      void transport.close();
+      return;
+    }
     // Set the ref synchronously (see loadSession's matching comment) and
     // bump sessionGenRef — a real identity transition, needed so a
     // since-superseded wipe's deferred state update (see the auth-error
