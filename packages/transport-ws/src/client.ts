@@ -39,6 +39,16 @@ export interface WsClientOptions {
    * without a real 10s wait) — same role as {@link WsClientOptions.maxBackoffMs}.
    */
   confirmAckTimeoutMs?: number;
+  /**
+   * #P1-B: invoked with the pair.grant BEFORE the client sends pair.confirm.
+   * Use it to DURABLY persist the adopted session. The client AWAITS it and
+   * only confirms if it resolves; if it rejects (or throws), the client does
+   * NOT confirm — the hub never promotes the provisional session (its TTL reaps
+   * it), so the server can never hold a session the host hasn't committed
+   * ("ready" is therefore never reachable without a durable local copy). WS
+   * pairing only; a session-resume connection never calls it.
+   */
+  onAdoptGrant?: (grant: Envelope<'pair.grant'>) => Promise<void>;
 }
 
 export class WsClientTransport implements Transport {
@@ -161,14 +171,31 @@ export class WsClientTransport implements Transport {
             this.opts = { ...this.opts, session: env.payload.sessionToken, pairingToken: undefined };
             pendingGrant = env;
             this.adoptedGrant = env; // surfaced by established() on confirm OR recovery-resume
-            try {
-              ws.send(JSON.stringify(createEnvelope('pair.confirm', {
-                from: 'system', to: 'system', channel: 'pairing',
-                payload: { sessionToken: env.payload.sessionToken },
-              })));
-            } catch { /* best-effort; a lost confirm surfaces as connect() rejecting on close */ }
-            clearConfirmTimer();
-            confirmTimer = setTimeout(() => { try { ws.close(); } catch { /* already closing */ } }, this.opts.confirmAckTimeoutMs ?? CONFIRM_ACK_TIMEOUT_MS);
+            const grant = env;
+            const adopt = this.opts.onAdoptGrant;
+            const confirmTimeoutMs = this.opts.confirmAckTimeoutMs ?? CONFIRM_ACK_TIMEOUT_MS;
+            // #P1-B: DURABLY adopt (host persists the session) BEFORE confirming.
+            // Await the host's persist; confirm ONLY if it succeeds. A failure —
+            // or the socket closing during the persist — aborts the confirm, so
+            // the hub never promotes the provisional session (it TTL-reaps) and
+            // there is no server session without a durable client copy.
+            void (async () => {
+              try {
+                if (adopt) await adopt(grant);
+              } catch {
+                try { ws.close(); } catch { /* already closing */ }
+                return;
+              }
+              if (settled) return; // socket closed during the persist — nothing to confirm
+              try {
+                ws.send(JSON.stringify(createEnvelope('pair.confirm', {
+                  from: 'system', to: 'system', channel: 'pairing',
+                  payload: { sessionToken: grant.payload.sessionToken },
+                })));
+              } catch { /* a lost confirm surfaces as connect() rejecting on close */ }
+              clearConfirmTimer();
+              confirmTimer = setTimeout(() => { try { ws.close(); } catch { /* already closing */ } }, confirmTimeoutMs);
+            })();
             return;
           }
           if (env?.kind === 'pair.confirmed' && pendingGrant && env.payload.sessionToken === pendingGrant.payload.sessionToken) {

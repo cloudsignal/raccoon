@@ -404,9 +404,25 @@ export class WsHub {
     // Session resume: { session: string } — must not be rate-limited (legit reconnect)
     if (typeof hello === 'object' && hello !== null && 'session' in hello) {
       const presentedToken = String((hello as { session: unknown }).session);
-      const userId = await this.store.verifySession(presentedToken);
+      let userId = await this.store.verifySession(presentedToken);
       if (signal.aborted) return; // #R6-11b: deadline fired mid-verify — abandon, don't attach
-      if (!userId) { ws.close(4401, 'bad session'); return; }
+      if (!userId) {
+        // #P1-B: idempotent reconnect that COMPLETES a pending confirmation. The
+        // token may be a PROVISIONAL session whose pair.confirm was lost in
+        // transit (the client durably adopted it, then the confirm/ACK dropped).
+        // A resume presenting the token is itself proof of durable client
+        // adoption, so complete the confirmation (promote) and re-verify. This
+        // does NOT resurrect a lost-grant orphan: a client that never received
+        // the grant holds no token to present, so its provisional session is
+        // never resumed and still TTL-reaps. confirmSession returns false for an
+        // unknown/revoked/expired token (it reaps an expired one), so those
+        // still fail closed.
+        const promoted = await this.store.confirmSession(presentedToken).catch(() => false);
+        if (signal.aborted) return;
+        if (promoted) userId = await this.store.verifySession(presentedToken);
+        if (signal.aborted) return;
+        if (!userId) { ws.close(4401, 'bad session'); return; }
+      }
       // The store round-trip above has no ordering guarantee against a
       // concurrent revokeUser() for a REAL (non-in-memory) store: it could
       // resolve "valid" for a session that is being invalidated right now.

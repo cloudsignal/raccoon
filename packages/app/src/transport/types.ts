@@ -19,4 +19,9 @@ export type MakeTransport = (opts: {
   session?: string;
   pairingToken?: string;
   device?: string;
+  // #P1-B: called with the pair.grant BEFORE the transport confirms pairing —
+  // the host persists the session here and the transport only confirms once it
+  // resolves. A non-WS/host-managed transport may ignore it. See
+  // WsClientOptions.onAdoptGrant.
+  onAdoptGrant?: (grant: Envelope<'pair.grant'>) => Promise<void>;
 }) => AppTransport;

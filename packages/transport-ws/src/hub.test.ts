@@ -2,9 +2,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import { createEnvelope, parseEnvelope, type AnyEnvelope } from '@raccoon/protocol';
 import { WsHub } from './hub.js';
+import { MemoryCredentialStore } from './credential-store.js';
 
 let hub: WsHub;
 afterEach(async () => { await hub?.stop(); });
+
+/** Read the next raw JSON frame (e.g. the `{ ok, userId }` resume ack, which is
+ *  NOT an OAM envelope so nextMessage/parseEnvelope can't be used). */
+function nextRaw(ws: WebSocket): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => ws.once('message', (d) => resolve(JSON.parse(d.toString()))));
+}
 
 function connect(port: number): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
@@ -96,7 +103,13 @@ describe('WsHub pairing', () => {
     resumed.close();
   });
 
-  it('a paired-but-UNCONFIRMED session is not resumable — closing before pair.confirm leaves no live session (#P1-C)', async () => {
+  it('#P1-B: resuming an UNCONFIRMED (but unexpired) session completes the pending confirmation', async () => {
+    // The client durably adopted the session (it holds the token) but its
+    // pair.confirm was lost in transit before it closed. A reconnect presenting
+    // the token is proof of adoption, so the hub COMPLETES the confirmation
+    // (promote) and resumes — an idempotent recovery, not a re-pair. (A truly
+    // lost-grant orphan holds no token to present and still TTL-reaps: see the
+    // reaped-after-TTL test below and the never-adopted case in #P1-C ordering.)
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();
     const token = hub.issuePairingToken('u1');
@@ -104,15 +117,12 @@ describe('WsHub pairing', () => {
     ws.send(pairRequest(token));
     const grant = await nextMessage(ws);
     if (grant.kind !== 'pair.grant') throw new Error('expected grant');
-    // The client abandons WITHOUT confirming (models the lost-grant window:
-    // the close frame reaches the server after the grant was already sent).
-    ws.close();
+    ws.close(); // adopted the token, but the confirm was lost
     await tick();
 
     const resumed = await connect(port);
     resumed.send(JSON.stringify({ session: grant.payload.sessionToken }));
-    // The provisional session was never confirmed → not resumable.
-    expect(await nextClose(resumed)).toBe(4401);
+    expect(await nextRaw(resumed)).toMatchObject({ ok: true, userId: 'u1' });
   });
 
   it('an unconfirmed provisional session is reaped after its TTL (#P1-C)', async () => {
@@ -137,23 +147,26 @@ describe('WsHub pairing', () => {
   });
 
   it('a pair.confirm for a token this socket was NOT granted does not promote it (#P1-C)', async () => {
-    hub = new WsHub({ instance: 'test' });
+    // Verify the confirm-path guard directly via an injected store (a resume can
+    // no longer prove "provisional" — #P1-B promote-on-resume would confirm it):
+    // socket A confirming B's token must NOT promote B's session.
+    const store = new MemoryCredentialStore();
+    hub = new WsHub({ instance: 'test', store });
     const { port } = await hub.start();
-    // Pair user A (socket a) and user B (socket b), neither confirmed.
     const a = await connect(port); a.send(pairRequest(hub.issuePairingToken('a')));
     const grantA = await nextMessage(a);
     const b = await connect(port); b.send(pairRequest(hub.issuePairingToken('b')));
     const grantB = await nextMessage(b);
     if (grantA.kind !== 'pair.grant' || grantB.kind !== 'pair.grant') throw new Error('expected grants');
-    // Socket a tries to confirm B's token — must be ignored (guarded by the
-    // socket's OWN provisional token).
+    // Socket a tries to confirm B's token — must be ignored (a socket only
+    // promotes the provisional token IT was granted).
     confirmGrant(a, grantB.payload.sessionToken);
     await tick();
     a.close(); b.close();
 
-    const resumed = await connect(port);
-    resumed.send(JSON.stringify({ session: grantB.payload.sessionToken }));
-    expect(await nextClose(resumed)).toBe(4401); // B stayed provisional
+    // B's session was never promoted by A's cross-confirm — still provisional
+    // (verifySession returns null only for a NON-confirmed session).
+    expect(await store.verifySession(grantB.payload.sessionToken)).toBeNull();
   });
 
   it('ACKs a real confirm with pair.confirmed echoing the session token (#R10)', async () => {

@@ -57,14 +57,15 @@ describe('TransportProvider', () => {
   it('pairs from a QR payload and persists the grant', async () => {
     const transport = new FakeTransport();
     render(
-      <TransportProvider makeTransport={() => transport}>
+      <TransportProvider makeTransport={(opts) => { transport.onAdoptGrant = opts.onAdoptGrant; return transport; }}>
         <Probe />
       </TransportProvider>,
     );
     await waitFor(() => expect(api.phase).toBe('setup'));
     const pairing = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://h:1/', transport: 'ws', token: 'tok' }));
     await act(async () => {
-      transport.grant(createEnvelope('pair.grant', {
+      // grant() runs onAdoptGrant (durable save) BEFORE firing grantHandlers.
+      await transport.grant(createEnvelope('pair.grant', {
         from: 'system', to: 'user:u1', channel: 'pairing',
         payload: { sessionToken: 's1', userId: 'u1', instance: 'echo', channels: ['coordinator'] },
       }));
@@ -72,6 +73,8 @@ describe('TransportProvider', () => {
     });
     await waitFor(() => expect(api.phase).toBe('ready'));
     expect(api.session?.userId).toBe('u1');
+    // #P1-B: durably persisted (the save preceded confirmation), not a racy after-the-fact write.
+    expect((await loadSession())?.sessionToken).toBe('s1');
   });
 
   it('pairing survives a rejected connect() and completes on the recovery grant — session persisted + ready (#R10)', async () => {
@@ -83,7 +86,7 @@ describe('TransportProvider', () => {
     const transport = new FakeTransport();
     transport.failConnect = true; // first dial rejects
     render(
-      <TransportProvider makeTransport={() => transport}>
+      <TransportProvider makeTransport={(opts) => { transport.onAdoptGrant = opts.onAdoptGrant; return transport; }}>
         <Probe />
       </TransportProvider>,
     );
@@ -93,7 +96,7 @@ describe('TransportProvider', () => {
       // connect() has rejected; pairing is now waiting for the recovery grant.
       await new Promise((r) => setTimeout(r, 10));
       // Recovery: the transport reconnects (resume) and re-emits the adopted grant.
-      transport.grant(createEnvelope('pair.grant', {
+      await transport.grant(createEnvelope('pair.grant', {
         from: 'system', to: 'user:u1', channel: 'pairing',
         payload: { sessionToken: 's-recovered', userId: 'u1', instance: 'echo', channels: ['coordinator'] },
       }));

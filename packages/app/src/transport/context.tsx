@@ -948,7 +948,34 @@ export function TransportProvider(props: TransportProviderProps) {
   const pairWithPayload = useCallback(async (json: string) => {
     const payload = parsePairingPayload(json);
     setAuthError(null);
-    const transport = makeTransport({ url: payload.instanceUrl, pairingToken: payload.token, device: 'raccoon-app' });
+    // #P1-B: DURABLE client adoption BEFORE the server confirms. onAdoptGrant is
+    // called by the transport on the pair.grant and AWAITED before it sends
+    // pair.confirm — the save (durable IDB commit) therefore happens BEFORE the
+    // server promotes the session. If the save throws, the transport aborts the
+    // confirm (the provisional server session TTL-reaps), so we never end up
+    // with a valid server session and no durable client copy, and 'ready' is
+    // unreachable without that commit. The session is stashed for the ready path.
+    let adoptedSession: Session | null = null;
+    const transport = makeTransport({
+      url: payload.instanceUrl,
+      pairingToken: payload.token,
+      device: 'raccoon-app',
+      onAdoptGrant: async (g) => {
+        const s: Session = {
+          url: payload.instanceUrl,
+          sessionToken: g.payload.sessionToken,
+          userId: g.payload.userId,
+          instance: g.payload.instance,
+          channels: g.payload.channels,
+          vapidPublicKey: g.payload.vapidPublicKey,
+          // #R7-3: fresh NON-SECRET epoch so a re-pair is distinguishable from a
+          // prior session (identityKey uses it, not the secret token).
+          epoch: crypto.randomUUID(),
+        };
+        await saveSession(s); // throws => transport does NOT confirm; pairing fails safely
+        adoptedSession = s;
+      },
+    });
     // #A2: interactive pairing requires the transport to support pair.grant. A
     // non-pairing transport (host-managed session) never reaches this path —
     // it's driven by sessionOverride, not pairWithPayload.
@@ -956,26 +983,16 @@ export function TransportProvider(props: TransportProviderProps) {
       setAuthError('This transport does not support interactive pairing.');
       return;
     }
-    // Register the grant handler before connect; defer full wiring until after the grant
-    // so that the connect-phase status change doesn't trigger React state updates outside act.
-    const granted = new Promise<Session>((resolve) => {
-      transport.onGrant!((g) => resolve({
-        url: payload.instanceUrl,
-        sessionToken: g.payload.sessionToken,
-        userId: g.payload.userId,
-        instance: g.payload.instance,
-        channels: g.payload.channels,
-        vapidPublicKey: g.payload.vapidPublicKey,
-        // #R7-3: mint a fresh NON-SECRET epoch for this pairing so a re-pair
-        // is distinguishable from the prior session (identityKey uses it, not
-        // the secret token). Persisted below so all tabs share it.
-        epoch: crypto.randomUUID(),
-      }));
+    // Resolves once the hub ACKs (onGrant fires on pair.confirmed OR on a
+    // recovery-resume). By then the session was already durably saved in
+    // onAdoptGrant, so we hand back THAT persisted session.
+    const paired = new Promise<Session>((resolve) => {
+      transport.onGrant!(() => { if (adoptedSession) resolve(adoptedSession); });
     });
     // Fail fast on a terminal auth rejection (bad/expired token) instead of
     // waiting out the recovery grace below. The .catch keeps a post-pairing
     // rejection (a later revocation, handled by the wired onAuthError) from
-    // surfacing as an unhandled rejection once `granted` has already won.
+    // surfacing as an unhandled rejection once `paired` has already won.
     let sawAuthError = false;
     const authFailed = new Promise<never>((_, reject) => {
       transport.onAuthError((code) => { sawAuthError = true; reject(new Error(`pairing rejected (code ${code})`)); });
@@ -986,16 +1003,16 @@ export function TransportProvider(props: TransportProviderProps) {
     wireTransport(transport);
     // #R10: connect() can REJECT on a lost pair.confirmed even though the
     // transport recovers in the background and RE-EMITS the grant. So do NOT let
-    // a connect() rejection abort pairing — wait for the grant (initial OR
+    // a connect() rejection abort pairing — wait for `paired` (initial OR
     // recovered) or a terminal auth error. Only if connect() failed AND no
     // grant/auth-error arrives within the recovery window is the pairing dead.
     const connected = await transport.connect().then(() => true, () => false);
     let next: Session;
     try {
       next = connected
-        ? await Promise.race([granted, authFailed])
+        ? await Promise.race([paired, authFailed])
         : await Promise.race([
-            granted,
+            paired,
             authFailed,
             new Promise<never>((_, reject) =>
               setTimeout(() => reject(new Error('pairing recovery timed out')), PAIR_RECOVERY_GRACE_MS)),
@@ -1003,22 +1020,21 @@ export function TransportProvider(props: TransportProviderProps) {
     } catch {
       setAuthError(sawAuthError
         ? 'Pairing was rejected. Ask for a fresh QR code and try again.'
-        : 'Could not reach the server to finish pairing. Check the connection and scan a fresh QR code.');
+        : 'Could not finish pairing — the server was unreachable or the session could not be saved. Try a fresh QR code.');
       void transport.close();
       return;
     }
-    // Set the ref synchronously (see loadSession's matching comment) and
-    // bump sessionGenRef — a real identity transition, needed so a
-    // since-superseded wipe's deferred state update (see the auth-error
-    // handler / unpair()) correctly detects it should no longer apply.
+    // `next` is ALREADY durably persisted (onAdoptGrant). Go ready — there is no
+    // unawaited save here: the durable commit strictly preceded confirmation.
+    // Set the ref synchronously (see loadSession's matching comment) and bump
+    // sessionGenRef (a real identity transition).
     sessionGenRef.current += 1;
-    const nextSession = withEpoch(next); // #R8-5: ensure a non-secret epoch
+    const nextSession = withEpoch(next); // already carries a non-secret epoch; passthrough
     sessionRef.current = nextSession;
     validUserIdRef.current = nextSession.userId;
     identityScopeRef.current = identityKey(nextSession);
     setSession(nextSession);
     setPhase('ready');
-    void saveSession(next); // persist async; state is already updated
   }, [makeTransport, wireTransport]);
 
   const sendEnvelope = useCallback((env: AnyEnvelope) => {

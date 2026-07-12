@@ -9,6 +9,9 @@ export class FakeTransport implements AppTransport {
   // WsClientTransport whose first dial rejects on a lost pair.confirmed but which
   // recovers in the background and later re-emits the grant (drive with grant()).
   failConnect = false;
+  // #P1-B: set by a test's makeTransport from opts.onAdoptGrant. grant() awaits
+  // it BEFORE firing grantHandlers (mirrors the real persist-before-confirm).
+  onAdoptGrant?: (g: Envelope<'pair.grant'>) => Promise<void>;
   private envelopeHandlers = new Set<(env: AnyEnvelope) => void>();
   private statusHandlers = new Set<(s: TransportStatus) => void>();
   private grantHandlers = new Set<(g: Envelope<'pair.grant'>) => void>();
@@ -32,6 +35,11 @@ export class FakeTransport implements AppTransport {
 
   emit(env: AnyEnvelope): void { for (const h of this.envelopeHandlers) h(env); }
   setStatus(s: TransportStatus): void { for (const h of this.statusHandlers) h(s); }
-  grant(g: Envelope<'pair.grant'>): void { this.connected = true; for (const h of this.grantHandlers) h(g); this.setStatus('open'); }
+  async grant(g: Envelope<'pair.grant'>): Promise<void> {
+    if (this.onAdoptGrant) await this.onAdoptGrant(g); // #P1-B: durable adoption BEFORE the "confirm" (grantHandlers)
+    this.connected = true;
+    for (const h of this.grantHandlers) h(g);
+    this.setStatus('open');
+  }
   authFail(code: number): void { for (const h of this.authHandlers) h(code); }
 }

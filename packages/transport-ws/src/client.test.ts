@@ -240,6 +240,58 @@ describe('WsClientTransport', () => {
     expect((await echoed).kind).toBe('msg');
   });
 
+  it('awaits onAdoptGrant BEFORE sending pair.confirm — durable adoption precedes server confirmation (#P1-B)', async () => {
+    const confirmCalls: string[] = [];
+    const sessions = new Map<string, string>();
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async (u: string) => { const t = `tok-${u}`; sessions.set(t, u); return t; },
+        verifySession: async (t: string) => sessions.get(t) ?? null,
+        confirmSession: async (t: string) => { confirmCalls.push(t); return true; },
+        revokeUser: async () => {},
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    let releaseAdopt!: () => void;
+    const adoptGate = new Promise<void>((r) => { releaseAdopt = r; });
+    let adoptCalled = false;
+    client = new WsClientTransport({
+      url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest',
+      onAdoptGrant: async () => { adoptCalled = true; await adoptGate; },
+    });
+    const connectP = client.connect();
+    await new Promise((r) => setTimeout(r, 100)); // grant arrived; onAdoptGrant is now gating
+    expect(adoptCalled).toBe(true);
+    expect(confirmCalls).toEqual([]); // NOT confirmed yet — the server must not promote before durable adoption
+    releaseAdopt(); // durable adoption completes → the client may now confirm
+    await connectP;
+    expect(confirmCalls).toEqual(['tok-u1']); // confirmed exactly once (the session token), AFTER adoption
+  });
+
+  it('an onAdoptGrant rejection aborts pairing — the server never promotes the session (#P1-B)', async () => {
+    const confirmCalls: string[] = [];
+    hub = new WsHub({
+      instance: 'test',
+      store: {
+        createSession: async (u: string) => `tok-${u}`,
+        verifySession: async () => null, // provisional never resumable
+        confirmSession: async (t: string) => { confirmCalls.push(t); return true; },
+        revokeUser: async () => {},
+      },
+    });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    client = new WsClientTransport({
+      url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest', confirmAckTimeoutMs: 200,
+      onAdoptGrant: async () => { throw new Error('persist failed'); },
+    });
+    await expect(client.connect()).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(confirmCalls).toEqual([]); // adoption failed → confirm never sent → server never promotes (no ghost)
+  });
+
   it('reconnects a session-backed client that starts while the hub is down (#4 offline-start)', async () => {
     // Prime a real session, then take the hub down so the next client starts offline.
     const first = new WsHub({ instance: 'test' });
