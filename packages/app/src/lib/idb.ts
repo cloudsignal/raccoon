@@ -203,6 +203,26 @@ export async function kvDel(key: string): Promise<void> {
 }
 
 /**
+ * Round-trip a probe key (write → read → delete) to confirm IndexedDB is
+ * actually usable for DURABLE writes — not just openable. Returns false (never
+ * throws) on a blocked/failed open, a private-mode/quota write rejection, or a
+ * value mismatch. The app gates pairing on this so a user can't pair into a
+ * session that can never be saved (see #F6 storage-error state).
+ */
+export async function probeStorageWritable(): Promise<boolean> {
+  const key = '__raccoon_storage_probe__';
+  const marker = 'ok';
+  try {
+    await kvSet(key, marker);
+    const got = await kvGet<string>(key);
+    await kvDel(key);
+    return got === marker;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * ATOMIC read-modify-write of one kv key in a SINGLE transaction (#R8-4).
  * `fn(current)` returns the next value (or undefined to leave unchanged).
  * Because IDB serializes 'readwrite' transactions on a store across ALL tabs,

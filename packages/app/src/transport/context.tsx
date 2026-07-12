@@ -7,7 +7,7 @@ import {
   type AnyEnvelope, type TransportStatus,
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
-import { kvGet, kvSet, wipeKvExceptSession } from '../lib/idb.js';
+import { kvGet, kvSet, probeStorageWritable, wipeKvExceptSession } from '../lib/idb.js';
 import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
@@ -31,13 +31,16 @@ const HISTORY_LIMIT = 50;
 const PAIR_RECOVERY_GRACE_MS = 8_000;
 
 export interface ChatApi {
-  phase: 'loading' | 'setup' | 'ready';
+  phase: 'loading' | 'setup' | 'ready' | 'storage-error';
   status: TransportStatus;
   session: Session | null;
   state: ChatState;
   activeChannel: string | null;
   authError: string | null;
   pairWithPayload(json: string): Promise<void>;
+  /** #F6: re-probe durable storage from the 'storage-error' phase. On success,
+   *  moves to 'setup' (pairing enabled); otherwise stays in 'storage-error'. */
+  retryStorage(): Promise<void>;
   openChannel(channel: string | null): void;
   sendMessage(channel: string, text: string): void;
   respondApproval(channel: string, refId: string, choice: string, editedText?: string): void;
@@ -173,7 +176,7 @@ export interface TransportProviderProps {
 
 export function TransportProvider(props: TransportProviderProps) {
   const makeTransport = props.makeTransport ?? defaultMakeTransport;
-  const [phase, setPhase] = useState<'loading' | 'setup' | 'ready'>('loading');
+  const [phase, setPhase] = useState<'loading' | 'setup' | 'ready' | 'storage-error'>('loading');
   const [status, setStatus] = useState<TransportStatus>('closed');
   const [session, setSession] = useState<ActiveSession | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -858,7 +861,18 @@ export function TransportProvider(props: TransportProviderProps) {
         setPhase('setup');
       });
     }
-    void loadSession().then(async (loaded) => {
+    // #F6: gate boot on a durable-storage write-probe. If storage is unusable
+    // (private browsing / quota / blocked open) enter the distinct
+    // 'storage-error' state, NOT 'setup' — pairing must stay disabled until a
+    // write actually works, since a pair here could never be durably saved.
+    void probeStorageWritable().then((writable) => {
+      if (cancelled) return;
+      if (!writable) {
+        setAuthError('This device can’t save data locally (private browsing or full storage). Fix that, then retry.');
+        setPhase('storage-error');
+        return;
+      }
+      return loadSession().then(async (loaded) => {
       if (cancelled) return;
       if (!loaded) { setPhase('setup'); return; }
       // loadSession guarantees an epoch (persisted at pairing, lazily migrated
@@ -917,16 +931,15 @@ export function TransportProvider(props: TransportProviderProps) {
       wireTransport(transport);
       setPhase('ready');
       try { await transport.connect(); } catch { /* reconnect loop handles it */ }
+      });
     }).catch((err) => {
-      // #IDB-boot: loadSession() (and the IDB paths it drives) reject on a
-      // blocked/failed IndexedDB open. Without this handler the promise rejects
-      // unhandled and `phase` is stranded at its initial 'loading' — a permanent
-      // spinner. Surface the failure and drop to 'setup' so the QR-scan UI is
-      // reachable (a re-pair is the only recovery when local storage is unusable).
+      // #F6: the storage probe or the session load rejected (blocked/failed IDB
+      // open). Enter the retryable 'storage-error' state — never a permanent
+      // 'loading' spinner, and never 'setup' (whose pairing could not be saved).
       if (cancelled) return;
-      console.error('[raccoon] session load failed at boot:', err);
-      setAuthError('Could not read local storage on this device. Scan a QR code to reconnect.');
-      setPhase('setup');
+      console.error('[raccoon] storage unavailable at boot:', err);
+      setAuthError('Local storage is unavailable on this device. Retry once it’s available.');
+      setPhase('storage-error');
     });
     return () => {
       cancelled = true;
@@ -1231,9 +1244,19 @@ export function TransportProvider(props: TransportProviderProps) {
 
   const canEnablePush = !!session?.vapidPublicKey || !!props.pushRegistrarOverride;
 
+  const retryStorage = useCallback(async () => {
+    // #F6: re-probe durable storage from the storage-error state. On success,
+    // enable pairing (setup); a prior stored session is not auto-restored — the
+    // user re-pairs, which #P1-B persists durably (or fails safely). On failure,
+    // stay in storage-error with an updated message.
+    const writable = await probeStorageWritable();
+    if (writable) { setAuthError(null); setPhase('setup'); }
+    else setAuthError('Still can’t save data locally. Free up space or leave private browsing, then retry.');
+  }, []);
+
   const api = useMemo<ChatApi>(() => ({
     phase, status, session, state, activeChannel, authError,
-    pairWithPayload, openChannel, loadOlder, enablePush, canEnablePush, unpair,
+    pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, unpair,
     // sendMessage, respondApproval, retryMessage are only wired once the
     // session is loaded and the transport is connected (phase === 'ready').
     // Before ready they are undefined at runtime (the `as` cast is intentional —
@@ -1243,7 +1266,7 @@ export function TransportProvider(props: TransportProviderProps) {
     sendMessage: (phase === 'ready' ? sendMessage : undefined) as ChatApi['sendMessage'],
     respondApproval: (phase === 'ready' ? respondApproval : undefined) as ChatApi['respondApproval'],
     retryMessage: (phase === 'ready' ? retryMessage : undefined) as ChatApi['retryMessage'],
-  }), [phase, status, session, state, activeChannel, authError, pairWithPayload, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, unpair]);
+  }), [phase, status, session, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, unpair]);
 
   return <ChatContext.Provider value={api}>{props.children}</ChatContext.Provider>;
 }

@@ -281,11 +281,11 @@ describe('TransportProvider', () => {
     demoteSpy.mockRestore();
   });
 
-  it('an IndexedDB boot failure surfaces the error and reaches setup, never hanging on loading (#IDB-boot)', async () => {
+  it('an IndexedDB boot failure enters storage-error, never hanging on loading (#F6)', async () => {
     // loadSession() (and the IDB paths it drives) reject on a blocked/failed
-    // IndexedDB open. The boot effect must catch that and drop to 'setup'; the
-    // pre-fix code left the promise rejected-unhandled and phase stuck on the
-    // initial 'loading' (a permanent spinner).
+    // IndexedDB open. The boot must enter the retryable 'storage-error' state —
+    // NOT stay on the initial 'loading' spinner, and NOT drop to 'setup' (whose
+    // pairing could never be saved).
     const realLoad = await import('../lib/session.js');
     const loadSpy = vi.spyOn(realLoad, 'loadSession').mockRejectedValue(new Error('IndexedDB open blocked'));
     render(
@@ -293,8 +293,38 @@ describe('TransportProvider', () => {
         <Probe />
       </TransportProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('setup'));
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('storage-error'));
     loadSpy.mockRestore();
+  });
+
+  it('a failed durable-storage write-probe enters storage-error, so pairing stays disabled (#F6)', async () => {
+    // Storage opens/reads but a WRITE fails (private mode / quota). loadSession
+    // would succeed, but a pair could never be saved — so gate on the write-probe.
+    const idb = await import('../lib/idb.js');
+    const probeSpy = vi.spyOn(idb, 'probeStorageWritable').mockResolvedValue(false);
+    render(
+      <TransportProvider makeTransport={() => new FakeTransport()}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(api.phase).toBe('storage-error'));
+    probeSpy.mockRestore();
+  });
+
+  it('retryStorage recovers to setup once storage becomes writable (#F6)', async () => {
+    const idb = await import('../lib/idb.js');
+    const probeSpy = vi.spyOn(idb, 'probeStorageWritable').mockResolvedValue(false);
+    render(
+      <TransportProvider makeTransport={() => new FakeTransport()}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(api.phase).toBe('storage-error'));
+    // Storage comes back; a retry re-probes and re-enables pairing.
+    probeSpy.mockResolvedValue(true);
+    await act(async () => { await api.retryStorage(); });
+    await waitFor(() => expect(api.phase).toBe('setup'));
+    probeSpy.mockRestore();
   });
 
   it('a wipe that arrives BEFORE loadSession resolves is not ignored — the loaded session is not installed (#R6-4b)', async () => {
