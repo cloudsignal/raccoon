@@ -76,18 +76,28 @@ function Shell() {
 }
 ```
 
-For the standalone, self-serving build (the hub serves the PWA on its own
-port), run `npm run build:app` in the monorepo and pass the `dist-standalone/` path as
-`staticDir` to the hub. See [`packages/app/README.md`](../packages/app/README.md).
+For the standalone, self-serving build (the hub serves the PWA on its own port),
+either install `@raccoon/app` and serve its prebuilt `dist-standalone/`
+(published in the package — no clone needed), or, from a monorepo clone, run
+`npm run build:app` and serve the generated `packages/app/dist-standalone/`. Pass
+that path as `staticDir` to the hub. See [`packages/app/README.md`](../packages/app/README.md).
 
 ## Path B — an existing OpenClaw agent
 
 If your agent runs on [OpenClaw](https://openclaw.ai), install the first-party
-connector instead of writing an `AgentRunner`:
+connector as an OpenClaw plugin — no `AgentRunner` to write:
 
 ```bash
-npm install @raccoon/connector-openclaw
-# openclaw is a peer dependency you already have
+openclaw plugins install npm:@raccoon/connector-openclaw
+```
+
+Serve the PWA the connector pairs to by installing the app package and pointing
+`staticDir` at its prebuilt bundle — no monorepo clone required:
+
+```bash
+npm install @raccoon/app
+# set channels.raccoon.staticDir (or RACCOON_STATIC_DIR) to
+#   node_modules/@raccoon/app/dist-standalone
 ```
 
 The connector is a full OpenClaw channel plugin: it stands up the hub inside

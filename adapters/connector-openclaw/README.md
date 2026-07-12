@@ -11,6 +11,19 @@ OpenClaw version matrix, and
 [../../docs/connector-authoring.md](../../docs/connector-authoring.md) for the
 public ports this connector implements.
 
+## Install
+
+Install as an OpenClaw plugin (npm resolves the connector + its declared deps):
+
+```bash
+openclaw plugins install npm:@raccoon/connector-openclaw
+```
+
+Serve the PWA the connector pairs to by installing `@raccoon/app` and pointing
+`channels.raccoon.staticDir` (or `RACCOON_STATIC_DIR`) at
+`node_modules/@raccoon/app/dist-standalone` — the prebuilt PWA ships inside the
+`@raccoon/app` package, so no monorepo clone is required.
+
 ## Status: CHANNEL-NATIVE (2026-07-09)
 
 Reconciled against the real `openclaw@2026.6.11` SDK. The adapter is a full

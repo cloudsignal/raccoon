@@ -10,13 +10,24 @@ WebSocket on one port.
     # open http://127.0.0.1:8790/ and scan the printed QR (or paste the payload)
     # send "/draft" to try the approval card
 
-## Build
+## Outputs — library vs standalone PWA
 
-    npm run build:app                 # BUILD_ID=dev
+This package emits **two separate** build outputs (they no longer clobber):
+
+- **`dist/`** — the LIBRARY (`npm run build`): `lib.js` + emitted `.d.ts` + a
+  compiled `styles.css`. This is what `import { App } from '@raccoon/app'` and
+  `import '@raccoon/app/styles.css'` resolve to.
+- **`dist-standalone/`** — the standalone PWA (`npm run build:app`, i.e. `vite
+  build`): `index.html`, hashed `assets/`, `version.json`,
+  `manifest.webmanifest`, and the BUILD_ID-stamped `service-worker.js`. This is
+  what a hub serves via `staticDir`.
+
+Both are published in the npm package (`prepack` builds them), so an OpenClaw
+host can serve the PWA from `node_modules/@raccoon/app/dist-standalone` without
+cloning this repo.
+
+    npm run build:app                                    # BUILD_ID=dev → dist-standalone/
     BUILD_ID=$(git rev-parse --short HEAD) npm run build:app
-
-Outputs `dist/` with `index.html`, hashed `assets/`, `version.json`,
-`manifest.webmanifest`, and the BUILD_ID-stamped `service-worker.js`.
 
 ## Branding: raccoon.config.json
 

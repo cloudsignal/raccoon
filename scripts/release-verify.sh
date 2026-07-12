@@ -37,10 +37,14 @@ ls "$WORK"/*.tgz | sed "s#$WORK/#  packed #"
 
 # ---------------------------------------------------------------------------
 echo "== 4/6 GATE: OpenClaw 2026.6.11 installs + inspects the packed connector =="
-# A consumer with ALL raccoon tarballs installed (connector deps resolve offline
-# from the co-installed tarballs) + openclaw. `plugins install --link` loads the
-# installed package (deps already present) — the published `openclaw plugins
-# install @raccoon/connector-openclaw` npm-resolves the same deps from the registry.
+# The connector is installed via npm from its packed tarball into a consumer
+# where its DECLARED deps resolve from the co-packed tarballs — i.e. real
+# npm-install dep resolution (dep COMPLETENESS is verified deterministically by
+# `gate:deps` in step 2, which catches an undeclared direct import that a hoisted
+# tree would otherwise mask). `plugins install --link` then points OpenClaw at
+# that installed package; the published path is `openclaw plugins install
+# npm:@raccoon/connector-openclaw`, which npm-resolves the same deps from the
+# registry (validated post-publish, since v0.1's deps aren't yet published).
 OC="$WORK/oc-consumer"
 mkdir -p "$OC"
 cat > "$OC/package.json" <<JSON
@@ -59,12 +63,18 @@ if ! node "$BIN" plugins doctor 2>&1 | grep -q "No plugin issues detected"; then
   node "$BIN" plugins doctor >&2 || true
   exit 1
 fi
-if ! node "$BIN" plugins inspect raccoon 2>&1 | grep -q "Status: loaded"; then
-  echo "ERROR: OpenClaw did not load the packed connector as a channel" >&2
-  node "$BIN" plugins inspect raccoon >&2 || true
-  exit 1
-fi
-echo "  OpenClaw loaded the packed connector (doctor clean; channel 'raccoon' loaded)"
+# Load the plugin RUNTIME (executes the connector module) and assert via
+# structured JSON that OpenClaw actually loaded it as a channel — not a cold
+# metadata read.
+node "$BIN" plugins inspect raccoon --runtime --json > "$OC/inspect.json" 2>/dev/null \
+  || { echo "ERROR: 'openclaw plugins inspect raccoon --runtime --json' failed" >&2; exit 1; }
+node -e '
+  const p = require(process.argv[1]).plugin;
+  const ok = p && p.status === "loaded" && p.activated === true
+    && Array.isArray(p.channelIds) && p.channelIds.includes("raccoon");
+  if (!ok) { console.error("ERROR: connector runtime did not load as a channel:", JSON.stringify(p)); process.exit(1); }
+' "$OC/inspect.json"
+echo "  OpenClaw loaded the packed connector RUNTIME (doctor clean; status=loaded, activated, channel 'raccoon')"
 
 # ---------------------------------------------------------------------------
 echo "== 5/6 GATE: a fresh Vite app builds from the packed @raccoon/app (incl. styles) =="
@@ -119,61 +129,66 @@ ls "$APP"/dist/assets/*.css >/dev/null 2>&1 || { echo "ERROR: no CSS emitted —
 echo "  fresh Vite app built from tarballs (browser-safe JS + resolvable compiled styles.css)"
 
 # ---------------------------------------------------------------------------
-echo "== 6/6 GATE: a NEW connector process resumes a session persisted by a first =="
-# Both scripts run inside the OpenClaw consumer (has @raccoon/connector-openclaw +
-# @raccoon/transport-ws + openclaw). proc1 pairs a user against a FileCredentialStore
-# on disk and exits; proc2 — a FRESH process on the same port + same store file —
-# resumes with the stored session, proving durability survives a real restart.
+echo "== 6/6 GATE: a NEW connector process resumes a session via the PRODUCTION store wiring =="
+# Both scripts drive the PRODUCTION gateway.startAccount (exported), which
+# auto-creates a FileCredentialStore at RACCOON_STORE_PATH/sessions.json — the
+# real default wiring, NOT a hand-constructed store. proc1 starts the account,
+# pairs a user (persisting a confirmed session), stops the account, and exits;
+# proc2 is a FRESH node process that starts the account on the same store path
+# and resumes with the stored session — proving durability survives a real
+# restart through the production path.
+G3STORE="$OC/g3-store"
+mkdir -p "$G3STORE"
+export RACCOON_STORE_PATH="$G3STORE"
 cat > "$OC/proc1.mjs" <<'JS'
-import { createRaccoonChannel } from '@raccoon/connector-openclaw';
-import { FileCredentialStore, WsClientTransport } from '@raccoon/transport-ws';
-const storePath = process.argv[2];
-const channel = createRaccoonChannel({
-  instance: 'g3', instanceUrl: 'ws://127.0.0.1/', port: 0, channels: ['coordinator'],
-  runner: { async *run() { yield 'ok'; } },
-  sessionStore: new FileCredentialStore({ path: storePath }),
-});
-const { port } = await channel.start();
-const pairing = await channel.pair('u1');
-const client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: pairing.token, device: 'g3' });
+import { startAccount, stopAccount } from '@raccoon/connector-openclaw';
+import { issuePairing } from '@raccoon/pairing';
+import { WsClientTransport } from '@raccoon/transport-ws';
+const port = Number(process.argv[2]);
+const instanceUrl = `ws://127.0.0.1:${port}/`;
+const log = { info() {}, warn() {}, error() {}, debug() {} };
+const ctx = { accountId: 'default', cfg: {}, account: { instance: 'g3', instanceUrl, port, channels: ['coordinator'] }, log };
+const acct = await startAccount(ctx); // production wiring auto-creates the FileCredentialStore
+const pairing = await issuePairing(acct.hub, { userId: 'u1', instanceUrl });
+const client = new WsClientTransport({ url: instanceUrl, pairingToken: pairing.token, device: 'g3' });
 let session = '';
 client.onGrant((g) => { session = g.payload.sessionToken; });
-await client.connect();
+await client.connect(); // pair -> confirm -> the store durably persists the confirmed session
 await client.close();
-await channel.stop();
+await stopAccount(ctx);
 if (!session) { console.error('proc1: no session granted'); process.exit(1); }
-process.stdout.write(`${port} ${session}\n`);
+process.stdout.write(`${session}\n`); // stdout carries ONLY the session
 process.exit(0);
 JS
 cat > "$OC/proc2.mjs" <<'JS'
-import { createRaccoonChannel } from '@raccoon/connector-openclaw';
-import { FileCredentialStore, WsClientTransport } from '@raccoon/transport-ws';
-const [, , port, storePath, session] = process.argv;
-const channel = createRaccoonChannel({
-  instance: 'g3', instanceUrl: 'ws://127.0.0.1/', port: Number(port), channels: ['coordinator'],
-  runner: { async *run() { yield 'ok'; } },
-  sessionStore: new FileCredentialStore({ path: storePath }),
-});
-await channel.start();
-const client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session });
+import { startAccount, stopAccount } from '@raccoon/connector-openclaw';
+import { WsClientTransport } from '@raccoon/transport-ws';
+const [, , port, session] = process.argv;
+const instanceUrl = `ws://127.0.0.1:${port}/`;
+const log = { info() {}, warn() {}, error() {}, debug() {} };
+const ctx = { accountId: 'default', cfg: {}, account: { instance: 'g3', instanceUrl, port: Number(port), channels: ['coordinator'] }, log };
+await startAccount(ctx); // same RACCOON_STORE_PATH -> same FileCredentialStore file -> loads the persisted session
+const client = new WsClientTransport({ url: instanceUrl, session });
 let opened = false;
 client.onStatus((s) => { if (s === 'open') opened = true; });
 await client.connect();
 await new Promise((r) => setTimeout(r, 200));
 await client.close();
-await channel.stop();
+await stopAccount(ctx);
 if (!opened) { console.error('proc2: session did NOT resume across the restart'); process.exit(1); }
 process.stdout.write('RESUMED\n');
 process.exit(0);
 JS
-G3OUT="$( cd "$OC" && node proc1.mjs "$OC/g3-sessions.json" )"
-G3PORT="${G3OUT%% *}"
-G3SESSION="${G3OUT##* }"
-if ! ( cd "$OC" && node proc2.mjs "$G3PORT" "$OC/g3-sessions.json" "$G3SESSION" ) | grep -q RESUMED; then
+# A free ephemeral port both processes reuse (proc1 frees it on exit before proc2 binds).
+G3PORT="$(node -e 'const s=require("net").createServer().listen(0,()=>{process.stdout.write(String(s.address().port));s.close();})')"
+G3SESSION="$( cd "$OC" && node proc1.mjs "$G3PORT" | tail -1 )"
+if [ -z "$G3SESSION" ]; then echo "ERROR: proc1 did not pair a session" >&2; exit 1; fi
+if ! ( cd "$OC" && node proc2.mjs "$G3PORT" "$G3SESSION" ) | grep -q RESUMED; then
   echo "ERROR: a fresh connector process did NOT resume the persisted session" >&2
   exit 1
 fi
-echo "  a fresh connector process resumed the session the first process persisted"
+unset RACCOON_STORE_PATH
+echo "  a fresh connector process resumed the session the first persisted (production startAccount store wiring)"
 
 echo ""
 echo "RELEASE VERIFY: PASS — OpenClaw-installable connector, browser-buildable app from packed packages, and cross-process session resume."

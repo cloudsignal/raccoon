@@ -5,19 +5,21 @@
   "type": "module",
   "main": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
-  "files": ["dist", "raccoon.config.json"],
+  "files": ["dist", "dist-standalone", "raccoon.config.json"],
   "exports": {
     ".": {
       "types": "./dist/lib.d.ts",
       "default": "./dist/lib.js"
     },
-    "./styles.css": "./dist/styles.css"
+    "./styles.css": "./dist/styles.css",
+    "./dist-standalone/*": "./dist-standalone/*"
   },
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.build.json && tailwindcss -i ./src/styles.css -o ./dist/styles.css --minify",
     "build:standalone": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "prepack": "npm run build && npm run build:standalone"
   },
   "peerDependencies": {
     "react": "^19.0.0",
