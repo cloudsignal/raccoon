@@ -1,4 +1,4 @@
-import { WsHub } from '@raccoon/transport-ws';
+import { WsHub, type CredentialStore } from '@raccoon/transport-ws';
 import { InMemoryMessageStore, RaccoonBridge, type AgentRunner } from '@raccoon/bridge';
 import { issuePairing, revokePairing } from '@raccoon/pairing';
 import { InMemorySubscriptionStore, VapidPushSender, withPushFallback } from '@raccoon/push';
@@ -21,6 +21,16 @@ export interface RaccoonChannelOptions {
   staticDir?: string;
   /** Enable self-hosted web-push for offline delivery. */
   vapid?: { publicKey: string; privateKey: string; subject: string };
+  /**
+   * Session/credential store backing pairing + resume. Defaults to the WsHub's
+   * in-memory store, which does NOT survive a connector restart — every paired
+   * PWA must re-pair after the process bounces. Supply a persistent
+   * CredentialStore (any impl of the interface) so confirmed sessions survive a
+   * restart and reconnecting clients resume rather than re-pair. Session
+   * durability is the deployment's responsibility (v0.1 ships no file-backed
+   * default); see docs/connector-authoring.md.
+   */
+  sessionStore?: CredentialStore;
 }
 
 /** The object returned by createRaccoonChannel — a started/stoppable WsHub +
@@ -45,6 +55,9 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
     channels: opts.channels,
     staticDir: opts.staticDir,
     vapidPublicKey: opts.vapid?.publicKey,
+    // Only override the WsHub's in-memory default when a store is supplied, so
+    // an omitted sessionStore keeps the built-in (undefined would not).
+    ...(opts.sessionStore ? { store: opts.sessionStore } : {}),
   });
 
   let stopPush: (() => void) | null = null;
