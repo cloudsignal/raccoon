@@ -245,6 +245,22 @@ describe('TransportProvider', () => {
     demoteSpy.mockRestore();
   });
 
+  it('an IndexedDB boot failure surfaces the error and reaches setup, never hanging on loading (#IDB-boot)', async () => {
+    // loadSession() (and the IDB paths it drives) reject on a blocked/failed
+    // IndexedDB open. The boot effect must catch that and drop to 'setup'; the
+    // pre-fix code left the promise rejected-unhandled and phase stuck on the
+    // initial 'loading' (a permanent spinner).
+    const realLoad = await import('../lib/session.js');
+    const loadSpy = vi.spyOn(realLoad, 'loadSession').mockRejectedValue(new Error('IndexedDB open blocked'));
+    render(
+      <TransportProvider makeTransport={() => new FakeTransport()}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('setup'));
+    loadSpy.mockRestore();
+  });
+
   it('a wipe that arrives BEFORE loadSession resolves is not ignored — the loaded session is not installed (#R6-4b)', async () => {
     await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
 

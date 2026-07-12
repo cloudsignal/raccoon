@@ -910,6 +910,16 @@ export function TransportProvider(props: TransportProviderProps) {
       wireTransport(transport);
       setPhase('ready');
       try { await transport.connect(); } catch { /* reconnect loop handles it */ }
+    }).catch((err) => {
+      // #IDB-boot: loadSession() (and the IDB paths it drives) reject on a
+      // blocked/failed IndexedDB open. Without this handler the promise rejects
+      // unhandled and `phase` is stranded at its initial 'loading' — a permanent
+      // spinner. Surface the failure and drop to 'setup' so the QR-scan UI is
+      // reachable (a re-pair is the only recovery when local storage is unusable).
+      if (cancelled) return;
+      console.error('[raccoon] session load failed at boot:', err);
+      setAuthError('Could not read local storage on this device. Scan a QR code to reconnect.');
+      setPhase('setup');
     });
     return () => {
       cancelled = true;
