@@ -11,6 +11,7 @@
     "build": "npm run build -w @raccoon/protocol && npm run build -w @raccoon/transport-ws && npm run build -w @raccoon/pairing && npm run build -w @raccoon/push && npm run build -w @raccoon/bridge && npm run build -w @raccoon/connector-openclaw && npm run build -w @raccoon/app",
     "build:app": "npm run build:standalone -w @raccoon/app",
     "gate:neutrality": "bash scripts/gate-neutrality.sh",
+    "gate:deps": "node scripts/gate-deps.mjs",
     "release:verify": "bash scripts/release-verify.sh",
     "demo": "npm run build:app && npm start -w @raccoon/example-echo",
     "example:echo": "npm start -w @raccoon/example-echo"

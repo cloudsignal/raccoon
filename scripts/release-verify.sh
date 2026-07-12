@@ -17,6 +17,8 @@ npm run gate:neutrality
 echo "== 2/6 build all published libs (dist + declarations + compiled css) =="
 npm run build >/dev/null
 echo "  built"
+# Unpiped so a failure trips `set -e` (piping to sed would mask the exit code).
+npm run gate:deps
 
 echo "== 3/6 pack every published package =="
 WORK="$(mktemp -d)"
