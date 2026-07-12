@@ -145,7 +145,7 @@ server-only or unconditional-WS exports.
   Allow/Deny/Edit response back to the real command via an approval-value store.
 
 No OpenClaw type crosses into core; `openclaw` is a peer dependency of the
-connector only. The end-to-end workflow (pair → message → streamed reply →
+connector only. The end-to-end workflow (pair → message → reply →
 approval Allow/Deny/Edit → reconnect → connector restart → unpair) is covered by
 `adapters/connector-openclaw/src/openclaw-e2e.test.ts`, driven against the real
 published OpenClaw types.

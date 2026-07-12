@@ -13,7 +13,7 @@
 // The ONLY thing stubbed is `dispatchReplyFromConfigWithSettledDispatcher` — the
 // one call that would invoke a live model. openclaw@2026.6.11 ships no
 // deterministic/echo model provider (its only provider is 'anthropic'), so a
-// real streamed turn cannot run in CI. The stub still drives the connector's
+// real model turn cannot run in CI. The stub still drives the connector's
 // REAL dispatcher (buildDispatcher in inbound.ts) with REAL ReplyPayload shapes,
 // and it captures the FinalizedMsgContext.Body the connector actually hands
 // OpenClaw — so the approval-resolution assertions verify the real inbound
@@ -21,7 +21,9 @@
 // (MessagePresentation, ChannelOutboundPayloadContext, ReplyPayload,
 // FinalizedMsgContext) — there are no handwritten shims here.
 //
-// Covers the DoD workflow: pair the PWA → send a message → streamed reply →
+// Covers the DoD workflow: pair the PWA → send a message → reply (final reply
+// only; the connector forwards sendFinalReply, not block/tool chunks — the
+// client receives ONE concatenated msg, not incremental streaming) →
 // approval request → Allow / Deny / Edit → disconnect + reconnect → restart the
 // connector and resume the stored session → unpair and reject the old session.
 
@@ -177,7 +179,7 @@ async function raiseApproval(
 // ---------------------------------------------------------------------------
 
 describe('OpenClaw connector e2e (real hub + client + connector; only the model call stubbed)', () => {
-  it('pairs, streams a reply, resolves Allow/Deny/Edit approvals, then reconnects', async () => {
+  it('pairs, receives a reply, resolves Allow/Deny/Edit approvals, then reconnects', async () => {
     const { channel, outbound } = buildConnector();
     const { port } = await channel.start();
 
@@ -193,7 +195,7 @@ describe('OpenClaw connector e2e (real hub + client + connector; only the model 
     await client.connect();
     expect(session.length).toBeGreaterThan(0);
 
-    // 3. Send a message → streamed reply (msg → bridge → runner → dispatcher → msg).
+    // 3. Send a message → reply (msg → bridge → runner → dispatcher → one msg).
     await client.send(userMsg('hi'));
     await waitUntil(() => received.some((e) => e.kind === 'msg' && e.payload.text === 'reply:hi'));
 
