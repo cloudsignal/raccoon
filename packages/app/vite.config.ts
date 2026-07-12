@@ -30,7 +30,11 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), raccoonAssets()],
   define: { __RACCOON_BUILD_ID__: JSON.stringify(buildId) },
   resolve: {
+    // Resolve workspace deps to SOURCE so `npm run build:app` is self-contained
+    // on a clean clone (no prior `npm run build` / dist required — the DoD lists
+    // build:app as a standalone post-`npm ci` command).
     alias: {
+      '@raccoon/protocol': new URL('../protocol/src/index.ts', import.meta.url).pathname,
       // The transport-ws barrel re-exports server-only modules (credential-store, hub).
       // Point the browser build at the browser-safe client entry only.
       '@raccoon/transport-ws': new URL('../transport-ws/src/client.ts', import.meta.url).pathname,
