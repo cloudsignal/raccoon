@@ -11,7 +11,12 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "@raccoon/protocol": ["../protocol/src/index.ts"],
+      "@raccoon/transport-ws": ["../transport-ws/src/index.ts"]
+    }
   },
   "include": ["src"]
 }
