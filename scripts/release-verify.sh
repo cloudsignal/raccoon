@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# v0.1 release acceptance gate. Proves the published packages install as
-# TARBALLS into a FRESH consumer project OUTSIDE the monorepo and build there
-# with NO sibling repo, NO vendored tree, NO path aliases into source, NO deep
-# /src imports, and NO CloudSignal/GTM dependency — importing only package
-# ROOTS. Also runs the neutrality gate and a runtime ESM smoke.
+# v0.1 release acceptance gate. Three REAL end-to-end gates against the PACKED
+# tarballs (not a sibling repo / vendor tree / path aliases):
+#   GATE 1  OpenClaw 2026.6.11 installs + loads the packed connector.
+#   GATE 2  A fresh Vite app builds from the packed @raccoon/app (incl. styles).
+#   GATE 3  A NEW connector process resumes a session persisted by a first process.
+# Plus the neutrality gate. These replace the earlier typecheck-only fixture,
+# which passed over an un-installable connector and a browser-unbuildable app.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+BIN="$ROOT/node_modules/.bin/openclaw"
 
-echo "== 1/5 neutrality gate =="
+echo "== 1/6 neutrality gate =="
 npm run gate:neutrality
 
-echo "== 2/5 build all published libs (dist + declarations) =="
+echo "== 2/6 build all published libs (dist + declarations + compiled css) =="
 npm run build >/dev/null
 echo "  built"
 
-echo "== 3/5 pack every published package =="
+echo "== 3/6 pack every published package =="
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 dir_of() { # bash-3.2-safe (macOS) — no associative arrays
@@ -27,85 +30,148 @@ dir_of() { # bash-3.2-safe (macOS) — no associative arrays
 for p in protocol transport-ws pairing push bridge connector-openclaw app; do
   ( cd "$(dir_of "$p")" && npm pack --pack-destination "$WORK" >/dev/null )
 done
+tgz() { echo "$WORK/raccoon-$1-0.1.0.tgz"; }
 ls "$WORK"/*.tgz | sed "s#$WORK/#  packed #"
 
-echo "== 4/5 build a FRESH external consumer fixture against the tarballs =="
-FIX="$WORK/fixture"
-mkdir -p "$FIX/src"
-tgz() { echo "file:$WORK/raccoon-$1-0.1.0.tgz"; }
-cat > "$FIX/package.json" <<JSON
-{
-  "name": "raccoon-consumer-fixture",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
+# ---------------------------------------------------------------------------
+echo "== 4/6 GATE: OpenClaw 2026.6.11 installs + inspects the packed connector =="
+# A consumer with ALL raccoon tarballs installed (connector deps resolve offline
+# from the co-installed tarballs) + openclaw. `plugins install --link` loads the
+# installed package (deps already present) — the published `openclaw plugins
+# install @raccoon/connector-openclaw` npm-resolves the same deps from the registry.
+OC="$WORK/oc-consumer"
+mkdir -p "$OC"
+cat > "$OC/package.json" <<JSON
+{ "name": "oc-consumer", "private": true, "version": "0.0.0", "type": "module",
+  "dependencies": { "openclaw": "2026.6.11" } }
+JSON
+( cd "$OC" && npm i --no-audit --no-fund \
+    "$(tgz protocol)" "$(tgz transport-ws)" "$(tgz pairing)" "$(tgz push)" "$(tgz bridge)" "$(tgz connector-openclaw)" \
+    >/dev/null 2>&1 )
+export OPENCLAW_STATE_DIR="$OC/state"
+export OPENCLAW_CONFIG="$OC/config.json"
+mkdir -p "$OPENCLAW_STATE_DIR"
+node "$BIN" plugins install --link "$OC/node_modules/@raccoon/connector-openclaw" >/dev/null
+if ! node "$BIN" plugins doctor 2>&1 | grep -q "No plugin issues detected"; then
+  echo "ERROR: openclaw plugins doctor reported issues for the packed connector" >&2
+  node "$BIN" plugins doctor >&2 || true
+  exit 1
+fi
+if ! node "$BIN" plugins inspect raccoon 2>&1 | grep -q "Status: loaded"; then
+  echo "ERROR: OpenClaw did not load the packed connector as a channel" >&2
+  node "$BIN" plugins inspect raccoon >&2 || true
+  exit 1
+fi
+echo "  OpenClaw loaded the packed connector (doctor clean; channel 'raccoon' loaded)"
+
+# ---------------------------------------------------------------------------
+echo "== 5/6 GATE: a fresh Vite app builds from the packed @raccoon/app (incl. styles) =="
+APP="$WORK/vite-consumer"
+mkdir -p "$APP/src"
+cat > "$APP/package.json" <<JSON
+{ "name": "vite-consumer", "private": true, "version": "0.0.0", "type": "module",
+  "scripts": { "build": "vite build" },
   "dependencies": {
+    "@raccoon/app": "$(tgz app)",
     "@raccoon/protocol": "$(tgz protocol)",
     "@raccoon/transport-ws": "$(tgz transport-ws)",
-    "@raccoon/pairing": "$(tgz pairing)",
-    "@raccoon/push": "$(tgz push)",
-    "@raccoon/bridge": "$(tgz bridge)",
-    "@raccoon/connector-openclaw": "$(tgz connector-openclaw)",
-    "@raccoon/app": "$(tgz app)",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "openclaw": "2026.6.11"
+    "react": "^19.0.0", "react-dom": "^19.0.0"
   },
-  "devDependencies": {
-    "typescript": "^5.5.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "@types/node": "^22.0.0"
-  }
-}
+  "devDependencies": { "vite": "^6.0.0", "@vitejs/plugin-react": "^4.3.0" } }
 JSON
-cat > "$FIX/tsconfig.json" <<JSON
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "jsx": "react-jsx",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "strict": true,
-    "skipLibCheck": true,
-    "noEmit": true,
-    "types": ["node"]
-  },
-  "include": ["src"]
-}
-JSON
-# Consume ONLY package roots — never @raccoon/*/src. Named + namespace imports
-# prove both the exports map and the emitted declarations resolve.
-cat > "$FIX/src/consume.tsx" <<'TS'
-import { createEnvelope, type AnyEnvelope } from '@raccoon/protocol';
-import { RaccoonBridge, type AgentRunner, type MessageStore } from '@raccoon/bridge';
-import { WsHub, WsClientTransport } from '@raccoon/transport-ws';
-import * as pairing from '@raccoon/pairing';
-import { vendorOf } from '@raccoon/push';
-import { createRaccoonChannel } from '@raccoon/connector-openclaw';
-import { TransportProvider, App, type Session } from '@raccoon/app';
-
-const env: AnyEnvelope = createEnvelope('msg', {
-  from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'hi' },
-});
-void env; void RaccoonBridge; void WsHub; void WsClientTransport; void pairing;
-void vendorOf; void createRaccoonChannel; void TransportProvider; void App;
-type _Runner = AgentRunner; type _Store = MessageStore; type _S = Session;
+cat > "$APP/vite.config.ts" <<'TS'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()] });
 TS
-( cd "$FIX" && npm install --no-audit --no-fund >/dev/null 2>&1 && npx tsc --noEmit )
-echo "  fixture typechecks against tarball roots"
+cat > "$APP/index.html" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"></head>
+<body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+HTML
+# Imports the package ROOT + the compiled stylesheet — the exact host-embed
+# surface. A browser build here would fail on node:crypto if @raccoon/app pulled
+# the transport's server barrel, or on an unresolved raw @import 'tailwindcss'.
+cat > "$APP/src/main.tsx" <<'TSX'
+import { createRoot } from 'react-dom/client';
+import { App, TransportProvider } from '@raccoon/app';
+import '@raccoon/app/styles.css';
+const el = document.getElementById('root');
+if (el) createRoot(el).render(
+  <TransportProvider makeTransport={() => { throw new Error('demo-only'); }}>
+    <App />
+  </TransportProvider>
+);
+TSX
+( cd "$APP" && npm i --no-audit --no-fund >/dev/null 2>&1 )
+if ! ( cd "$APP" && npm run build >/dev/null 2>&1 ); then
+  echo "ERROR: a fresh Vite app failed to build against the packed packages" >&2
+  ( cd "$APP" && npm run build ) >&2 || true
+  exit 1
+fi
+test -d "$APP/dist" || { echo "ERROR: vite build produced no dist" >&2; exit 1; }
+# The build SUCCEEDING is the proof the app's transport import no longer pulls the
+# node:crypto-using hub barrel (the reviewer's failure was a hard build error) —
+# a browser bundler resolves @raccoon/transport-ws's 'browser' condition to the
+# client-only entry. Confirm the compiled stylesheet resolved + emitted too.
+ls "$APP"/dist/assets/*.css >/dev/null 2>&1 || { echo "ERROR: no CSS emitted — @raccoon/app/styles.css did not resolve/compile" >&2; exit 1; }
+echo "  fresh Vite app built from tarballs (browser-safe JS + resolvable compiled styles.css)"
 
-echo "== 5/5 fixture boundary assertions + runtime ESM smoke =="
-if grep -rn "@raccoon/[a-z-]*/src" "$FIX/src"; then echo "ERROR: fixture used a /src import" >&2; exit 1; fi
-if grep -rniE "cloudsignal|gtm|supabase" "$FIX/src"; then echo "ERROR: fixture referenced a vendor identifier" >&2; exit 1; fi
-cat > "$FIX/src/smoke.mjs" <<'JS'
-import { createEnvelope } from '@raccoon/protocol';
-const e = createEnvelope('msg', { from: 'user:u1', to: 'agent:a', channel: 'c', payload: { text: 'ok' } });
-if (e.kind !== 'msg') { console.error('smoke FAILED'); process.exit(1); }
-console.log('  runtime ESM smoke: @raccoon/protocol resolves + runs from tarball dist');
+# ---------------------------------------------------------------------------
+echo "== 6/6 GATE: a NEW connector process resumes a session persisted by a first =="
+# Both scripts run inside the OpenClaw consumer (has @raccoon/connector-openclaw +
+# @raccoon/transport-ws + openclaw). proc1 pairs a user against a FileCredentialStore
+# on disk and exits; proc2 — a FRESH process on the same port + same store file —
+# resumes with the stored session, proving durability survives a real restart.
+cat > "$OC/proc1.mjs" <<'JS'
+import { createRaccoonChannel } from '@raccoon/connector-openclaw';
+import { FileCredentialStore, WsClientTransport } from '@raccoon/transport-ws';
+const storePath = process.argv[2];
+const channel = createRaccoonChannel({
+  instance: 'g3', instanceUrl: 'ws://127.0.0.1/', port: 0, channels: ['coordinator'],
+  runner: { async *run() { yield 'ok'; } },
+  sessionStore: new FileCredentialStore({ path: storePath }),
+});
+const { port } = await channel.start();
+const pairing = await channel.pair('u1');
+const client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: pairing.token, device: 'g3' });
+let session = '';
+client.onGrant((g) => { session = g.payload.sessionToken; });
+await client.connect();
+await client.close();
+await channel.stop();
+if (!session) { console.error('proc1: no session granted'); process.exit(1); }
+process.stdout.write(`${port} ${session}\n`);
+process.exit(0);
 JS
-( cd "$FIX" && node src/smoke.mjs )
+cat > "$OC/proc2.mjs" <<'JS'
+import { createRaccoonChannel } from '@raccoon/connector-openclaw';
+import { FileCredentialStore, WsClientTransport } from '@raccoon/transport-ws';
+const [, , port, storePath, session] = process.argv;
+const channel = createRaccoonChannel({
+  instance: 'g3', instanceUrl: 'ws://127.0.0.1/', port: Number(port), channels: ['coordinator'],
+  runner: { async *run() { yield 'ok'; } },
+  sessionStore: new FileCredentialStore({ path: storePath }),
+});
+await channel.start();
+const client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session });
+let opened = false;
+client.onStatus((s) => { if (s === 'open') opened = true; });
+await client.connect();
+await new Promise((r) => setTimeout(r, 200));
+await client.close();
+await channel.stop();
+if (!opened) { console.error('proc2: session did NOT resume across the restart'); process.exit(1); }
+process.stdout.write('RESUMED\n');
+process.exit(0);
+JS
+G3OUT="$( cd "$OC" && node proc1.mjs "$OC/g3-sessions.json" )"
+G3PORT="${G3OUT%% *}"
+G3SESSION="${G3OUT##* }"
+if ! ( cd "$OC" && node proc2.mjs "$G3PORT" "$OC/g3-sessions.json" "$G3SESSION" ) | grep -q RESUMED; then
+  echo "ERROR: a fresh connector process did NOT resume the persisted session" >&2
+  exit 1
+fi
+echo "  a fresh connector process resumed the session the first process persisted"
 
 echo ""
-echo "RELEASE VERIFY: PASS — packed tarballs build in a fresh consumer with package-root imports only."
+echo "RELEASE VERIFY: PASS — OpenClaw-installable connector, browser-buildable app from packed packages, and cross-process session resume."
