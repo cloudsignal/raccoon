@@ -27,7 +27,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEnvelope, type AnyEnvelope } from '@raccoon/protocol';
-import { WsClientTransport, MemoryCredentialStore } from '@raccoon/transport-ws';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { WsClientTransport, FileCredentialStore, type CredentialStore } from '@raccoon/transport-ws';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
 import type { ChannelOutboundPayloadContext } from 'openclaw/plugin-sdk/channel-runtime';
 import type { MessagePresentation, MessagePresentationButton } from 'openclaw/plugin-sdk/interactive-runtime';
@@ -73,12 +76,14 @@ beforeEach(() => {
 type Channel = ReturnType<typeof createRaccoonChannel>;
 const channels: Channel[] = [];
 const clients: WsClientTransport[] = [];
+const storeFilesToClean: string[] = [];
 
 afterEach(async () => {
   await Promise.all(clients.map((c) => c.close().catch(() => {})));
   clients.length = 0;
   await Promise.all(channels.map((c) => c.stop().catch(() => {})));
   channels.length = 0;
+  for (const d of storeFilesToClean.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -86,7 +91,7 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 /** Stand up the connector: real runner + real channel (+ real outbound). */
-function buildConnector(opts: { port?: number; sessionStore?: MemoryCredentialStore } = {}) {
+function buildConnector(opts: { port?: number; sessionStore?: CredentialStore } = {}) {
   const approvalValues = createApprovalValueStore();
   const runner = buildRaccoonInboundRunner({
     cfg, storePath: '/tmp/raccoon-e2e', agentId: 'coordinator', accountId: 'default', approvalValues,
@@ -222,12 +227,17 @@ describe('OpenClaw connector e2e (real hub + client + connector; only the model 
   });
 
   it('restarts the connector on the same port and resumes the stored session (persistent store)', async () => {
-    // A persistent credential store shared across the two connector lifecycles
-    // stands in for real on-disk session durability (v0.1 ships no file store;
-    // the deployment owns durability — see createRaccoonChannel({ sessionStore })).
-    const sessionStore = new MemoryCredentialStore();
+    // Back each lifecycle with a SEPARATE FileCredentialStore instance reading
+    // the SAME on-disk file — so the "restart" gets a fresh store object (as a
+    // new process would), NOT the same in-memory object. Durability rides the
+    // file, exactly as production does (gateway.startAccount wires a
+    // FileCredentialStore at <storePath>/sessions.json). The truly-new-process
+    // variant is exercised by the release gate.
+    const storeDir = mkdtempSync(join(tmpdir(), 'raccoon-e2e-store-'));
+    storeFilesToClean.push(storeDir);
+    const storePath = join(storeDir, 'sessions.json');
 
-    const first = buildConnector({ sessionStore });
+    const first = buildConnector({ sessionStore: new FileCredentialStore({ path: storePath }) });
     const { port } = await first.channel.start();
     const pairing = await first.channel.pair('u1');
     const paired = newClient({ url: `ws://127.0.0.1:${port}/`, pairingToken: pairing.token, device: 'iphone' });
@@ -237,11 +247,11 @@ describe('OpenClaw connector e2e (real hub + client + connector; only the model 
     expect(session.length).toBeGreaterThan(0);
     await paired.client.close();
 
-    // Restart: stop the connector, stand a NEW one up on the SAME port backed
-    // by the SAME store (a real process restart with persisted sessions).
+    // Restart: stop the connector, stand a NEW one up on the SAME port with a
+    // FRESH store instance reading the same persisted file (models a new process).
     await first.channel.stop();
     channels.length = 0; // first is stopped; don't double-stop in afterEach
-    const second = buildConnector({ port, sessionStore });
+    const second = buildConnector({ port, sessionStore: new FileCredentialStore({ path: storePath }) });
     await second.channel.start();
 
     // The PWA reconnects with the session it stored — resumes, no re-pair.

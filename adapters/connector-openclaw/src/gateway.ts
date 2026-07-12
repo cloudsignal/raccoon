@@ -26,8 +26,10 @@
 // registry is the mechanism that bridges "one plugin object built at module
 // load" to "a hub that only exists once an account is started".
 
+import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AgentRunner } from '@raccoon/bridge';
+import { FileCredentialStore, type CredentialStore } from '@raccoon/transport-ws';
 import { issuePairing, type PairingHub } from '@raccoon/pairing';
 import type {
   ChannelGatewayContext,
@@ -83,6 +85,7 @@ export interface StartAccountDeps {
     buildId?: string;
     staticDir?: string;
     vapid?: { publicKey: string; privateKey: string; subject: string };
+    sessionStore?: CredentialStore;
   }) => Pick<RaccoonAgentChannel, 'hub' | 'start' | 'stop' | 'revoke'>;
   /**
    * Optional allowlist gate applied to the inbound runner. When it returns
@@ -209,6 +212,11 @@ async function doStart(
   // read from the env rather than the resolved account.
   const host = process.env['RACCOON_HOST'];
 
+  // #F4: back sessions with a FILE store keyed to the account's storePath, so a
+  // real connector-process restart RESUMES confirmed sessions instead of forcing
+  // every paired device to re-pair (the in-memory default loses them on bounce).
+  const sessionStore = new FileCredentialStore({ path: join(resolveStorePath(accountId), 'sessions.json') });
+
   const factory = deps.createChannel ?? createRaccoonChannel;
   const channel = factory({
     instance: account.instance,
@@ -218,6 +226,7 @@ async function doStart(
     port: account.port,
     channels: account.channels,
     runner,
+    sessionStore,
     ...(account.vapid !== undefined ? { vapid: account.vapid } : {}),
   });
 
