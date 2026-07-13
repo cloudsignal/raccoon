@@ -35,6 +35,21 @@ done
 tgz() { echo "$WORK/raccoon-$1-0.1.0.tgz"; }
 ls "$WORK"/*.tgz | sed "s#$WORK/#  packed #"
 
+# The published PWA must carry a REAL build id (its package version), not 'dev'
+# — a 'dev' id disables the update check and makes every release share the
+# raccoon-*-dev cache. Assert against the artifact ACTUALLY IN THE TARBALL.
+APPPKG="$WORK/app-unpack"
+mkdir -p "$APPPKG"
+tar xzf "$(tgz app)" -C "$APPPKG"
+APP_BUILD_ID="$(node -e "process.stdout.write(String(require('$APPPKG/package/dist-standalone/version.json').buildId))")"
+if [ "$APP_BUILD_ID" = "dev" ] || [ -z "$APP_BUILD_ID" ]; then
+  echo "ERROR: packed PWA version.json has buildId='$APP_BUILD_ID' (dev/empty) — updates would be disabled" >&2
+  exit 1
+fi
+grep -q "BUILD_ID = '$APP_BUILD_ID'" "$APPPKG/package/dist-standalone/service-worker.js" \
+  || { echo "ERROR: packed service-worker.js BUILD_ID does not match version.json ($APP_BUILD_ID)" >&2; exit 1; }
+echo "  packed PWA build id is release-real: $APP_BUILD_ID (not dev)"
+
 # ---------------------------------------------------------------------------
 echo "== 4/6 GATE: OpenClaw 2026.6.11 installs + inspects the packed connector =="
 # The connector is installed via npm from its packed tarball into a consumer

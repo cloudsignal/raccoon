@@ -19,7 +19,7 @@
     "build": "tsc -p tsconfig.build.json && tailwindcss -i ./src/styles.css -o ./dist/styles.css --minify",
     "build:standalone": "vite build",
     "preview": "vite preview",
-    "prepack": "npm run build && npm run build:standalone"
+    "prepack": "npm run build && BUILD_ID=$npm_package_version npm run build:standalone"
   },
   "peerDependencies": {
     "react": "^19.0.0",
