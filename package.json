@@ -20,6 +20,7 @@
   },
   "devDependencies": {
     "typescript": "^5.5.0",
+    "verdaccio": "^6.0.0",
     "vitest": "^3.0.0"
   }
 }

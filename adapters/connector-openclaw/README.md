@@ -20,9 +20,15 @@ openclaw plugins install npm:@raccoon/connector-openclaw
 ```
 
 Serve the PWA the connector pairs to by installing `@raccoon/app` and pointing
-`channels.raccoon.staticDir` (or `RACCOON_STATIC_DIR`) at
-`node_modules/@raccoon/app/dist-standalone` — the prebuilt PWA ships inside the
-`@raccoon/app` package, so no monorepo clone is required.
+`channels.raccoon.staticDir` (or `RACCOON_STATIC_DIR`) at the package's prebuilt
+`dist-standalone` bundle — the PWA ships inside `@raccoon/app`, so no monorepo
+clone is required. The gateway's working directory is not where you ran
+`npm install`, so resolve an **absolute** path (a relative `node_modules/...`
+path will not find the files at runtime):
+
+```bash
+export RACCOON_STATIC_DIR="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@raccoon/app/package.json')), 'dist-standalone')")"
+```
 
 ## Status: CHANNEL-NATIVE (2026-07-09)
 
