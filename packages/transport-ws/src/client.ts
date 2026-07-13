@@ -127,6 +127,11 @@ export class WsClientTransport implements Transport {
       this.ws = ws;
       this.setStatus('connecting');
       let settled = false;
+      // #P1(r3): set when onAdoptGrant REJECTED — the pairing is dead, so the
+      // close below must NOT schedule a reconnect (a reconnect would resume the
+      // provisional token and the hub would promote it, defeating the point of
+      // failing the adoption). Dial-scoped: a fresh connect() starts clean.
+      let pairingAborted = false;
       // #R10: the adopted grant, stashed until the hub ACKs pair.confirmed.
       // Success (established/grantHandlers/resolve) is DEFERRED until then, so a
       // lost/failed confirm never reports a false "paired".
@@ -162,31 +167,37 @@ export class WsClientTransport implements Transport {
           }
           const env = tryParseEnvelope(parsed);
           if (env?.kind === 'pair.grant') {
-            // Adopt the session token and CONFIRM, but DEFER success: the hub
-            // ACKs pair.confirmed only after it actually promotes the session.
-            // A client whose socket closed in the lost-grant window never
-            // reaches here (its provisional session is TTL-reaped); one whose
-            // confirm/promotion fails never gets the ACK, so connect() rejects
-            // on close instead of falsely reporting paired (#R10).
-            this.opts = { ...this.opts, session: env.payload.sessionToken, pairingToken: undefined };
-            pendingGrant = env;
-            this.adoptedGrant = env; // surfaced by established() on confirm OR recovery-resume
             const grant = env;
+            pendingGrant = env; // matched against pair.confirmed; cleared on adoption failure
             const adopt = this.opts.onAdoptGrant;
             const confirmTimeoutMs = this.opts.confirmAckTimeoutMs ?? CONFIRM_ACK_TIMEOUT_MS;
-            // #P1-B: DURABLY adopt (host persists the session) BEFORE confirming.
-            // Await the host's persist; confirm ONLY if it succeeds. A failure —
-            // or the socket closing during the persist — aborts the confirm, so
-            // the hub never promotes the provisional session (it TTL-reaps) and
-            // there is no server session without a durable client copy.
+            // #P1-B/#P1(r3): DURABLY adopt (host persists) BEFORE the token becomes
+            // RESUMABLE. opts.session is set (and the grant stashed for re-emission)
+            // ONLY after onAdoptGrant succeeds — never before — so a failed
+            // adoption can't leave a resumable token that a reconnect would
+            // resume+promote. On rejection: clear the provisional state and
+            // TERMINATE without reconnecting (the hub's provisional session
+            // TTL-reaps, never promoted). Confirm is likewise sent only post-adopt.
             void (async () => {
               try {
                 if (adopt) await adopt(grant);
               } catch {
+                pendingGrant = null;
+                pairingAborted = true; // suppress the reconnect in the close handler
                 try { ws.close(); } catch { /* already closing */ }
                 return;
               }
-              if (settled) return; // socket closed during the persist — nothing to confirm
+              // Adoption succeeded → the session is durable. NOW make it resumable.
+              this.opts = { ...this.opts, session: grant.payload.sessionToken, pairingToken: undefined };
+              this.adoptedGrant = grant; // surfaced by established() on confirm OR recovery-resume
+              if (settled) {
+                // The socket closed WHILE adoption was in flight (the close handler
+                // saw no session yet, so it did NOT reconnect). Now that adoption
+                // succeeded, recovery is safe: resume the now-durable session,
+                // which the hub promotes idempotently (#P1-B).
+                this.scheduleReconnect();
+                return;
+              }
               try {
                 ws.send(JSON.stringify(createEnvelope('pair.confirm', {
                   from: 'system', to: 'system', channel: 'pairing',
@@ -230,9 +241,10 @@ export class WsClientTransport implements Transport {
           settled = true;
           reject(new Error(`connection closed during handshake (code ${event.code})`));
         }
-        // Terminal closes never reconnect: a user-initiated close, or an auth-coded
-        // close (revoked / expired / bad token).
-        if (this.closedByUser || AUTH_CLOSE_CODES.has(event.code)) return;
+        // Terminal closes never reconnect: a user-initiated close, an auth-coded
+        // close (revoked / expired / bad token), or an ABORTED pairing (adoption
+        // rejected — the provisional token must never become resumable, #P1(r3)).
+        if (this.closedByUser || pairingAborted || AUTH_CLOSE_CODES.has(event.code)) return;
         // Reconnect any resumable connection: one backed by a session token, or one
         // that opened at least once (includes the initial offline-start attempt). A
         // never-opened pairing-only attempt does not loop (the pairing UI surfaces it).

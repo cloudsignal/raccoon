@@ -50,6 +50,7 @@ const NO_STORE = new Set(['/index.html', '/version.json', '/service-worker.js', 
 // memory), or send an oversized frame (unbounded per-message memory — the
 // `ws` library's own default maxPayload is 100 MiB).
 const DEFAULT_HELLO_TIMEOUT_MS = 10_000;
+const DEFAULT_PROVISIONAL_SESSION_TTL_MS = 30_000; // mirror MemoryCredentialStore's default
 const DEFAULT_MAX_PENDING_CONNECTIONS = 200;
 const DEFAULT_MAX_PAYLOAD_BYTES = 262_144; // 256 KiB — generous for any real hello/envelope frame
 
@@ -100,6 +101,7 @@ export class WsHub {
   private readonly maxPayloadBytes: number;
   private readonly staticDir: string | null;
   private readonly vapidPublicKey: string | null;
+  private readonly provisionalTtlMs: number;
   private readonly validatePairingToken: ((token: string, signal?: AbortSignal) => Promise<string | null>) | null;
 
   private server: Server | null = null;
@@ -107,6 +109,12 @@ export class WsHub {
   private pairingTokens = new Map<string, PairingToken>();
   private attempts = new Map<string, { count: number; resetAt: number }>();
   private byUser = new Map<string, Set<WebSocket>>();
+  // #P1(r3): sockets whose session is CONFIRMED (a resume, or a pairing socket
+  // that has promoted via pair.confirm). A provisional (unconfirmed) pairing
+  // socket is attached to byUser but NOT here — its non-pairing frames are
+  // refused (inbound gate) and sendToUser skips it (outbound gate), so a client
+  // can't run agent turns without confirming. Membership is the authorization.
+  private confirmedSockets = new Set<WebSocket>();
   // Connections that have not yet sent a valid first message (hello). Tracked
   // separately from byUser so the pending-connection cap (R3-10) only bounds
   // pre-auth resource usage, never a legitimately high count of authenticated
@@ -160,6 +168,10 @@ export class WsHub {
     this.host = opts.host ?? '127.0.0.1';
     this.portOpt = opts.port ?? 0;
     this.store = opts.store ?? new MemoryCredentialStore({ provisionalSessionTtlMs: opts.provisionalSessionTtlMs });
+    // #P1(r3): how long a provisional (unconfirmed) pairing SOCKET may stay open
+    // before the hub closes it — aligned with the store's provisional-session
+    // TTL so an unconfirmed socket can't outlive its (reaped) session.
+    this.provisionalTtlMs = opts.provisionalSessionTtlMs ?? DEFAULT_PROVISIONAL_SESSION_TTL_MS;
     this.pairingTtlMs = opts.pairingTtlMs ?? 300_000;
     this.maxAttempts = opts.pairingAttemptsPerMinute ?? 10;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
@@ -328,8 +340,14 @@ export class WsHub {
     const sockets = this.byUser.get(userId);
     if (!sockets || sockets.size === 0) return false;
     const data = JSON.stringify(env);
-    for (const ws of sockets) ws.send(data);
-    return true;
+    // #P1(r3): OUTBOUND gate — deliver only to CONFIRMED sockets. A provisional
+    // (unconfirmed) pairing socket must not receive agent traffic; the pairing
+    // handshake frames (grant/confirmed) are sent via ws.send directly, not here.
+    let sent = false;
+    for (const ws of sockets) {
+      if (this.confirmedSockets.has(ws)) { ws.send(data); sent = true; }
+    }
+    return sent;
   }
 
   private serveHttp(req: IncomingMessage, res: ServerResponse): void {
@@ -538,7 +556,23 @@ export class WsHub {
     let set = this.byUser.get(userId);
     if (!set) { set = new Set(); this.byUser.set(userId, set); }
     set.add(ws);
+    // #P1(r3): a resume (no provisionalToken) is already CONFIRMED; a pairing
+    // socket is provisional until pair.confirm promotes it (onSocketMessage adds
+    // it then). A provisional socket that never confirms is closed at the TTL so
+    // it can't hold an authorized-but-ungated connection open indefinitely.
+    if (provisionalToken === undefined) {
+      this.confirmedSockets.add(ws);
+    } else {
+      const ttl = setTimeout(() => {
+        if (!this.confirmedSockets.has(ws) && ws.readyState === ws.OPEN) {
+          try { ws.close(4408, 'pairing not confirmed'); } catch { /* already closing */ }
+        }
+      }, this.provisionalTtlMs);
+      if (typeof ttl.unref === 'function') ttl.unref();
+      ws.on('close', () => clearTimeout(ttl));
+    }
     ws.on('close', () => {
+      this.confirmedSockets.delete(ws);
       set!.delete(ws);
       // Only delete the map entry if it STILL points at THIS closure's Set. A
       // revoke (or any path that removes the map entry synchronously, e.g.
@@ -577,6 +611,8 @@ export class WsHub {
       if (provisionalToken && env.payload.sessionToken === provisionalToken) {
         const promoted = await this.store.confirmSession(provisionalToken).catch(() => false);
         if (promoted && this.byUser.get(userId)?.has(ws) && ws.readyState === ws.OPEN) {
+          // #P1(r3): the socket is now CONFIRMED — un-gate its inbound/outbound.
+          this.confirmedSockets.add(ws);
           ws.send(JSON.stringify(createEnvelope('pair.confirmed', {
             from: 'system', to: userAddress(userId), channel: 'pairing',
             payload: { sessionToken: provisionalToken },
@@ -585,6 +621,11 @@ export class WsHub {
       }
       return;
     }
+    // #P1(r3): INBOUND gate — a provisional (unconfirmed) socket may ONLY send
+    // pair.confirm (handled above). Every other frame (msg / approval.response /
+    // history.request / push.*) is refused until the session is promoted, so a
+    // client cannot run agent turns or mutate state without confirming.
+    if (!this.confirmedSockets.has(ws)) return;
     for (const h of this.handlers) h(env, userId);
   }
 }

@@ -270,26 +270,40 @@ describe('WsClientTransport', () => {
     expect(confirmCalls).toEqual(['tok-u1']); // confirmed exactly once (the session token), AFTER adoption
   });
 
-  it('an onAdoptGrant rejection aborts pairing — the server never promotes the session (#P1-B)', async () => {
-    const confirmCalls: string[] = [];
+  it('an onAdoptGrant rejection aborts pairing with NO reconnect/resume/promote, even past the reconnect window (#P1r3)', async () => {
+    // A REALISTIC two-phase store (provisional → confirm promotes → verify
+    // resumes), so that IF the client wrongly reconnected it would resume and
+    // the hub's #P1-B promote-on-resume would promote the token. It must not.
+    let createCount = 0;
+    let promoteCount = 0;
+    const sessions = new Map<string, { userId: string; confirmed: boolean }>();
     hub = new WsHub({
       instance: 'test',
       store: {
-        createSession: async (u: string) => `tok-${u}`,
-        verifySession: async () => null, // provisional never resumable
-        confirmSession: async (t: string) => { confirmCalls.push(t); return true; },
+        createSession: async (u: string) => { createCount += 1; const t = `tok-${u}-${createCount}`; sessions.set(t, { userId: u, confirmed: false }); return t; },
+        confirmSession: async (t: string) => { const r = sessions.get(t); if (!r) return false; promoteCount += 1; r.confirmed = true; return true; },
+        verifySession: async (t: string) => { const r = sessions.get(t); return r?.confirmed ? r.userId : null; },
         revokeUser: async () => {},
       },
     });
     const { port } = await hub.start();
     const token = hub.issuePairingToken('u1');
+    const grants: string[] = [];
+    const statuses: string[] = [];
     client = new WsClientTransport({
-      url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest', confirmAckTimeoutMs: 200,
+      url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest', confirmAckTimeoutMs: 200, maxBackoffMs: 300,
       onAdoptGrant: async () => { throw new Error('persist failed'); },
     });
+    client.onGrant((g) => grants.push(g.payload.sessionToken));
+    client.onStatus((s) => statuses.push(s));
     await expect(client.connect()).rejects.toThrow();
-    await new Promise((r) => setTimeout(r, 150));
-    expect(confirmCalls).toEqual([]); // adoption failed → confirm never sent → server never promotes (no ghost)
+    // Wait WELL PAST the reconnect backoff (500ms first attempt) — the old bug
+    // (opts.session set before adoption) reconnected here and got promoted.
+    await new Promise((r) => setTimeout(r, 900));
+    expect(createCount).toBe(1);            // paired once; never reconnected/re-paired
+    expect(promoteCount).toBe(0);           // never promoted
+    expect(statuses).not.toContain('open'); // never reported paired
+    expect(grants).toEqual([]);             // no grant surfaced
   });
 
   it('reconnects a session-backed client that starts while the hub is down (#4 offline-start)', async () => {

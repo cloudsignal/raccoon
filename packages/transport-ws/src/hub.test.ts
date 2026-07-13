@@ -203,6 +203,44 @@ describe('WsHub pairing', () => {
     expect(await nextClose(resumed)).toBe(4401);
   });
 
+  it('a provisional (unconfirmed) socket cannot send agent messages until pair.confirm (#P1r3)', async () => {
+    const forwarded: string[] = [];
+    hub = new WsHub({ instance: 'test' });
+    hub.onEnvelope((env) => { if (env.kind === 'msg') forwarded.push(env.payload.text); });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    // An agent message from the UNCONFIRMED socket must be refused (not forwarded).
+    ws.send(JSON.stringify(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'unconfirmed' },
+    })));
+    await tick(60);
+    expect(forwarded).toEqual([]);
+    // After pair.confirm, the SAME socket's messages ARE forwarded.
+    confirmGrant(ws, grant.payload.sessionToken);
+    await nextMessage(ws); // pair.confirmed
+    ws.send(JSON.stringify(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'confirmed' },
+    })));
+    await tick(60);
+    expect(forwarded).toEqual(['confirmed']);
+  });
+
+  it('an unconfirmed pairing socket is closed at the provisional TTL (#P1r3)', async () => {
+    hub = new WsHub({ instance: 'test', provisionalSessionTtlMs: 30 });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    // Never confirm → the hub closes the socket at the provisional TTL.
+    expect(await nextClose(ws)).toBe(4408);
+  });
+
   it('revokeUser closes live sockets with 4403 and kills the session', async () => {
     hub = new WsHub({ instance: 'test' });
     const { port } = await hub.start();
@@ -257,7 +295,10 @@ describe('WsHub pairing', () => {
     const token2 = hub.issuePairingToken('u1');
     const ws2 = await connect(port);
     ws2.send(pairRequest(token2));
-    await nextMessage(ws2); // pair.grant
+    const grant2 = await nextMessage(ws2); // pair.grant
+    if (grant2.kind !== 'pair.grant') throw new Error('expected grant');
+    confirmGrant(ws2, grant2.payload.sessionToken); // #P1(r3): confirm so ws2 is un-gated for sendToUser
+    await nextMessage(ws2); // pair.confirmed
 
     // Now release ws1's close handshake so its (server-side) close handler
     // actually runs, with ws2 already registered.
@@ -488,10 +529,14 @@ describe('WsHub pairing', () => {
     const token = hub.issuePairingToken('u1');
 
     // Authenticate a connection FIRST — once granted it is no longer
-    // "pending" and so no longer counts toward the cap.
+    // "pending" and so no longer counts toward the cap. Confirm it too so it is
+    // un-gated for outbound traffic (#P1(r3)).
     const authed = await connect(port);
     authed.send(pairRequest(token));
-    await nextMessage(authed); // pair.grant
+    const authedGrant = await nextMessage(authed); // pair.grant
+    if (authedGrant.kind !== 'pair.grant') throw new Error('expected grant');
+    confirmGrant(authed, authedGrant.payload.sessionToken);
+    await nextMessage(authed); // pair.confirmed
 
     // A second connection never sends hello — occupies the single pending slot.
     const blocked = await connect(port);
