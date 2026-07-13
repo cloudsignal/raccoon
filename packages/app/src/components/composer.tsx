@@ -50,11 +50,12 @@ export function Composer(props: { channel: string }) {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
             }}
             rows={1}
-            // No autocorrect/predictive bar: agent commands and technical
-            // terms get mangled by iOS autocorrection. Sentence
-            // auto-capitalization stays.
-            autoCorrect="off"
-            spellCheck={false}
+            // iOS autocorrect + spellcheck ON: for ordinary chat this is what
+            // users expect, and turning it off hurt the common case more than it
+            // helped the occasional slash-command. autoComplete stays off (form
+            // autofill has no place in a message box).
+            autoCorrect="on"
+            spellCheck={true}
             autoComplete="off"
             placeholder={`Message ${meta.label}…`}
             className="max-h-[120px] w-full resize-none bg-transparent py-1.5 text-base text-ink outline-none placeholder:text-ink-faint"
