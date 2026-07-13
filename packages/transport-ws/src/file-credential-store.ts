@@ -1,21 +1,39 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { CredentialStore } from './credential-store.js';
 
 const DEFAULT_PROVISIONAL_SESSION_TTL_MS = 30_000;
 
-// Locks this process holds, cleaned up on exit (covers a graceful shutdown that
-// forgot to close(); a crash leaves a stale lock that the next owner reclaims
-// after an isAlive check).
-const heldLocks = new Set<string>();
+interface LockRecord { pid: number; owner: string }
+
+// Locks this process holds (canonical lockPath -> our owner token), cleaned up
+// on exit. Owner-aware: only unlink a lock the file still says is OURS, so a
+// stale instance never removes a successor's lock.
+const heldLocks = new Map<string, string>();
 let exitHookInstalled = false;
 function installExitHook(): void {
   if (exitHookInstalled) return;
   exitHookInstalled = true;
   process.on('exit', () => {
-    for (const lock of heldLocks) { try { unlinkSync(lock); } catch { /* best-effort */ } }
+    for (const [lockPath, owner] of heldLocks) unlinkOwnLock(lockPath, owner);
   });
+}
+
+function readLock(lockPath: string): LockRecord | null {
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<LockRecord>;
+    if (typeof parsed.owner === 'string' && typeof parsed.pid === 'number') return { pid: parsed.pid, owner: parsed.owner };
+  } catch { /* missing / unreadable / legacy */ }
+  return null;
+}
+
+/** Unlink a lock ONLY if it still belongs to `owner` — never clobber a lock a
+ *  successor legitimately reclaimed after this instance went stale. */
+function unlinkOwnLock(lockPath: string, owner: string): void {
+  const rec = readLock(lockPath);
+  if (rec && rec.owner !== owner) return; // reclaimed by someone else — leave it
+  try { unlinkSync(lockPath); } catch { /* already gone */ }
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -52,40 +70,48 @@ export class FileCredentialStore implements CredentialStore {
   private readonly provisional = new Map<string, { userId: string; expiresAt: number }>(); // in-memory only
   private readonly path: string;
   private readonly lockPath: string;
+  private readonly ownerToken: string;
   private readonly provisionalTtlMs: number;
   private closed = false;
 
   constructor(opts: { path: string; provisionalSessionTtlMs?: number }) {
-    this.path = opts.path;
-    this.lockPath = `${opts.path}.lock`;
+    // Canonicalize so path aliases (dir/x, dir/./x, symlinks, relative) resolve
+    // to ONE identity — otherwise two "different" paths could both acquire the
+    // lock. realpath the (created) DIR, then join the basename (the store file
+    // itself may not exist yet).
+    const abs = resolve(opts.path);
+    mkdirSync(dirname(abs), { recursive: true });
+    this.path = join(realpathSync(dirname(abs)), basename(abs));
+    this.lockPath = `${this.path}.lock`;
+    this.ownerToken = randomBytes(16).toString('hex'); // unguessable per-instance lock owner
     this.provisionalTtlMs = opts.provisionalSessionTtlMs ?? DEFAULT_PROVISIONAL_SESSION_TTL_MS;
-    mkdirSync(dirname(this.path), { recursive: true }); // ensure the dir for lock + store (throws loudly on a bad path)
     this.acquireLock();
     this.load();
     installExitHook();
   }
 
   private acquireLock(): void {
-    // In-process: another live store instance in THIS process holds it (same pid,
-    // so the file-based stale check below can't tell it apart from our own leftover).
+    // In-process: another live store instance in THIS process already holds the
+    // (canonical) lock — same pid, so the file-based stale check can't tell it
+    // apart from our own leftover.
     if (heldLocks.has(this.lockPath)) {
       throw new Error(
         `FileCredentialStore: ${this.path} is already locked by another store instance in this process; ` +
         'a session store must have a single writer.',
       );
     }
+    const record = JSON.stringify({ pid: process.pid, owner: this.ownerToken });
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        writeFileSync(this.lockPath, String(process.pid), { flag: 'wx', mode: 0o600 }); // O_EXCL
-        heldLocks.add(this.lockPath);
+        writeFileSync(this.lockPath, record, { flag: 'wx', mode: 0o600 }); // O_EXCL
+        heldLocks.set(this.lockPath, this.ownerToken);
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-        let ownerPid = 0;
-        try { ownerPid = Number.parseInt(readFileSync(this.lockPath, 'utf8').trim(), 10); } catch { /* unreadable */ }
-        if (Number.isInteger(ownerPid) && ownerPid > 0 && ownerPid !== process.pid && isProcessAlive(ownerPid)) {
+        const held = readLock(this.lockPath);
+        if (held && held.owner !== this.ownerToken && held.pid !== process.pid && isProcessAlive(held.pid)) {
           throw new Error(
-            `FileCredentialStore: ${this.path} is locked by another live process (pid ${ownerPid}); ` +
+            `FileCredentialStore: ${this.path} is locked by another live process (pid ${held.pid}); ` +
             'a session store must have a single writer. Point each connector account at its own store path.',
           );
         }
@@ -95,12 +121,19 @@ export class FileCredentialStore implements CredentialStore {
     throw new Error(`FileCredentialStore: could not acquire the lock at ${this.lockPath}`);
   }
 
-  /** Release the exclusive lock. Idempotent. Call on graceful shutdown. */
+  /** Release the exclusive lock (only if it is still OURS). Idempotent. After
+   *  close() every operation throws — a closed store must never write again. */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     heldLocks.delete(this.lockPath);
-    try { unlinkSync(this.lockPath); } catch { /* already gone */ }
+    unlinkOwnLock(this.lockPath, this.ownerToken);
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new Error(`FileCredentialStore: operation after close() — this instance no longer owns ${this.path}`);
+    }
   }
 
   private load(): void {
@@ -130,6 +163,7 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async createSession(userId: string): Promise<string> {
+    this.assertOpen();
     this.sweepExpiredProvisional();
     const token = randomBytes(32).toString('base64url');
     this.provisional.set(token, { userId, expiresAt: Date.now() + this.provisionalTtlMs });
@@ -137,6 +171,7 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async confirmSession(token: string): Promise<boolean> {
+    this.assertOpen();
     if (this.confirmed.has(token)) return true; // idempotent
     const rec = this.provisional.get(token);
     if (!rec) return false;
@@ -157,6 +192,7 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async verifySession(token: string): Promise<string | null> {
+    this.assertOpen();
     const userId = this.confirmed.get(token);
     if (userId !== undefined) return userId;
     const rec = this.provisional.get(token);
@@ -165,6 +201,7 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async revokeUser(userId: string): Promise<void> {
+    this.assertOpen();
     const removed: Array<[string, string]> = [];
     for (const [token, uid] of this.confirmed) if (uid === userId) { removed.push([token, uid]); this.confirmed.delete(token); }
     for (const [token, rec] of this.provisional) if (rec.userId === userId) this.provisional.delete(token);
@@ -178,6 +215,7 @@ export class FileCredentialStore implements CredentialStore {
   }
 
   async revokeSession(token: string): Promise<void> {
+    this.assertOpen();
     const userId = this.confirmed.get(token);
     this.provisional.delete(token);
     if (userId === undefined) return; // nothing durable to remove

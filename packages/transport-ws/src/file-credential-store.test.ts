@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { FileCredentialStore } from './file-credential-store.js';
 
 const dirs: string[] = [];
@@ -119,5 +119,57 @@ describe('FileCredentialStore', () => {
     first.close();
     const second = store(path); // lock released → acquires cleanly
     expect(second).toBeTruthy();
+  });
+
+  // ---- P1(r3): use-after-close, canonicalization, owner-token lock ---------
+
+  it('every operation throws after close()', async () => {
+    const s = store(tmpFile());
+    const token = await s.createSession('u1');
+    await s.confirmSession(token);
+    s.close();
+    await expect(s.createSession('u2')).rejects.toThrow(/after close/);
+    await expect(s.confirmSession(token)).rejects.toThrow(/after close/);
+    await expect(s.verifySession(token)).rejects.toThrow(/after close/);
+    await expect(s.revokeUser('u1')).rejects.toThrow(/after close/);
+    await expect(s.revokeSession(token)).rejects.toThrow(/after close/);
+  });
+
+  it('a closed store cannot clobber a successor that took the lock (use-after-close)', async () => {
+    const path = tmpFile();
+    const a = store(path);
+    const tokenA = await a.createSession('a'); await a.confirmSession(tokenA);
+    a.close(); // A releases the lock
+
+    const b = store(path); // B legitimately acquires
+    const tokenB = await b.createSession('b'); await b.confirmSession(tokenB);
+
+    // A is closed — its stale revoke must be REFUSED, not clobber B's file.
+    await expect(a.revokeUser('a')).rejects.toThrow(/after close/);
+    b.close();
+
+    const fresh = store(path);
+    expect(await fresh.verifySession(tokenB)).toBe('b'); // B's session survived
+  });
+
+  it('path aliases canonicalize to ONE lock identity (dir/x vs dir/./x)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'raccoon-fcs-'));
+    dirs.push(dir);
+    const a = store(join(dir, 'sessions.json'));
+    // A different TEXTUAL path for the SAME file must not acquire a second lock.
+    expect(() => new FileCredentialStore({ path: join(dir, '.', 'sessions.json') }))
+      .toThrow(/locked|single writer/i);
+    a.close();
+  });
+
+  it('close() only unlinks a lock it still owns (a reclaimed lock survives)', () => {
+    const path = tmpFile();
+    const canonicalLock = join(realpathSync(dirname(resolve(path))), basename(path)) + '.lock';
+    const a = store(path);
+    // Simulate a successor having reclaimed the lock (foreign owner token).
+    writeFileSync(canonicalLock, JSON.stringify({ pid: process.pid, owner: 'someone-else' }));
+    a.close(); // must NOT remove a lock it no longer owns
+    expect(existsSync(canonicalLock)).toBe(true);
+    rmSync(canonicalLock, { force: true });
   });
 });
