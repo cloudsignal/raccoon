@@ -938,6 +938,19 @@ export function TransportProvider(props: TransportProviderProps) {
       // 'loading' spinner, and never 'setup' (whose pairing could not be saved).
       if (cancelled) return;
       console.error('[raccoon] storage unavailable at boot:', err);
+      // #F6(r3): the failure may have landed AFTER the loaded-session refs were
+      // installed (e.g. a throw in sweepLeases/wireTransport). Clear the
+      // in-memory identity so the storage-error screen — and a later retry →
+      // setup — never carries a stale, unusable identity.
+      sessionGenRef.current += 1;
+      sessionRef.current = null;
+      validUserIdRef.current = null;
+      identityScopeRef.current = null;
+      void transportRef.current?.close();
+      transportRef.current = null;
+      setSession(null);
+      setActiveChannel(null);
+      dispatch({ type: 'reset' });
       setAuthError('Local storage is unavailable on this device. Retry once it’s available.');
       setPhase('storage-error');
     });

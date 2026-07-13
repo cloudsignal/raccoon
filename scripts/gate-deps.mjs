@@ -34,7 +34,9 @@ function jsFiles(dir, out = []) {
   return out;
 }
 
-const IMPORT_RE = /(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"]|(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+// Matches: `import|export … from 'x'` (incl. `import type … from`), a dynamic
+// `import('x')` / `require('x')`, AND a bare side-effect `import 'x'` (no `from`).
+const IMPORT_RE = /(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"]|(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)|import\s+['"]([^'"]+)['"]/g;
 
 let failed = false;
 for (const rel of PKGS) {
@@ -52,7 +54,7 @@ for (const rel of PKGS) {
     const src = readFileSync(file, 'utf8');
     let m;
     while ((m = IMPORT_RE.exec(src)) !== null) {
-      const spec = m[1] ?? m[2];
+      const spec = m[1] ?? m[2] ?? m[3];
       if (!spec || spec.startsWith('.') || spec.startsWith('/')) continue; // relative
       if (BUILTINS.has(spec) || BUILTINS.has(pkgName(spec))) continue;      // node builtin
       const name = pkgName(spec);

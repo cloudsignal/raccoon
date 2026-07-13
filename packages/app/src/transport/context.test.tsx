@@ -327,6 +327,23 @@ describe('TransportProvider', () => {
     probeSpy.mockRestore();
   });
 
+  it('a failure AFTER the session refs are installed enters storage-error with the identity CLEARED (#F6r3)', async () => {
+    // Storage opens + the probe passes + the session loads (refs installed), but
+    // a later boot step (sweepLeases → recoverExpiredSending) throws. The
+    // storage-error transition must NOT leave the stale identity live — else a
+    // retry → setup would carry it.
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
+    const recoverSpy = vi.spyOn(outbox, 'recoverExpiredSending').mockRejectedValue(new Error('idb write failed mid-boot'));
+    render(
+      <TransportProvider makeTransport={() => new FakeTransport()}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(api.phase).toBe('storage-error'));
+    expect(api.session).toBeNull(); // identity cleared — no stale session behind storage-error
+    recoverSpy.mockRestore();
+  });
+
   it('a wipe that arrives BEFORE loadSession resolves is not ignored — the loaded session is not installed (#R6-4b)', async () => {
     await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
 
