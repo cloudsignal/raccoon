@@ -12,7 +12,9 @@
     "build:app": "npm run build:standalone -w @raccoon/app",
     "gate:neutrality": "bash scripts/gate-neutrality.sh",
     "gate:deps": "node scripts/gate-deps.mjs",
+    "release:pack": "bash scripts/release-pack.sh",
     "release:verify": "bash scripts/release-verify.sh",
+    "release:publish": "bash scripts/release-publish.sh",
     "demo": "npm run build:app && npm start -w @raccoon/example-echo",
     "example:echo": "npm start -w @raccoon/example-echo"
   },

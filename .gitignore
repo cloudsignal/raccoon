@@ -1,6 +1,7 @@
 node_modules/
 dist/
 dist-standalone/
+release-artifacts/
 *.tsbuildinfo
 .DS_Store
 .superpowers/

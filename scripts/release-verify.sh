@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
-# v0.1 release acceptance gate. Three REAL end-to-end gates against the PACKED
-# tarballs (not a sibling repo / vendor tree / path aliases):
+# v0.1 release acceptance gate. Gates the EXACT immutable tarballs produced by
+# release:pack (release-artifacts/) — the same artifacts release:publish ships,
+# never repacked in between. Beyond neutrality it runs three REAL end-to-end
+# gates against those tarballs:
 #   GATE 1  OpenClaw 2026.6.11 installs + loads the packed connector.
 #   GATE 2  A fresh Vite app builds from the packed @raccoon/app (incl. styles).
 #   GATE 3  A NEW connector process resumes a session persisted by a first process.
-# Plus the neutrality gate. These replace the earlier typecheck-only fixture,
-# which passed over an un-installable connector and a browser-unbuildable app.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 BIN="$ROOT/node_modules/.bin/openclaw"
+OUT="$ROOT/release-artifacts"
+tgz() { echo "$OUT/raccoon-$1-0.1.0.tgz"; }
 
-echo "== 1/6 neutrality gate =="
+echo "== 1/5 neutrality gate =="
 npm run gate:neutrality
 
-echo "== 2/6 build all published libs (dist + declarations + compiled css) =="
-npm run build >/dev/null
-echo "  built"
-# Unpiped so a failure trips `set -e` (piping to sed would mask the exit code).
-npm run gate:deps
+echo "== 2/5 deterministic release pack (clean + dep-order build + real build id + pack) =="
+bash scripts/release-pack.sh   # clean → build → build:app(BUILD_ID) → gate:deps → pack to release-artifacts/
 
-echo "== 3/6 pack every published package =="
+# Ephemeral scratch for the consumer FIXTURES only; the tarballs live in OUT.
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 dir_of() { # bash-3.2-safe (macOS) — no associative arrays
@@ -29,11 +28,6 @@ dir_of() { # bash-3.2-safe (macOS) — no associative arrays
     *) echo "packages/$1" ;;
   esac
 }
-for p in protocol transport-ws pairing push bridge connector-openclaw app; do
-  ( cd "$(dir_of "$p")" && npm pack --pack-destination "$WORK" >/dev/null )
-done
-tgz() { echo "$WORK/raccoon-$1-0.1.0.tgz"; }
-ls "$WORK"/*.tgz | sed "s#$WORK/#  packed #"
 
 # The published PWA must carry a REAL build id (its package version), not 'dev'
 # — a 'dev' id disables the update check and makes every release share the
@@ -51,7 +45,7 @@ grep -q "BUILD_ID = '$APP_BUILD_ID'" "$APPPKG/package/dist-standalone/service-wo
 echo "  packed PWA build id is release-real: $APP_BUILD_ID (not dev)"
 
 # ---------------------------------------------------------------------------
-echo "== 4/6 GATE: OpenClaw 2026.6.11 installs + inspects the packed connector =="
+echo "== 3/5 GATE: OpenClaw 2026.6.11 installs + inspects the packed connector =="
 # The connector is installed via npm from its packed tarball into a consumer
 # where its DECLARED deps resolve from the co-packed tarballs — i.e. real
 # npm-install dep resolution (dep COMPLETENESS is verified deterministically by
@@ -92,7 +86,7 @@ node -e '
 echo "  OpenClaw loaded the packed connector RUNTIME (doctor clean; status=loaded, activated, channel 'raccoon')"
 
 # ---------------------------------------------------------------------------
-echo "== 5/6 GATE: a fresh Vite app builds from the packed @raccoon/app (incl. styles) =="
+echo "== 4/5 GATE: a fresh Vite app builds from the packed @raccoon/app (incl. styles) =="
 APP="$WORK/vite-consumer"
 mkdir -p "$APP/src"
 cat > "$APP/package.json" <<JSON
@@ -144,7 +138,7 @@ ls "$APP"/dist/assets/*.css >/dev/null 2>&1 || { echo "ERROR: no CSS emitted —
 echo "  fresh Vite app built from tarballs (browser-safe JS + resolvable compiled styles.css)"
 
 # ---------------------------------------------------------------------------
-echo "== 6/6 GATE: a NEW connector process resumes a session via the PRODUCTION store wiring =="
+echo "== 5/5 GATE: a NEW connector process resumes a session via the PRODUCTION store wiring =="
 # Both scripts drive the PRODUCTION gateway.startAccount (exported), which
 # auto-creates a FileCredentialStore at RACCOON_STORE_PATH/sessions.json — the
 # real default wiring, NOT a hand-constructed store. proc1 starts the account,
