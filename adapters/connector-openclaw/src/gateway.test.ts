@@ -269,6 +269,29 @@ describe('gateway.startAccount / stopAccount', () => {
     expect(resolveRunning('default')!.hub).toBe(created[1]!.hub);
   });
 
+  it('a FAILED channel.start() releases the store lock + approvalValues so a retry succeeds (#P1r3)', async () => {
+    const account = makeAccount();
+    let starts = 0;
+    // First start throws (e.g. port bind fails); the second succeeds.
+    const factory = ((): CreateChannel => (() => {
+      const willFail = starts === 0;
+      starts += 1;
+      return {
+        hub: { __fake: 'hub', id: `h${starts}` },
+        start: vi.fn(async () => { if (willFail) throw new Error('bind failed'); return { port: 8790 }; }),
+        stop: vi.fn(async () => {}),
+      } as unknown as ReturnType<CreateChannel>;
+    }) as unknown as CreateChannel)();
+
+    await expect(startAccount(makeCtx(account), { createChannel: factory })).rejects.toThrow(/bind failed/);
+    // The failed start must have released the FileCredentialStore's exclusive
+    // lock — otherwise the retry's store construction dies with "already locked".
+    const acct = await startAccount(makeCtx(account), { createChannel: factory });
+    expect(acct).toBeTruthy();
+    expect(resolveRunning('default')).toBeTruthy();
+    await stopAccount(makeCtx(account));
+  });
+
   it('uses the account.channels[0] as the OAM channel for the registry entry', async () => {
     const { factory } = makeFakeChannelFactory();
     const account = makeAccount({ channels: ['assistant', 'echo'] });

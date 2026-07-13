@@ -230,16 +230,29 @@ async function doStart(
     ...(account.vapid !== undefined ? { vapid: account.vapid } : {}),
   });
 
-  await channel.start();
+  // #P1(r3): a FAILED start (e.g. the hub's port bind throws) must not leak the
+  // store's exclusive lock or the approval store — otherwise the very next retry
+  // dies with "already locked". Release both on failure; the store cleanup runs
+  // even if the best-effort channel teardown itself throws.
+  try {
+    await channel.start();
+  } catch (err) {
+    approvalValues.delete(accountId);
+    try { await channel.stop(); } catch { /* start may have left a partial hub */ }
+    await sessionStore.close?.(); // idempotent — ensures the lock is freed even if stop() threw first
+    throw err;
+  }
 
   const entry: RunningAccount = {
     hub: channel.hub,
     channel: channelName,
     instanceUrl: account.instanceUrl,
     // The gateway CREATED sessionStore, so the gateway releases its lock on stop
-    // — independent of the channel (a test's fake channel won't). close() is
-    // idempotent, so the real createRaccoonChannel.stop() closing it too is fine.
-    stop: async () => { await channel.stop(); await sessionStore.close?.(); },
+    // — independent of the channel (a test's fake channel won't). The finally
+    // guarantees close() runs even if channel.stop() throws (else a stop failure
+    // would leak the lock). close() is idempotent (createRaccoonChannel.stop()
+    // closes it too).
+    stop: async () => { try { await channel.stop(); } finally { await sessionStore.close?.(); } },
     revoke: (userId: string) => channel.revoke(userId),
   };
   running.set(accountId, entry);
