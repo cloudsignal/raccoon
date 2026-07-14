@@ -27,27 +27,28 @@ change to the core packages**.
                        │ CONNECTOR     │        │ CONNECTOR / TRANSPORT│
                        │ (first-party) │        │ (out of core)        │
                        │               │        │                      │
-                       │ @raccoon/     │        │ e.g. a GTM / hosted  │
+                       │ @raccoon/     │        │ e.g. a hosted        │
                        │ connector-    │        │ identity+push build  │
                        │ openclaw      │        │ (own repo, own deps) │
-                       │  → openclaw   │        │  → CloudSignal, etc. │
+                       │  → openclaw   │        │  → a managed service │
                        └───────────────┘        └──────────────────────┘
 ```
 
 Rules the boundary enforces (checked in CI by `scripts/gate-neutrality.sh`):
 
-- **Core never names a vendor.** No `@cloudsignal`, `cloudsignal`, `gtm`, or
-  `supabase` identifier appears anywhere in core runtime source. Core builds,
-  tests, and releases with none of them installed.
+- **Core never names a vendor.** No downstream-vendor identifier appears
+  anywhere in core runtime source, comments included — CI enforces a denylist
+  (`scripts/gate-neutrality.sh`). Core builds, tests, and releases with no
+  vendor package installed.
 - **No package imports another via `/src`.** Consumers import package roots
   (`@raccoon/bridge`), never `@raccoon/bridge/src/...`. Every published package
   ships `dist/` + emitted `.d.ts` and an `exports` map.
 - **A connector's framework is its own peer dependency.** `openclaw` is a peer
   dep of `@raccoon/connector-openclaw`; no OpenClaw type leaks into core.
-- **Managed transports live outside the v0.1 gate.** `@raccoon/transport-mqtt`
-  and `@raccoon/transport-cloudsignal` are `private` and are not part of the
-  released core. A CloudSignal/GTM build consumes the public ports below from
-  its own repo.
+- **Managed transports live outside the v0.1 gate.** The repo's private
+  transport experiments (an MQTT broker transport and a managed-service
+  transport) are not part of the released core. A vendor build consumes the
+  public ports below from its own repo.
 
 ## The public ports
 
@@ -174,7 +175,7 @@ export function createMyChannel(opts: { port: number }) {
 ```
 
 The same shape is how a **managed transport** (a hosted identity + ACL + push +
-NAT-relay service such as CloudSignal, or the GTM build that uses it) plugs in:
+NAT-relay service) plugs in:
 it implements the same public ports — `Transport`, `OutboundHub`, a durable
 `MessageStore` and `CredentialStore`, and (optionally) a push registrar — from
 its own repository. Core exports the ports; the managed build implements them.

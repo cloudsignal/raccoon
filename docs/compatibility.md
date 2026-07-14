@@ -12,9 +12,10 @@
 | `@raccoon/app` | 0.1.0 | installable chat PWA |
 | `@raccoon/connector-openclaw` | 0.1.0 | first-party OpenClaw connector |
 
-Not part of the v0.1 gate (marked `private`, not published): `@raccoon/transport-mqtt`,
-`@raccoon/transport-cloudsignal`. These are managed-transport experiments that
-consume the public core ports; they are excluded from the neutral core release.
+Not part of the v0.1 gate (marked `private`, not published): the repo's two
+transport experiments — an MQTT broker transport and a managed-service
+transport. They consume the public core ports and are excluded from the
+neutral core release.
 
 ## Runtime
 

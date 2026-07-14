@@ -21,8 +21,10 @@ change.
 
 v0.1 ships a **vendor-neutral core** and a **first-party OpenClaw connector**.
 Other agent frameworks connect through the same documented public ports — no
-fork required. MQTT and CloudSignal transport integrations exist as private,
-unpublished implementations; they are not dependencies of the core.
+fork required. Deeper plumbing is pluggable the same way: the wire that carries
+messages and the delivery behind push notifications are documented seams, so
+vendor integrations arrive as plugins you choose to install — never as core
+dependencies, never named by the core.
 
 ## Why Raccoon
 
@@ -75,10 +77,19 @@ A Raccoon **hub** exchanges protocol envelopes with the app over a pluggable
 control; background notifications are delivered through Web Push (VAPID) or a
 host framework's own push adapter.
 
-Swap the transport or the connector without rewriting the app or your agents.
-See [PROTOCOL.md](PROTOCOL.md) for the wire format and
-[docs/connector-authoring.md](docs/connector-authoring.md) for the ports a
-connector implements.
+Everything below the app is a documented extension seam
+([docs/connector-authoring.md](docs/connector-authoring.md)):
+
+- **Connectors** — join an agent framework as a consumer of the messaging
+  ports; this is everything the OpenClaw connector uses.
+- **Transports** — replace the built-in WebSocket with your own wire (a
+  broker, a managed service) that carries the same envelopes.
+- **Push** — piggy-back notifications on your own delivery instead of raw
+  Web Push.
+
+Vendor integrations ship as plugins built on these seams, from their own
+repos — the core never names or depends on them. See
+[PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 ## Try it (same-machine demo)
 
@@ -146,10 +157,10 @@ map and installs as a plain npm package — no workspace, sibling repo, vendored
 tree, or `/src` import required. `npm run release:verify` proves it by packing
 each package and building a fresh external consumer against the tarballs.
 
-Not part of the v0.1 core (marked `private`, unpublished): `@raccoon/transport-mqtt`
-and `@raccoon/transport-cloudsignal` — managed-transport implementations that
-consume the public core ports from outside the neutral release. A NanoClaw
-connector is planned, not yet shipped.
+The repo also carries two `private`, unpublished transport implementations (an
+MQTT broker transport and a managed-service transport) that prove the transport
+seam from outside the neutral release — nothing in core depends on them. A
+NanoClaw connector is planned, not yet shipped.
 
 ## Docs
 

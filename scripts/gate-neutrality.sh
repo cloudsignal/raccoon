@@ -47,6 +47,31 @@ else
   echo "  OK — zero matches"
 fi
 
+echo "== neutrality: public docs name no vendor and no 'OAM' =="
+# Vendors are discovered through plugins, not through raccoon's docs; 'OAM' is
+# not a public spec and must not resurface as the protocol's name. The repo's
+# own GitHub URL (github.com/cloudsignal/raccoon) is provenance, not
+# positioning — excluded. 'oam' is boundary-matched so 'roaming'/'Foam' pass.
+PUBLIC_DOCS=(README.md PROTOCOL.md docs examples packages adapters)
+set +e
+raw_out="$(grep -rniE '(^|[^[:alnum:]])oam([^[:alnum:]]|$)|cloudsignal|gtm|supabase' \
+  "${PUBLIC_DOCS[@]}" --include='*.md' --include='*.mjs' --include='*.yml' --include='vercel.json')"
+rc=$?
+set -e
+if [ "$rc" -ge 2 ]; then
+  echo "ERROR: grep failed (rc=$rc) scanning public docs — cannot verify (do NOT treat as clean)." >&2
+  fail=1
+else
+  scan_out="$(printf '%s\n' "$raw_out" | grep -v 'github\.com/cloudsignal' || true)"
+  if [ -n "$scan_out" ]; then
+    printf '%s\n' "$scan_out" >&2
+    echo "ERROR: vendor/OAM naming found in public docs (above). Vendors arrive as plugins — reword or remove." >&2
+    fail=1
+  else
+    echo "  OK — public docs are vendor-blind"
+  fi
+fi
+
 echo "== boundary: no published package imports another via /src =="
 set +e
 scan_out="$(grep -rnE "from ['\"]@raccoon/[a-z-]+/src" "${CORE_SRC[@]}" "${INCLUDES[@]}" "${EXCLUDES[@]}")"

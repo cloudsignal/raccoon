@@ -5,9 +5,8 @@ pairing, and a WebSocket transport — with **zero external services**. This
 walks the two paths: bring your own agent (framework-neutral), or plug in an
 existing OpenClaw agent.
 
-Everything here uses only the published, vendor-neutral packages. No
-CloudSignal, GTM, Supabase, or broker is required (or referenced) anywhere in
-this guide.
+Everything here uses only the published, vendor-neutral packages. No vendor
+service or message broker is required (or referenced) anywhere in this guide.
 
 ## Install
 
