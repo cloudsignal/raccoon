@@ -1,15 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { OAM_VERSION, createEnvelope, parseEnvelope, tryParseEnvelope } from './envelope.js';
+import { PROTOCOL_VERSION, createEnvelope, parseEnvelope, tryParseEnvelope } from './envelope.js';
 
 describe('envelope', () => {
-  it('creates a msg envelope with oam version, ulid id and ISO ts', () => {
+  it('creates a msg envelope with protocol version, ulid id and ISO ts', () => {
     const env = createEnvelope('msg', {
       from: 'user:u1',
       to: 'agent:coordinator',
       channel: 'coordinator',
       payload: { text: 'hello' },
     });
-    expect(env.oam).toBe(OAM_VERSION);
+    expect(env.raccoon).toBe(PROTOCOL_VERSION);
     expect(env.kind).toBe('msg');
     expect(env.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
     expect(Number.isNaN(Date.parse(env.ts))).toBe(false);
@@ -45,7 +45,7 @@ describe('envelope', () => {
 
   it('rejects unknown kind', () => {
     expect(() =>
-      parseEnvelope({ oam: '0.1', id: 'x', kind: 'nope', from: 'system', to: 'user:u1', channel: 'c', ts: new Date().toISOString(), payload: {} }),
+      parseEnvelope({ raccoon: '0.1', id: 'x', kind: 'nope', from: 'system', to: 'user:u1', channel: 'c', ts: new Date().toISOString(), payload: {} }),
     ).toThrow();
   });
 

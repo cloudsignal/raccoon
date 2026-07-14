@@ -187,7 +187,7 @@ async function mutate(
 /**
  * Pending-only compare-and-set: claims the row for `ownerId` (this tab) ONLY
  * if its status is currently 'pending' AND its envelope was written under
- * the identity the caller is currently sending as (`expectedFrom`, an OAM
+ * the identity the caller is currently sending as (`expectedFrom`, a Raccoon
  * address like 'user:u1' — #R5-3: rows are shared per-origin across tabs,
  * and a stale tab still running a since-wiped identity can write rows a
  * newer tab's drain would otherwise pick up and transmit through the WRONG

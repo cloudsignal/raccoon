@@ -23,13 +23,13 @@
 //     - sendText: plain text + optional mediaUrls (from ctx; mediaUrls is not on
 //       the real ChannelOutboundContext either, so handled via sendPayload fallback).
 //     - sendPayload: inspects ctx.payload.interactive / ctx.payload.presentation
-//       for buttons-like blocks → OAM approval.request; otherwise delegates to
+//       for buttons-like blocks → approval.request; otherwise delegates to
 //       the plain-text path.
 //
-// OAM CHANNEL SOURCE DECISION:
-//   The `channel` for OAM envelopes is taken from the factory parameter (injected
+// RACCOON CHANNEL SOURCE DECISION:
+//   The `channel` for Raccoon envelopes is taken from the factory parameter (injected
 //   at construction time), not from `ctx.accountId` or `channelData`. Rationale:
-//   a Raccoon deployment routes all user messages through one named OAM channel
+//   a Raccoon deployment routes all user messages through one named Raccoon channel
 //   (e.g. 'coordinator'); the factory is constructed once per account/channel
 //   lifecycle (T7's gateway.startAccount), so the channel is stable. It is
 //   injectable via `deps.channel` to support multiple channels in one instance.
@@ -66,12 +66,12 @@ import { ulid } from 'ulid';
 
 export interface RaccoonOutboundDeps {
   /**
-   * The hub that delivers OAM envelopes to connected Raccoon users.
+   * The hub that delivers Raccoon envelopes to connected Raccoon users.
    * Structurally matches @raccoon/bridge OutboundHub.
    */
   hub: OutboundHub;
   /**
-   * OAM channel name to use as envelope.channel and the source agent address.
+   * Raccoon channel name to use as envelope.channel and the source agent address.
    * Typically the agent's role name (e.g. 'coordinator'). Injectable so that
    * multi-channel Raccoon deployments can construct one adapter per channel.
    */
@@ -111,7 +111,7 @@ function parseRaccoonUserId(to: string): string {
 }
 
 /**
- * Send one or more OAM `msg` envelopes for the given text chunks in order.
+ * Send one or more Raccoon `msg` envelopes for the given text chunks in order.
  * Returns the id of the FIRST envelope (used as messageId in the result).
  */
 function sendMsgChunks(
@@ -280,7 +280,7 @@ function presentationTextBlocks(presentation: MessagePresentation): string {
 }
 
 /**
- * Render a MessagePresentation to OAM envelopes: a buttons or select block
+ * Render a MessagePresentation to Raccoon envelopes: a buttons or select block
  * becomes one approval.request (select options rendered as choice buttons —
  * see findPresentationSelect); otherwise the presentation's text/context
  * blocks are sent as plain msg text, falling back to `fallbackText` if the
@@ -365,10 +365,10 @@ function presentationFromChannelData(channelData: unknown): MessagePresentation 
 
 /**
  * Create a ChannelOutboundAdapter that routes OpenClaw's outbound replies to
- * a Raccoon user via OAM envelopes over the given hub.
+ * a Raccoon user via Raccoon envelopes over the given hub.
  *
- * @param deps.hub     - Hub that sends OAM envelopes to connected Raccoon users.
- * @param deps.channel - OAM channel name (e.g. 'coordinator'); used as
+ * @param deps.hub     - Hub that sends Raccoon envelopes to connected Raccoon users.
+ * @param deps.channel - Raccoon channel name (e.g. 'coordinator'); used as
  *                       envelope.channel and the from: agent:<channel> address.
  */
 export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
@@ -401,7 +401,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
   //   presentationCapabilities and render natively).
   //
   // Interactive mapping strategy:
-  //   - Find a 'buttons' block → emit one OAM approval.request envelope.
+  //   - Find a 'buttons' block → emit one approval.request envelope.
   //   - No 'buttons' block (e.g. select-only) → text fallback that includes
   //     the option labels as a plain list (all envelopes are 'msg').
   //   - No interactive at all → delegate to plain text path (same as sendText).

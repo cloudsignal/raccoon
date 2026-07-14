@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MqttTransport } from '../client.js';
-import { oamCodec } from '../oam-codec.js';
+import { raccoonCodec } from '../codec.js';
 import { createEnvelope } from '@raccoon/protocol';
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ const TEST_OPTS = {
   url: 'mqtt://localhost:1883',
   instance: 'test-instance',
   userId: 'u1',
-  codec: oamCodec,
+  codec: raccoonCodec,
 };
 
 function makeTransport(extra?: Partial<typeof TEST_OPTS> & { MqttImpl?: unknown }) {
@@ -165,7 +165,7 @@ describe('MqttTransport', () => {
     expect(decoded.kind).toBe('msg');
   });
 
-  it('inbound outbox message decodes to OAM envelope', async () => {
+  it('inbound outbox message decodes to a Raccoon envelope', async () => {
     const fake = createFakeMqtt();
     const transport = makeTransport({ MqttImpl: () => fake });
 

@@ -4,7 +4,7 @@
 // optional `value` (or a `command`/`callback` action) distinct from its
 // `label` — the machine-meaningful identifier OpenClaw may need back to
 // correlate a human's choice with the pending action it was raised for.
-// Raccoon's OAM protocol only carries the human-facing labels as
+// Raccoon's Raccoon protocol only carries the human-facing labels as
 // `approval.request.payload.options` (the app renders them verbatim as
 // buttons and echoes the clicked one back as `approval.response.payload.choice`),
 // so this information has nowhere to travel on the wire without a protocol

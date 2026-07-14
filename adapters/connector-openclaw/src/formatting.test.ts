@@ -129,7 +129,7 @@ describe('formatReply', () => {
     expect(result).toEqual(['part-1', 'part-2']);
   });
 
-  it('preserves chunk order — each chunk maps 1:1 to one OAM msg envelope', () => {
+  it('preserves chunk order — each chunk maps 1:1 to one Raccoon msg envelope', () => {
     // Callers must map result[0] → first envelope, result[1] → second, etc.
     mockChunk.mockReturnValueOnce(['first', 'second', 'third']);
     const result = formatReply({ text: 'long reply' });

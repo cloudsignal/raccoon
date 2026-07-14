@@ -4,7 +4,7 @@
 
 | Package | Version | Notes |
 | --- | --- | --- |
-| `@raccoon/protocol` | 0.1.0 | OAM v0.1 envelopes + codec |
+| `@raccoon/protocol` | 0.1.0 | Raccoon protocol envelopes + codec |
 | `@raccoon/transport-ws` | 0.1.0 | `WsHub` + `WsClientTransport` |
 | `@raccoon/bridge` | 0.1.0 | `RaccoonBridge` + framework ports |
 | `@raccoon/pairing` | 0.1.0 | QR pairing issue / verify |

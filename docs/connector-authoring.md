@@ -13,7 +13,7 @@ change to the core packages**.
                        │                    CORE                        │
                        │        (vendor-neutral, published v0.1)        │
                        │                                                │
-   ┌───────────┐       │  @raccoon/protocol   OAM envelopes + codec     │
+   ┌───────────┐       │  @raccoon/protocol   envelopes + codec         │
    │  PWA /     │◀──────▶  @raccoon/transport-ws   WsHub + WsClient      │
    │  client    │  WS   │  @raccoon/bridge     RaccoonBridge + ports     │
    └───────────┘       │  @raccoon/pairing    QR issue / verify         │
@@ -141,7 +141,7 @@ server-only or unconditional-WS exports.
   pairing + optional push into a start/stoppable channel. `opts.sessionStore`
   takes any `CredentialStore` for restart durability.
 - **`createRaccoonOutbound(deps)`** maps OpenClaw's `MessagePresentation`
-  approval prompts to OAM `approval.request` envelopes and correlates the
+  approval prompts to `approval.request` envelopes and correlates the
   Allow/Deny/Edit response back to the real command via an approval-value store.
 
 No OpenClaw type crosses into core; `openclaw` is a peer dependency of the

@@ -6,7 +6,7 @@ import {
 } from '@raccoon/protocol';
 import type { Codec, CodecContext, WirePublish, AnyEnvelope } from '@raccoon/protocol';
 
-export const oamCodec: Codec = {
+export const raccoonCodec: Codec = {
   subscriptions(ctx: CodecContext): Array<{ topic: string; qos: 0 | 1 }> {
     return [{ topic: topicUserOutbox(ctx.instance, ctx.userId), qos: 1 }];
   },

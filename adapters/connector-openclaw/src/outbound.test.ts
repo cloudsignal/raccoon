@@ -153,7 +153,7 @@ describe('createRaccoonOutbound', () => {
     expect(result.messageId).not.toBe(hub.envelopes[1]!.id);
   });
 
-  // ---- OAM envelope fields ------------------------------------------------
+  // ---- Raccoon envelope fields ------------------------------------------------
 
   it('msg envelopes carry correct from (agent:<channel>), to, channel', async () => {
     mockChunk.mockReturnValueOnce(['hello']);

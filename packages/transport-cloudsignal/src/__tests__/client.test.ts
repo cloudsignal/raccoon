@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CloudSignalTransport } from '../client.js';
 import type { CloudSignalTransportOptions, TokenProvider } from '../client.js';
-import { oamCodec } from '@raccoon/transport-mqtt';
+import { raccoonCodec } from '@raccoon/transport-mqtt';
 import { createEnvelope } from '@raccoon/protocol';
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ const BASE_OPTS = {
   tokenServiceUrl: 'https://api.cloudsignal.io/v2/tokens',
   instance: 'test-instance',
   userId: 'u1',
-  codec: oamCodec,
+  codec: raccoonCodec,
 };
 
 function makeTransport(
@@ -176,7 +176,7 @@ describe('CloudSignalTransport', () => {
       await transport.connect();
 
       const ctx = { instance: BASE_OPTS.instance, userId: BASE_OPTS.userId };
-      const expectedSubs = oamCodec.subscriptions(ctx).map((s) => s.topic);
+      const expectedSubs = raccoonCodec.subscriptions(ctx).map((s) => s.topic);
       for (const topic of expectedSubs) {
         expect(fake.subscribed).toContain(topic);
       }
@@ -189,7 +189,7 @@ describe('CloudSignalTransport', () => {
       await transport.connect();
 
       const ctx = { instance: BASE_OPTS.instance, userId: BASE_OPTS.userId };
-      const onConnectMsgs = oamCodec.onConnect?.(ctx) ?? [];
+      const onConnectMsgs = raccoonCodec.onConnect?.(ctx) ?? [];
       // Presence message should be among transmits
       expect(onConnectMsgs.length).toBeGreaterThan(0);
       const transmittedTopics = fake.transmitted.map(([t]) => t);
@@ -205,7 +205,7 @@ describe('CloudSignalTransport', () => {
       await transport.connect();
 
       const ctx = { instance: BASE_OPTS.instance, userId: BASE_OPTS.userId };
-      const will = oamCodec.will?.(ctx);
+      const will = raccoonCodec.will?.(ctx);
       if (will) {
         expect(fake.connectOpts['willTopic']).toBe(will.topic);
         const willPayload = fake.connectOpts['willMessage'] as string;
@@ -247,7 +247,7 @@ describe('CloudSignalTransport', () => {
       await transport.send(env);
 
       const ctx = { instance: BASE_OPTS.instance, userId: BASE_OPTS.userId };
-      const encoded = oamCodec.encode(env, ctx);
+      const encoded = raccoonCodec.encode(env, ctx);
       const transmittedTopics = fake.transmitted.map(([t]) => t);
       for (const msg of encoded) {
         expect(transmittedTopics).toContain(msg.topic);

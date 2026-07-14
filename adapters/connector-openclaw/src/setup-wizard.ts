@@ -189,7 +189,7 @@ const instanceUrlInput: ChannelSetupWizardTextInput = {
 
 const channelsInput: ChannelSetupWizardTextInput = {
   inputKey: 'groupChannels',
-  message: 'OAM channel names the hub subscribes to (comma-separated)',
+  message: 'Raccoon channel names the hub subscribes to (comma-separated)',
   placeholder: 'coordinator',
   required: false,
 

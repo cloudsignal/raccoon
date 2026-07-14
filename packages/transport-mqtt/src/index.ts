@@ -1,2 +1,2 @@
 export * from './client.js';
-export * from './oam-codec.js';
+export * from './codec.js';

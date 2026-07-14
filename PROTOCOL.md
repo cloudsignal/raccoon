@@ -1,6 +1,6 @@
-# OAM v0.1: Open Agent Messaging Protocol
+# The Raccoon Protocol v0.1
 
-OAM (Open Agent Messaging) is a minimal envelope protocol for conversations between
+The Raccoon protocol is a minimal, versioned envelope protocol for conversations between
 humans and AI agents. It defines address formats, envelope shapes, and a topic
 hierarchy for transport-layer routing. Transports are pluggable; this document covers
 the built-in WebSocket transport.
@@ -9,11 +9,11 @@ the built-in WebSocket transport.
 
 ## Envelope Fields
 
-Every OAM envelope is a JSON object with the following top-level fields:
+Every Raccoon envelope is a JSON object with the following top-level fields:
 
 | Field     | Type                              | Required | Description                                            |
 |-----------|-----------------------------------|----------|--------------------------------------------------------|
-| `oam`     | `"0.1"`                           | yes      | Protocol version. Must be the literal string `"0.1"`. |
+| `raccoon` | `"0.1"`                           | yes      | Protocol version. Must be the literal string `"0.1"`. |
 | `id`      | string (ULID)                     | yes      | Unique envelope identifier. Monotonically sortable.   |
 | `kind`    | string (enum, see Kinds below)    | yes      | Discriminates the payload shape.                       |
 | `from`    | Address                           | yes      | Sender address (`user:<id>`, `agent:<id>`, `system`). |
@@ -45,7 +45,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0AB",
   "kind": "msg",
   "from": "user:u1",
@@ -69,7 +69,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0CD",
   "kind": "ack",
   "from": "agent:coordinator",
@@ -92,7 +92,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0EF",
   "kind": "typing",
   "from": "agent:coordinator",
@@ -115,7 +115,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0GH",
   "kind": "presence",
   "from": "user:u1",
@@ -141,7 +141,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0IJ",
   "kind": "approval.request",
   "from": "agent:coordinator",
@@ -170,7 +170,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0KL",
   "kind": "approval.response",
   "from": "user:u1",
@@ -195,7 +195,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0MN",
   "kind": "history.request",
   "from": "user:u1",
@@ -220,7 +220,7 @@ Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0OP",
   "kind": "history.page",
   "from": "agent:coordinator",
@@ -250,7 +250,7 @@ Sent as the first message over a new WebSocket connection. Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0ST",
   "kind": "pair.request",
   "from": "system",
@@ -277,7 +277,7 @@ for reconnects. Payload fields:
 
 ```json
 {
-  "oam": "0.1",
+  "raccoon": "0.1",
   "id": "01J1F3ZK9GQ4S8B2VYQ2M5X0UV",
   "kind": "pair.grant",
   "from": "system",
@@ -297,7 +297,7 @@ for reconnects. Payload fields:
 
 ## Topic Mapping
 
-OAM topics follow this hierarchy (used natively over MQTT; the WS transport uses them
+Raccoon protocol topics follow this hierarchy (used natively over MQTT; the WS transport uses them
 as logical routing keys for future bridging):
 
 ```
@@ -346,11 +346,9 @@ reconnects, skipping the pairing step.
 ## Out-of-Band Pairing
 
 Transports MAY substitute the `pair.request` / `pair.grant` envelope exchange with an
-out-of-band pairing mechanism. For example, the CloudSignal transport authenticates
-users via the CloudSignal Identity Claims API; the session credential is obtained
+out-of-band pairing mechanism. For example, a managed transport can authenticate
+users through its own identity/claims API; the session credential is obtained
 before the transport connection opens, and the WS handshake is bypassed entirely.
-This is the intended integration point for Plan B (OpenClaw adapter) and Plan D
-(MQTT/CloudSignal transport).
 
 ---
 

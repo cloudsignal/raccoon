@@ -292,7 +292,7 @@ describe('gateway.startAccount / stopAccount', () => {
     await stopAccount(makeCtx(account));
   });
 
-  it('uses the account.channels[0] as the OAM channel for the registry entry', async () => {
+  it('uses the account.channels[0] as the Raccoon channel for the registry entry', async () => {
     const { factory } = makeFakeChannelFactory();
     const account = makeAccount({ channels: ['assistant', 'echo'] });
 

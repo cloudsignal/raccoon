@@ -49,9 +49,9 @@ import type { RaccoonResolvedAccount } from './channel-plugin.js';
 
 /** A live, started Raccoon transport for one account. */
 export interface RunningAccount {
-  /** The hub that delivers OAM envelopes to connected users. */
+  /** The hub that delivers Raccoon envelopes to connected users. */
   hub: RaccoonAgentChannel['hub'];
-  /** The OAM channel name (from account.channels[0]) used for outbound. */
+  /** The Raccoon channel name (from account.channels[0]) used for outbound. */
   channel: string;
   /** Public ws URL encoded into device-pairing QR codes (from the account). */
   instanceUrl: string;
@@ -128,7 +128,7 @@ export function __resetRunningForTests(): void {
 //
 // The real ChannelGatewayContext provides neither an agentId nor a storePath.
 // Raccoon derives them:
-//   - agentId: RACCOON_AGENT_ID env override, else the first OAM channel name
+//   - agentId: RACCOON_AGENT_ID env override, else the first Raccoon channel name
 //     (the channel maps to the agent role, e.g. 'coordinator').
 //   - storePath: RACCOON_STORE_PATH env override, else a per-account default
 //     under the OS-independent './.raccoon-store/<accountId>' path. The T1

@@ -70,7 +70,7 @@ default. The account model is a single account (`"default"`).
 |----------------------|--------------|---------|---------|
 | `instanceUrl` | `RACCOON_INSTANCE_URL` | (none) | Public `ws(s)://` URL clients dial. Required to be "configured". |
 | `port` | `RACCOON_PORT` | (none) | Hub HTTP/WS port the gateway binds. Required to be "configured". |
-| `channels` | `RACCOON_CHANNELS` (CSV) | `["coordinator"]` | OAM channels the hub serves. |
+| `channels` | `RACCOON_CHANNELS` (CSV) | `["coordinator"]` | Raccoon channels the hub serves. |
 | `instance` | `RACCOON_INSTANCE` | (none) | Instance display name. |
 | `staticDir` | `RACCOON_STATIC_DIR` | (none) | Filesystem path to the built Raccoon PWA (`@raccoon/app` `dist-standalone`) to serve. |
 | `allowFrom` | (none) | `[]` | Raccoon user ids allowed to DM the agent (the allowlist). |
@@ -79,7 +79,7 @@ default. The account model is a single account (`"default"`).
 **Runtime (env only):**
 
 - `RACCOON_HOST`: hub bind host (set `0.0.0.0` in a container).
-- `RACCOON_AGENT_ID`: agent id for inbound turns; defaults to the first OAM
+- `RACCOON_AGENT_ID`: agent id for inbound turns; defaults to the first Raccoon
   channel name.
 - `RACCOON_STORE_PATH`: message-store path; defaults to a per-account path.
 - `RACCOON_BUILD_ID`: value reported by `/raccoon/version` (default `dev`).
@@ -105,7 +105,7 @@ status`. Pairing, onboarding, and message transport work without one.
 (self-hosted) and collects:
 
 - **instance name**, **port** (numeric), **instance URL** (validated
-  `ws(s)://`), and **group channels** (CSV → the OAM `channels` list);
+  `ws(s)://`), and **group channels** (CSV → the Raccoon `channels` list);
 - **allowFrom**: the Raccoon user-id allowlist (written to
   `channels.raccoon.allowFrom`);
 - **DM policy**: defaults to `allowlist`.
@@ -135,7 +135,7 @@ internal detail; the real error is logged server-side.
 
 ## Message formatting & chunking
 
-The outbound adapter turns one agent reply into an ordered list of OAM `msg`
+The outbound adapter turns one agent reply into an ordered list of Raccoon `msg`
 envelopes, one per chunk, order preserved:
 
 - Chunking uses the SDK's `chunkMarkdownTextWithMode` with limit
@@ -144,9 +144,9 @@ envelopes, one per chunk, order preserved:
   length splitting only when a single paragraph exceeds the limit; there is
   no `'paragraph'` literal in the real SDK).
 - Media URLs are appended as a plain markdown-links block before chunking
-  (v1); the Raccoon app renders them clickable. Native OAM media envelopes are
+  (v1); the Raccoon app renders them clickable. Native media envelopes are
   a future protocol extension.
-- Interactive replies (approval-style buttons) map to an OAM
+- Interactive replies (approval-style buttons) map to a protocol
   `approval.request` envelope; anything unmappable falls back to text.
 
 ## Running the smoke test (Docker)

@@ -1,7 +1,7 @@
 import { ulid } from 'ulid';
 import { z } from 'zod';
 
-export const OAM_VERSION = '0.1' as const;
+export const PROTOCOL_VERSION = '0.1' as const;
 
 const address = z.union([
   z.templateLiteral(['user:', z.string().min(1)]),
@@ -19,7 +19,7 @@ const historyMessage = z.object({
 export type HistoryMessage = z.infer<typeof historyMessage>;
 
 const base = z.object({
-  oam: z.literal(OAM_VERSION),
+  raccoon: z.literal(PROTOCOL_VERSION),
   id: z.string().min(1),
   from: address,
   to: address,
@@ -139,7 +139,7 @@ export function createEnvelope<K extends Kind>(
   },
 ): Envelope<K> {
   const env = {
-    oam: OAM_VERSION,
+    raccoon: PROTOCOL_VERSION,
     id: ulid(),
     kind,
     ts: new Date().toISOString(),

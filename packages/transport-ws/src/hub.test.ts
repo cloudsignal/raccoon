@@ -8,7 +8,7 @@ let hub: WsHub;
 afterEach(async () => { await hub?.stop(); });
 
 /** Read the next raw JSON frame (e.g. the `{ ok, userId }` resume ack, which is
- *  NOT an OAM envelope so nextMessage/parseEnvelope can't be used). */
+ *  NOT an Raccoon envelope so nextMessage/parseEnvelope can't be used). */
 function nextRaw(ws: WebSocket): Promise<Record<string, unknown>> {
   return new Promise((resolve) => ws.once('message', (d) => resolve(JSON.parse(d.toString()))));
 }

@@ -52,7 +52,7 @@ const meta: ChannelMeta = {
   docsPath: 'channels/raccoon',
   blurb:
     'Self-hosted Raccoon messenger: installable PWA with offline web-push, ' +
-    'device-pair QR auth, and OAM-native message routing.',
+    'device-pair QR auth, and Raccoon-native message routing.',
 };
 
 // ---------------------------------------------------------------------------
@@ -276,7 +276,7 @@ const configSchema: ChannelConfigSchema = {
       channels: {
         type: 'array',
         items: { type: 'string' },
-        description: 'OAM channel names the hub joins (e.g. ["coordinator"]).',
+        description: 'Raccoon channel names the hub joins (e.g. ["coordinator"]).',
       },
       staticDir: {
         type: 'string',
@@ -297,8 +297,8 @@ const configSchema: ChannelConfigSchema = {
       placeholder: 'wss://hub.example.com/',
     },
     channels: {
-      label: 'OAM channels',
-      help: 'Comma-separated OAM channel names the hub subscribes to.',
+      label: 'Raccoon channels',
+      help: 'Comma-separated Raccoon channel names the hub subscribes to.',
       placeholder: 'coordinator',
     },
   },
