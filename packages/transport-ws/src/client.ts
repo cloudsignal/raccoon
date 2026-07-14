@@ -225,7 +225,19 @@ export class WsClientTransport implements Transport {
         if (env) for (const h of this.envelopeHandlers) h(env);
       });
 
-      ws.addEventListener('close', (event: { code: number }) => {
+      // Both 'close' and 'error' funnel here, exactly once per socket. Node 22's
+      // WebSocket (undici) fires ONLY 'error' — no 'close' ever — when a dial
+      // fails before the upgrade (ECONNREFUSED, non-101 response), which left
+      // connect() unsettled forever and never armed the reconnect loop (caught
+      // by the offline-start test, which hangs on node 22 without this).
+      // Browsers, node 26, and the `ws` package fire error-then-close; the guard
+      // makes the second delivery a no-op (and 1006 matches the abnormal-close
+      // code those runtimes report — clean auth closes fire 'close' only, so
+      // real codes still arrive through the real event).
+      let closeHandled = false;
+      const onSocketClose = (event: { code: number }) => {
+        if (closeHandled) return;
+        closeHandled = true;
         clearConfirmTimer();
         const wasOpen = this.status === 'open';
         this.setStatus('closed');
@@ -249,9 +261,9 @@ export class WsClientTransport implements Transport {
         // that opened at least once (includes the initial offline-start attempt). A
         // never-opened pairing-only attempt does not loop (the pairing UI surfaces it).
         if (this.opts.session || this.everOpened || wasOpen) this.scheduleReconnect();
-      });
-
-      ws.addEventListener('error', () => { /* close event follows */ });
+      };
+      ws.addEventListener('close', onSocketClose);
+      ws.addEventListener('error', () => { onSocketClose({ code: 1006 }); });
     });
   }
 
