@@ -1,11 +1,26 @@
 {
   "name": "@raccoon/app",
   "version": "0.1.0",
+  "description": "The Raccoon chat PWA: installable, push-capable React app plus the prebuilt static bundle (dist-standalone) any Raccoon hub can serve.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudsignal/raccoon.git",
+    "directory": "packages/app"
+  },
+  "homepage": "https://github.com/cloudsignal/raccoon#readme",
+  "bugs": "https://github.com/cloudsignal/raccoon/issues",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
-  "files": ["dist", "dist-standalone", "raccoon.config.json"],
+  "files": [
+    "dist",
+    "dist-standalone",
+    "raccoon.config.json"
+  ],
   "exports": {
     ".": {
       "types": "./dist/lib.d.ts",

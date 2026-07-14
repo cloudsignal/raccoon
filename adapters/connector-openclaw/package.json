@@ -1,7 +1,18 @@
 {
   "name": "@raccoon/connector-openclaw",
   "version": "0.1.0",
+  "description": "First-party OpenClaw channel connector for Raccoon: embeds the hub in the OpenClaw gateway, native approval cards, and a pairing/revocation CLI.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudsignal/raccoon.git",
+    "directory": "adapters/connector-openclaw"
+  },
+  "homepage": "https://github.com/cloudsignal/raccoon#readme",
+  "bugs": "https://github.com/cloudsignal/raccoon/issues",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

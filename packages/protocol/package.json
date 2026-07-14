@@ -1,7 +1,18 @@
 {
   "name": "@raccoon/protocol",
   "version": "0.1.0",
+  "description": "Raccoon protocol envelope types, schemas, codec, topics, and pairing payload — the vendor-neutral wire format of the Raccoon messenger.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudsignal/raccoon.git",
+    "directory": "packages/protocol"
+  },
+  "homepage": "https://github.com/cloudsignal/raccoon#readme",
+  "bugs": "https://github.com/cloudsignal/raccoon/issues",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

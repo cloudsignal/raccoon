@@ -1,7 +1,18 @@
 {
   "name": "@raccoon/transport-ws",
   "version": "0.1.0",
+  "description": "Raccoon's built-in broker-free WebSocket transport: WsHub (server, static PWA serving, pairing) + WsClientTransport, with pluggable credential stores.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudsignal/raccoon.git",
+    "directory": "packages/transport-ws"
+  },
+  "homepage": "https://github.com/cloudsignal/raccoon#readme",
+  "bugs": "https://github.com/cloudsignal/raccoon/issues",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
