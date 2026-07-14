@@ -43,15 +43,19 @@ bridge.start();
 
 // 3. Pair a device: prints a QR + token the PWA scans.
 const { qr, token, payload } = await issuePairing(hub, {
-  userId: 'user:alice',
+  userId: 'alice',
   instanceUrl: `ws://127.0.0.1:${port}/`,
 });
 console.log(qr);            // scan from the Raccoon PWA
 console.log(token, payload); // or paste the payload manually
 ```
 
-That is a complete, working backend. Point the PWA (below) at the URL, scan
-the QR, and chat.
+That is a complete, working backend. Point the PWA (below) at the URL, pair,
+and chat. A `ws://127.0.0.1` instance URL only pairs a browser **on the same
+machine** — to pair a real phone you need HTTPS/WSS on a reachable host; set
+`instanceUrl` to your public `wss://` URL and see
+[`examples/hosting/`](../examples/hosting/) for Railway / Cloudflare / Vercel
+walkthroughs.
 
 ### Add the installable PWA
 
@@ -119,11 +123,19 @@ From a clone of the monorepo:
 npm install
 npm run build:app      # build the PWA once
 npm run demo           # echo hub on http://127.0.0.1:8790/
-# open the URL, scan the printed QR, send "/draft" to see an approval card
+# open the URL ON THE SAME MACHINE, paste the printed pairing payload into the
+# setup screen, send "/draft" to see an approval card
 ```
+
+The demo advertises a `ws://127.0.0.1` URL, so a phone can't reach it — it's a
+same-machine demo. To pair a real phone, deploy behind HTTPS/WSS:
+[`examples/hosting/`](../examples/hosting/) has Railway, Cloudflare, and
+Vercel walkthroughs.
 
 ## Next
 
+- [`examples/hosting/`](../examples/hosting/) — deploy with HTTPS/WSS on
+  Railway, Cloudflare (Tunnel/Pages), or Vercel, and pair a real phone.
 - [connector-authoring.md](connector-authoring.md) — the public ports a
   connector implements, the package-boundary diagram, and how a second
   connector (or a managed transport) plugs in without touching core.
