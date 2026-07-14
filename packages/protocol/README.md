@@ -7,7 +7,9 @@ speak. Zod-validated envelopes (`msg`, acks/ticks, `approval.request` /
 the QR pairing-payload format.
 
 ```bash
-npm install @raccoon/protocol
+# repo-first (not yet on the public npm registry) — install the packed tarball:
+#   git clone https://github.com/cloudsignal/raccoon && cd raccoon && npm ci && npm run release:pack
+npm i /path/to/raccoon/release-artifacts/raccoon-protocol-0.1.0.tgz
 ```
 
 ```ts

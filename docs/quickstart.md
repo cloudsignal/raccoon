@@ -10,8 +10,16 @@ service or message broker is required (or referenced) anywhere in this guide.
 
 ## Install
 
+v0.1 is distributed repo-first — the packages are not yet on the public npm
+registry, and nothing here needs a registry account or token. Pack the gated
+tarballs once, then install them in your own project (installed together they
+resolve each other):
+
 ```bash
-npm install @raccoon/protocol @raccoon/transport-ws @raccoon/bridge @raccoon/pairing
+git clone https://github.com/cloudsignal/raccoon && cd raccoon
+npm ci && npm run release:pack
+# in your project:
+npm i /path/to/raccoon/release-artifacts/raccoon-{protocol,transport-ws,bridge,pairing}-0.1.0.tgz
 ```
 
 Node ≥ 20.19 (or ≥ 22.12). All packages are ESM with emitted types.
@@ -59,7 +67,8 @@ walkthroughs.
 ### Add the installable PWA
 
 ```bash
-npm install @raccoon/app
+# same tarball flow as above:
+npm i /path/to/raccoon/release-artifacts/raccoon-app-0.1.0.tgz
 ```
 
 The app is a React component tree you mount in your own shell. Host-embedding
@@ -88,23 +97,21 @@ that path as `staticDir` to the hub. See [`packages/app/README.md`](../packages/
 ## Path B — an existing OpenClaw agent
 
 If your agent runs on [OpenClaw](https://openclaw.ai), install the first-party
-connector as an OpenClaw plugin — no `AgentRunner` to write:
+connector as an OpenClaw plugin — no `AgentRunner` to write. v0.1 installs from
+a clone:
 
 ```bash
-openclaw plugins install npm:@raccoon/connector-openclaw
+git clone https://github.com/cloudsignal/raccoon && cd raccoon
+npm ci && npm run build && npm run build:app
+openclaw plugins install --link "$PWD/adapters/connector-openclaw"
 ```
 
-Serve the PWA the connector pairs to by installing the app package and pointing
-`staticDir` at its prebuilt bundle — no monorepo clone required. An OpenClaw
-gateway's working directory is not the directory you ran `npm install` in, so
-resolve an **absolute** path (a relative `node_modules/...` will not find the
-files at runtime):
+Point `staticDir` at the PWA the clone just built. An OpenClaw gateway's
+working directory is not your clone, so it must be an **absolute** path (a
+relative path will not find the files at runtime):
 
 ```bash
-npm install @raccoon/app
-# Resolve the absolute dist-standalone path and set it as staticDir /
-# RACCOON_STATIC_DIR — do NOT pass a relative node_modules/... path:
-export RACCOON_STATIC_DIR="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@raccoon/app/package.json')), 'dist-standalone')")"
+export RACCOON_STATIC_DIR="$PWD/packages/app/dist-standalone"
 ```
 
 The connector is a full OpenClaw channel plugin: it stands up the hub inside

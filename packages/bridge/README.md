@@ -7,7 +7,9 @@ typing indicators, delivery acks/ticks, failure and stall signaling, dedup,
 turn deadlines, and history limits.
 
 ```bash
-npm install @raccoon/bridge
+# repo-first (not yet on the public npm registry) — install the packed tarball:
+#   git clone https://github.com/cloudsignal/raccoon && cd raccoon && npm ci && npm run release:pack
+npm i /path/to/raccoon/release-artifacts/raccoon-bridge-0.1.0.tgz
 ```
 
 ```ts

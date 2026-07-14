@@ -13,7 +13,9 @@ Node server. One package carries both sides:
   interface the Raccoon app consumes.
 
 ```bash
-npm install @raccoon/transport-ws
+# repo-first (not yet on the public npm registry) — install the packed tarball:
+#   git clone https://github.com/cloudsignal/raccoon && cd raccoon && npm ci && npm run release:pack
+npm i /path/to/raccoon/release-artifacts/raccoon-transport-ws-0.1.0.tgz
 ```
 
 ```ts

@@ -5,7 +5,9 @@ generation, push delivery, subscription stores, and a hub wrapper that falls
 back to push when the user has no live socket (the app is closed).
 
 ```bash
-npm install @raccoon/push
+# repo-first (not yet on the public npm registry) — install the packed tarball:
+#   git clone https://github.com/cloudsignal/raccoon && cd raccoon && npm ci && npm run release:pack
+npm i /path/to/raccoon/release-artifacts/raccoon-push-0.1.0.tgz
 ```
 
 ```ts

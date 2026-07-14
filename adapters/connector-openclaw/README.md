@@ -13,18 +13,27 @@ public ports this connector implements.
 
 ## Install
 
-Install as an OpenClaw plugin (npm resolves the connector + its declared deps):
+v0.1 installs from a clone as a linked OpenClaw plugin (the packages are not
+yet on the public npm registry; no registry account or token is needed):
 
 ```bash
-openclaw plugins install npm:@raccoon/connector-openclaw
+git clone https://github.com/cloudsignal/raccoon && cd raccoon
+npm ci && npm run build && npm run build:app
+openclaw plugins install --link "$PWD/adapters/connector-openclaw"
 ```
 
-Serve the PWA the connector pairs to by installing `@raccoon/app` and pointing
-`channels.raccoon.staticDir` (or `RACCOON_STATIC_DIR`) at the package's prebuilt
-`dist-standalone` bundle — the PWA ships inside `@raccoon/app`, so no monorepo
-clone is required. The gateway's working directory is not where you ran
-`npm install`, so resolve an **absolute** path (a relative `node_modules/...`
-path will not find the files at runtime):
+Serve the PWA the connector pairs to by pointing `channels.raccoon.staticDir`
+(or `RACCOON_STATIC_DIR`) at the bundle the clone just built. The gateway's
+working directory is not your clone, so it must be an **absolute** path (a
+relative path will not find the files at runtime):
+
+```bash
+export RACCOON_STATIC_DIR="$PWD/packages/app/dist-standalone"
+```
+
+If you instead installed `@raccoon/app` from a packed tarball into your own
+project (see the repo README's Distribution note), resolve the absolute path
+from wherever it landed:
 
 ```bash
 export RACCOON_STATIC_DIR="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@raccoon/app/package.json')), 'dist-standalone')")"

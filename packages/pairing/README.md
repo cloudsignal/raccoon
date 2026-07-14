@@ -5,7 +5,9 @@ mint a single-use pairing token on a hub and render the payload + terminal QR
 a device scans (or pastes) in the Raccoon app's setup screen.
 
 ```bash
-npm install @raccoon/pairing
+# repo-first (not yet on the public npm registry) — install the packed tarball:
+#   git clone https://github.com/cloudsignal/raccoon && cd raccoon && npm ci && npm run release:pack
+npm i /path/to/raccoon/release-artifacts/raccoon-pairing-0.1.0.tgz
 ```
 
 ```ts

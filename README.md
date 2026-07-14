@@ -107,14 +107,15 @@ To pair a real phone you need HTTPS/WSS on a reachable host — see
 
 ## Use it with OpenClaw
 
-The connector is an OpenClaw channel plugin; the PWA ships prebuilt inside
-`@raccoon/app`:
+The connector is an OpenClaw channel plugin. v0.1 installs from a clone (the
+packages are not yet on the public npm registry):
 
-    openclaw plugins install npm:@raccoon/connector-openclaw
-    npm install @raccoon/app
+    git clone https://github.com/cloudsignal/raccoon && cd raccoon
+    npm ci && npm run build && npm run build:app
+    openclaw plugins install --link "$PWD/adapters/connector-openclaw"
 
     # staticDir must be an ABSOLUTE path (the gateway's cwd differs):
-    export RACCOON_STATIC_DIR="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@raccoon/app/package.json')), 'dist-standalone')")"
+    export RACCOON_STATIC_DIR="$PWD/packages/app/dist-standalone"
 
 Configure `channels.raccoon` (instance URL, port, allowlist), restart the
 gateway, then enroll a user:
@@ -152,10 +153,20 @@ push — and for phones to reach the hub at all).
 | `@raccoon/pairing` | QR pairing token generation and verification |
 | `@raccoon/push` | VAPID key generation, Web Push delivery, subscription store |
 
-Every published package ships compiled `dist/` + emitted `.d.ts` with an `exports`
-map and installs as a plain npm package — no workspace, sibling repo, vendored
+Every package ships compiled `dist/` + emitted `.d.ts` with an `exports` map
+and installs as a plain npm package — no workspace, sibling repo, vendored
 tree, or `/src` import required. `npm run release:verify` proves it by packing
 each package and building a fresh external consumer against the tarballs.
+
+**Distribution (v0.1): repo-first — no registry account or token anywhere.**
+The packages are not yet on the public npm registry. Consume them from a clone,
+or pack the gated tarballs and install those in your own project (they resolve
+each other when installed together — exactly what `release:verify` gates):
+
+    git clone https://github.com/cloudsignal/raccoon && cd raccoon
+    npm ci && npm run release:pack
+    # in your project:
+    npm i /path/to/raccoon/release-artifacts/raccoon-*.tgz
 
 The repo also carries two `private`, unpublished transport implementations (an
 MQTT broker transport and a managed-service transport) that prove the transport
