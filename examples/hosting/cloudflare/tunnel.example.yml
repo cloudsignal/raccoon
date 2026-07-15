@@ -1,0 +1,10 @@
+# ~/.cloudflared/config.yml — Cloudflare Tunnel in front of a Raccoon hub.
+# Replace <TUNNEL-ID> with the id printed by `cloudflared tunnel create raccoon`.
+tunnel: <TUNNEL-ID>
+credentials-file: ~/.cloudflared/<TUNNEL-ID>.json
+
+ingress:
+  # Raccoon hub: PWA + WebSocket on one origin. Cloudflare proxies WS natively.
+  - hostname: raccoon.example.com
+    service: http://localhost:8790
+  - service: http_status:404

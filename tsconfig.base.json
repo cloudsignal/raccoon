@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@raccoon/protocol": ["packages/protocol/src/index.ts"],
+      "@raccoon/bridge": ["packages/bridge/src/index.ts"],
+      "@raccoon/pairing": ["packages/pairing/src/index.ts"],
+      "@raccoon/transport-ws": ["packages/transport-ws/src/index.ts"],
+      "@raccoon/push": ["packages/push/src/index.ts"],
+      "@raccoon/app": ["packages/app/src/lib.ts"],
+      "@raccoon/connector-openclaw": ["adapters/connector-openclaw/src/index.ts"]
+    }
+  }
+}

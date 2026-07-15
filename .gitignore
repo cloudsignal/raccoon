@@ -1,0 +1,19 @@
+node_modules/
+dist/
+dist-standalone/
+release-artifacts/
+*.tsbuildinfo
+.DS_Store
+.superpowers/
+
+# secrets / env / keys — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.local
+*.log
+data/

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, pub-release]
+    tags: ['v*']
+  pull_request:
+
+# A clean-clone gate: `actions/checkout` + `npm ci` is a fresh install from the
+# committed lockfile — no local state, no sibling repo, no vendored tree.
+jobs:
+  test:
+    name: typecheck + test + build (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build:app
+      - run: npm run gate:neutrality
+
+  release-verify:
+    name: packed-tarball fresh-consumer build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # Builds every published package, packs each to a tarball, and builds a
+      # fresh external consumer against the tarball roots — proving the release
+      # installs with no workspace, sibling repo, vendor tree, or /src imports.
+      - run: npm run release:verify

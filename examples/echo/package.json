@@ -1,0 +1,16 @@
+{
+  "name": "@raccoon/example-echo",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@raccoon/bridge": "0.1.0",
+    "@raccoon/pairing": "0.1.0",
+    "@raccoon/protocol": "0.1.0",
+    "@raccoon/push": "0.1.0",
+    "@raccoon/transport-ws": "0.1.0"
+  },
+  "devDependencies": { "@types/node": "^22.0.0", "tsx": "^4.19.0" },
+  "scripts": { "start": "tsx src/main.ts" }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "raccoon-monorepo",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": "^20.19.0 || >=22.12.0" },
+  "workspaces": ["packages/*", "examples/*", "adapters/*"],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p packages/protocol && tsc --noEmit -p packages/transport-ws && tsc --noEmit -p packages/transport-mqtt && tsc --noEmit -p packages/transport-cloudsignal && tsc --noEmit -p packages/bridge && tsc --noEmit -p packages/pairing && tsc --noEmit -p packages/push && tsc --noEmit -p examples/echo && tsc --noEmit -p adapters/connector-openclaw && tsc --noEmit -p packages/app",
+    "build": "npm run build -w @raccoon/protocol && npm run build -w @raccoon/transport-ws && npm run build -w @raccoon/pairing && npm run build -w @raccoon/push && npm run build -w @raccoon/bridge && npm run build -w @raccoon/connector-openclaw && npm run build -w @raccoon/app",
+    "build:app": "npm run build:standalone -w @raccoon/app",
+    "gate:neutrality": "bash scripts/gate-neutrality.sh",
+    "gate:deps": "node scripts/gate-deps.mjs",
+    "release:pack": "bash scripts/release-pack.sh",
+    "release:verify": "bash scripts/release-verify.sh",
+    "release:publish": "bash scripts/release-publish.sh",
+    "demo": "npm run build:app && npm start -w @raccoon/example-echo",
+    "example:echo": "npm start -w @raccoon/example-echo"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "verdaccio": "^6.0.0",
+    "vitest": "^3.0.0"
+  }
+}
