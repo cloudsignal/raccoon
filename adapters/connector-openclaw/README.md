@@ -210,6 +210,12 @@ envelopes, one per chunk, order preserved:
      and `OPENCLAW_GATEWAY_TOKEN` set (container binds 0.0.0.0).
    - On macOS, mount the state dir from `$HOME` (Docker Desktop presented a
      `/tmp` bind mount as an empty root-owned dir).
+   - A model set via `openclaw models set <provider>/<model>` must ALSO be
+     registered under `models.providers.<provider>.models[]` in
+     `openclaw.json` (`{ "id": "<model>", "name": "<model>" }`), or every
+     turn fails fast with `FailoverError: Unknown model`. The provider API
+     key can come from env (e.g. `ANTHROPIC_API_KEY`); check both with
+     `openclaw models status`.
 
 4. Run:
 
