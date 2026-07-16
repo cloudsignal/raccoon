@@ -1,0 +1,40 @@
+name: Bug report
+description: Something is broken
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Smallest set of steps or code that shows the problem.
+      placeholder: |
+        1. npm run demo
+        2. pair with the printed payload
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: area
+    attributes:
+      label: Affected package
+      placeholder: "@raccoon/transport-ws, @raccoon/app, connector-openclaw, ..."
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "node 22.12 / macOS 15 / iOS Safari 18 PWA / openclaw 2026.6.11"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output. Redact tokens and session values.
+      render: shell

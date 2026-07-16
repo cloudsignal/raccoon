@@ -52,10 +52,10 @@ echo "== neutrality: public docs name no vendor and no 'OAM' =="
 # not a public spec and must not resurface as the protocol's name. The repo's
 # own GitHub URL (github.com/cloudsignal/raccoon) is provenance, not
 # positioning — excluded. 'oam' is boundary-matched so 'roaming'/'Foam' pass.
-PUBLIC_DOCS=(README.md PROTOCOL.md docs examples packages adapters)
+PUBLIC_DOCS=(README.md PROTOCOL.md docs examples packages adapters website)
 set +e
 raw_out="$(grep -rniE '(^|[^[:alnum:]])oam([^[:alnum:]]|$)|cloudsignal|gtm|supabase' \
-  "${PUBLIC_DOCS[@]}" --include='*.md' --include='*.mjs' --include='*.yml' --include='vercel.json')"
+  "${PUBLIC_DOCS[@]}" --include='*.md' --include='*.mjs' --include='*.yml' --include='*.html' --include='vercel.json')"
 rc=$?
 set -e
 if [ "$rc" -ge 2 ]; then

@@ -1,0 +1,30 @@
+name: Connector request
+description: Ask for (or offer to build) a connector to another agent framework
+labels: [connector]
+body:
+  - type: input
+    id: framework
+    attributes:
+      label: Agent framework
+      description: Name and link to the framework you want Raccoon to front.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: How agents run there
+      description: >
+        How does a turn work in that framework (input in, reply out)? Links to
+        its plugin or extension docs help. The connector surface Raccoon needs
+        is one AgentRunner implementation; see docs/connector-authoring.md.
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Are you offering to build it?
+      options:
+        - I want to build it and need guidance
+        - I'm requesting it
+    validations:
+      required: true
