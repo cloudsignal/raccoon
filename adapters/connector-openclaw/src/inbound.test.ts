@@ -539,6 +539,11 @@ describe('buildRaccoonInboundRunner', () => {
       Body: ctx.text,
       BodyForAgent: ctx.text,
       From: ctx.userId,
+      // Issue #4: the routable reply target, in the outbound adapter's own
+      // 'user:<id>' format. OpenClaw persists it as the session origin's `to`
+      // and hands it to the exec tool as turnSourceTo — without it the
+      // exec-approval forwarder resolves NO delivery target for this channel.
+      To: `user:${ctx.userId}`,
       SessionKey: `raccoon:user:${ctx.userId}`,
       AgentId: opts.agentId,
       MessageSid: ctx.messageId,

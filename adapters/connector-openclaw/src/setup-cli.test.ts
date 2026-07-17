@@ -73,6 +73,33 @@ describe('mergeRaccoonSetup', () => {
     expect(twice.plugins.allow).toEqual(['raccoon']);
     expect(twice.channels.raccoon.allowFrom).toEqual(['efi']);
   });
+
+  // Issue #4: without approvals.exec.enabled, OpenClaw never forwards
+  // exec-approval requests to any chat channel — the approval card can't
+  // render and an ask=always exec turn stalls until the approval expires.
+  it('enables approvals.exec (session mode) when the config has no approvals.exec at all', () => {
+    const { next, warnings } = mergeRaccoonSetup({}, {});
+    expect((next as Record<string, unknown>)['approvals']).toEqual({
+      exec: { enabled: true, mode: 'session' },
+    });
+    expect(warnings.some((w) => w.includes('approvals.exec'))).toBe(true);
+  });
+
+  it('leaves an existing approvals.exec section untouched (operator intent)', () => {
+    const disabled = { approvals: { exec: { enabled: false } } };
+    const { next, warnings } = mergeRaccoonSetup(disabled, {});
+    expect((next as Record<string, unknown>)['approvals']).toEqual({ exec: { enabled: false } });
+    expect(warnings.some((w) => w.includes('approvals.exec'))).toBe(false);
+  });
+
+  it('preserves sibling approvals keys when adding exec', () => {
+    const existing = { approvals: { plugin: { enabled: true } } };
+    const { next } = mergeRaccoonSetup(existing, {});
+    expect((next as Record<string, unknown>)['approvals']).toEqual({
+      plugin: { enabled: true },
+      exec: { enabled: true, mode: 'session' },
+    });
+  });
 });
 
 function makeIo(overrides?: Partial<SetupIo> & { files?: Record<string, string> }): SetupIo & { files: Record<string, string>; logs: string[] } {

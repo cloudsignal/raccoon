@@ -194,6 +194,29 @@ envelopes, one per chunk, order preserved:
 - Interactive replies (approval-style buttons) map to a protocol
   `approval.request` envelope; anything unmappable falls back to text.
 
+## Exec approvals → native cards
+
+The plugin registers an `approvalCapability` whose `render.exec` hooks turn
+OpenClaw exec-approval requests into compact card payloads: title, the FULL
+pending command (never truncated — an approval surface that hides part of what
+it approves is a security bug), an agent/host/expiry context line, and
+Allow Once / Allow Always / Deny buttons carrying the real `/approve <id>
+<decision>` command. Tapping a button resolves the approval and the blocked
+exec continues.
+
+Requirements, both handled by `openclaw raccoon setup`:
+
+- `approvals.exec.enabled` in `openclaw.json` (mode `session` routes the
+  request back to the conversation that started the turn). Without it,
+  OpenClaw never forwards exec approvals to ANY chat channel.
+- An exec-approval policy that actually prompts — `openclaw approvals set`
+  with `ask: on-miss` (or `always`). The default `ask: off` auto-runs.
+
+Approval authorization is the channel gate itself: Raccoon is a 1:1
+paired-device DM channel, so the user in the conversation is the approver —
+the same trust model as answering the prompt in the terminal that started the
+run. The plugin registers no extra `authorizeActorAction`.
+
 ## Running the smoke test (Docker)
 
 1. Build the plugin bundle (single-file ESM; `openclaw/*` stays external, as

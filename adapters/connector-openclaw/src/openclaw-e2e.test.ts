@@ -51,6 +51,7 @@ import { buildRaccoonInboundRunner } from './inbound.js';
 import { createRaccoonChannel } from './plugin.js';
 import { createRaccoonOutbound } from './outbound.js';
 import { createApprovalValueStore } from './approval-values.js';
+import { buildRaccoonExecPendingPayload, buildRaccoonExecResolvedPayload } from './approval-render.js';
 
 // The opaque config the runner passes to (mocked) dispatch — never read here.
 const cfg = {} as OpenClawConfig;
@@ -226,6 +227,63 @@ describe('OpenClaw connector e2e (real hub + client + connector; only the model 
     await resumed.connect();
     await resumed.send(userMsg('back'));
     await waitUntil(() => afterReconnect.some((e) => e.kind === 'msg' && e.payload.text === 'reply:back'));
+  });
+
+  // Issue #4 — the exec-approval → card bridge, end to end on the connector's
+  // side of the seam: the EXACT ReplyPayload our approvalCapability.render.exec
+  // hook hands the exec-approval forwarder, delivered through the REAL
+  // outbound (presentation → approval.request card), tapped on a REAL client,
+  // resolved by the REAL inbound to the native /approve slash command that
+  // unblocks the waiting exec. (The forwarder itself is OpenClaw core — its
+  // delivery contract is "payloads through the channel outbound", which is
+  // what this simulates; the full gateway loop is a live-rig check.)
+  it('renders an exec-approval as a card and resolves the tap to /approve <id> <decision>', async () => {
+    const { channel, outbound } = buildConnector();
+    const { port } = await channel.start();
+    const pairing = await channel.pair('u1');
+    const { client, received } = newClient({ url: `ws://127.0.0.1:${port}/`, pairingToken: pairing.token, device: 'iphone' });
+    await client.connect();
+
+    // The forwarder-side payload our capability produces for a pending exec.
+    const nowMs = Date.now();
+    const pending = buildRaccoonExecPendingPayload({
+      request: {
+        id: 'apr-e2e-1',
+        createdAtMs: nowMs,
+        expiresAtMs: nowMs + 30 * 60_000,
+        request: { command: 'date', agentId: 'main', host: 'gateway' },
+      },
+      nowMs,
+    });
+
+    // Deliver it the way the forwarder does: through the channel outbound.
+    received.length = 0;
+    await outbound.sendPayload!({
+      cfg, to: 'user:u1', text: pending.text ?? '', payload: pending,
+    } as ChannelOutboundPayloadContext);
+
+    // One approval.request card: compact title, the command in the
+    // description, decision labels as options.
+    await waitUntil(() => received.some(isApprovalRequest));
+    const card = received.find(isApprovalRequest)!;
+    expect(card.payload.title).toBe('Exec approval required');
+    expect(card.payload.description).toContain('date');
+    expect(card.payload.options).toEqual(['Allow Once', 'Allow Always', 'Deny']);
+
+    // Tap "Allow Once" → the REAL native approve command reaches dispatch.
+    dispatchedBodies.length = 0;
+    await client.send(approvalResponse(card.payload.refId, 'Allow Once'));
+    await waitUntil(() => dispatchedBodies.includes('/approve apr-e2e-1 allow-once'));
+
+    // The resolved payload is plain text → an ordinary msg bubble.
+    received.length = 0;
+    const resolved = buildRaccoonExecResolvedPayload({
+      resolved: { id: 'apr-e2e-1', decision: 'allow-once', resolvedBy: 'u1', ts: nowMs },
+    });
+    await outbound.sendPayload!({
+      cfg, to: 'user:u1', text: resolved.text ?? '', payload: resolved,
+    } as ChannelOutboundPayloadContext);
+    await waitUntil(() => received.some((e) => e.kind === 'msg' && e.payload.text === 'Exec approval allowed once by u1.'));
   });
 
   it('restarts the connector on the same port and resumes the stored session (persistent store)', async () => {

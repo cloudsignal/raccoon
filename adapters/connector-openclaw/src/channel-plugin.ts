@@ -24,6 +24,7 @@ import type { ChannelConfigSchema } from 'openclaw/plugin-sdk';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk/channel-core';
 import { createRegistryOutbound, raccoonPairDeps, resolveRunning, startAccount, stopAccount } from './gateway.js';
 import { createRaccoonPairingAdapter, createRaccoonSecurityAdapter, type PairingIssuer } from './pairing-adapter.js';
+import { createRaccoonApprovalCapability } from './approval-render.js';
 import { raccoonSetupWizard } from './setup-wizard.js';
 
 // ---------------------------------------------------------------------------
@@ -363,6 +364,10 @@ export const raccoonChannelPlugin: ChannelPlugin<RaccoonResolvedAccount> = {
   outbound: createRegistryOutbound(resolveRunning),
   pairing: createRaccoonPairingAdapter(registryPairingIssuer),
   security: createRaccoonSecurityAdapter(),
+  // Exec-approval → Raccoon card rendering (issue #4). The exec-approval
+  // forwarder consults this via resolveChannelApprovalAdapter(plugin) when it
+  // builds the pending/resolved payloads it delivers through `outbound`.
+  approvalCapability: createRaccoonApprovalCapability(),
   setupWizard: raccoonSetupWizard,
   gateway: {
     startAccount: async (ctx) => {

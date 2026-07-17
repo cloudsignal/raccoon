@@ -84,6 +84,19 @@ describe('raccoonChannelPlugin identity', () => {
   it('capabilities.chatTypes contains "direct"', () => {
     expect(raccoonChannelPlugin.capabilities.chatTypes).toContain('direct');
   });
+
+  // Issue #4: the exec-approval forwarder consults
+  // resolveChannelApprovalAdapter(plugin) — which reads
+  // plugin.approvalCapability and requires at least one of
+  // delivery/nativeRuntime/render/native — when building the pending/resolved
+  // payloads it delivers through the outbound. Without this slot the
+  // forwarder falls back to the generic wall-of-text payload instead of the
+  // compact Raccoon card shape.
+  it('registers a render-capable approvalCapability (exec pending + resolved)', () => {
+    const cap = raccoonChannelPlugin.approvalCapability;
+    expect(cap?.render?.exec?.buildPendingPayload).toBeTypeOf('function');
+    expect(cap?.render?.exec?.buildResolvedPayload).toBeTypeOf('function');
+  });
 });
 
 describe('raccoonChannelPlugin.config — listAccountIds', () => {

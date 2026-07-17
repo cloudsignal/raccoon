@@ -121,6 +121,33 @@ CLI. See [`adapters/connector-openclaw/README.md`](../adapters/connector-opencla
 for configuration and the setup wizard, and
 [compatibility.md](compatibility.md) for the supported OpenClaw versions.
 
+### Approve agent commands from your phone
+
+Two switches make exec-approval cards live. `openclaw raccoon setup` flips the
+first one for you (`approvals.exec` in `openclaw.json` — it forwards pending
+approvals to the conversation that started the turn); if you configured the
+channel by hand, add:
+
+```json
+{ "approvals": { "exec": { "enabled": true, "mode": "session" } } }
+```
+
+The second is OpenClaw's own exec-approval policy — nothing prompts while
+`ask` is `off` (the default auto-runs):
+
+```bash
+echo '{"version":1,"defaults":{"security":"allowlist","ask":"on-miss"}}' \
+  | openclaw approvals set --stdin
+```
+
+Now when the agent wants to run a command the policy does not pre-approve,
+the chat shows a card with the full command and Allow Once / Allow Always /
+Deny buttons; the tap resolves the approval and the agent's turn continues.
+Approval authorization follows the channel's own gate: only paired, allowlisted
+users can reach the conversation, and whoever is in the conversation can
+resolve its approvals (the same trust model as approving in the terminal that
+started the run).
+
 ## Try the bundled demo
 
 From a clone of the monorepo:

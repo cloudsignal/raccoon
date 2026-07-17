@@ -205,6 +205,16 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     CommandBody: approvalText,
     BodyForCommands: approvalText,
     From: ctx.userId,
+    // The routable reply target for this conversation, in the exact format the
+    // outbound adapter parses (`user:<id>` — see outbound.ts parseRaccoonUserId).
+    // OpenClaw persists this as the session origin's `to`
+    // (deriveSessionOrigin: origin.to = ctx.OriginatingTo ?? ctx.To) and feeds
+    // it to the exec tool as turnSourceTo. Without it the exec-approval
+    // forwarder resolves NO delivery target for raccoon-originated turns
+    // (resolveExecApprovalSessionTarget: `if (!target.to) return null`), so
+    // ask=always exec approvals were never delivered to the channel and the
+    // turn stalled until the approval expired (raccoon issue #4).
+    To: `user:${ctx.userId}`,
     SessionKey: sessionKey,
     AgentId: opts.agentId,
     MessageSid: ctx.messageId,

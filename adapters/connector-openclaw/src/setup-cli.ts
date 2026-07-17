@@ -125,11 +125,28 @@ export function mergeRaccoonSetup(
     );
   }
 
+  // Exec-approval forwarding: without approvals.exec.enabled, OpenClaw never
+  // delivers exec-approval requests to ANY chat channel — an `ask=always`
+  // exec turn just stalls until the approval expires. Enable it (session
+  // mode: the request goes back to the conversation that started the turn,
+  // where the Raccoon card renders) ONLY when the operator has no
+  // approvals.exec section at all; an existing section is operator intent
+  // and is left untouched.
+  const approvals = asRecord(cfg['approvals']);
+  if (approvals['exec'] === undefined) {
+    approvals['exec'] = { enabled: true, mode: 'session' };
+    warnings.push(
+      'enabled approvals.exec (mode: session) so exec-approval prompts reach the Raccoon card. ' +
+      'Approvals only trigger once exec approvals are configured (openclaw approvals set — ask: on-miss or always).',
+    );
+  }
+
   return {
     next: {
       ...cfg,
       plugins: { ...plugins, allow },
       channels: { ...channels, raccoon },
+      approvals,
     },
     warnings,
   };
