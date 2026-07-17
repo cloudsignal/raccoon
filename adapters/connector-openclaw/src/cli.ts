@@ -22,6 +22,9 @@
 //   (shim: openclaw/plugin-sdk/plugin-entry block, extended in T5 for CLI)
 
 import type { OpenClawPluginCliRegistrar, OpenClawPluginCliContext } from 'openclaw/plugin-sdk/plugin-runtime';
+import * as fs from 'node:fs';
+
+import { defaultSetupIo, runRaccoonSetup } from './setup-cli.js';
 
 // ---------------------------------------------------------------------------
 // RaccoonCliDeps — injectable deps for the CLI commands (testable without a
@@ -112,6 +115,47 @@ export function registerRaccoonCli(registrar: CliRegistrar, deps: RaccoonCliDeps
       .action(async (userId: string) => {
         await deps.revoke(userId);
         console.log(`Raccoon device pairing revoked for user "${userId}".`);
+      });
+
+    // `openclaw raccoon setup [--url ...] [--tunnel cloudflared] [--channel ...] [--user ...]`
+    // One-command onboarding (#3): writes channels.raccoon + plugins.allow,
+    // resolves the PWA staticDir, optionally fronts the hub with a quick
+    // tunnel, and prints the restart + pair steps. Runs in the CLI process
+    // and never needs the gateway to be up.
+    const setup = (raccoon as unknown as {
+      command(name: string): {
+        description(desc: string): {
+          option(flags: string, desc: string): unknown;
+          action(fn: (opts: Record<string, string | undefined>) => Promise<void>): unknown;
+        };
+      };
+    }).command('setup').description('Configure the Raccoon channel on this OpenClaw host (config, staticDir, TLS, pairing steps)') as unknown as {
+      option(flags: string, desc: string): typeof setup;
+      action(fn: (opts: Record<string, string | undefined>) => Promise<void>): unknown;
+    };
+    setup
+      .option('--url <wssUrl>', 'public ws(s):// URL clients dial (encoded into pairing QRs)')
+      .option('--channel <name>', "channel name shown in the app (default 'assistant')")
+      .option('--user <id>', 'user id to allowlist for DMs')
+      .option('--port <port>', 'hub port (default 8790)')
+      .option('--static-dir <path>', 'absolute path to the built PWA (default: resolved from @raccoon/app)')
+      .option('--tunnel <provider>', "front the hub with a quick tunnel ('cloudflared')")
+      .option('--config <path>', 'openclaw.json path (default: $OPENCLAW_CONFIG or ~/.openclaw/openclaw.json)')
+      .action(async (opts: Record<string, string | undefined>) => {
+        const result = await runRaccoonSetup({
+          url: opts['url'],
+          channel: opts['channel'],
+          user: opts['user'],
+          port: opts['port'] ? Number(opts['port']) : undefined,
+          staticDir: opts['staticDir'],
+          tunnel: opts['tunnel'],
+          configPath: opts['config'],
+        }, defaultSetupIo(fs));
+        if (opts['tunnel']) {
+          // Keep the CLI (and with it the quick tunnel child process) alive.
+          console.log(`\ntunnel active for ${result.instanceUrl} — Ctrl+C to stop.`);
+          await new Promise(() => { /* lives until Ctrl+C */ });
+        }
       });
   };
 

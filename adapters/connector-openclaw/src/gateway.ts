@@ -141,7 +141,7 @@ function resolveAgentId(account: RaccoonResolvedAccount): string {
   const override = process.env['RACCOON_AGENT_ID'];
   if (override && override.length > 0) return override;
   const first = account.channels[0];
-  return first && first.length > 0 ? first : 'coordinator';
+  return first && first.length > 0 ? first : 'assistant';
 }
 
 function resolveStorePath(accountId: string): string {
@@ -188,7 +188,7 @@ async function doStart(
   accountId: string,
 ): Promise<RunningAccount> {
   const account = ctx.account;
-  const channelName = account.channels[0] ?? 'coordinator';
+  const channelName = account.channels[0] ?? 'assistant';
 
   // Fresh per-start correlation store, shared with the outbound adapter via
   // the approvalValues registry below (R2-5).

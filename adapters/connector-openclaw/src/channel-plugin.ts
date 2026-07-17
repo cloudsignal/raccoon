@@ -130,7 +130,7 @@ const config: ChannelConfigAdapter<RaccoonResolvedAccount> = {
     // channels: cfg value (string[]) or comma-split env var
     const channels: string[] =
       strArrayOrUndef(s['channels']) ??
-      (strOrUndef(process.env['RACCOON_CHANNELS'])?.split(',') ?? ['coordinator']);
+      (strOrUndef(process.env['RACCOON_CHANNELS'])?.split(',') ?? ['assistant']);
 
     // Optional — prefer config section; fall back to env var (consistent with
     // the other RACCOON_* env fallbacks above, and documented in README Docker
@@ -276,7 +276,7 @@ const configSchema: ChannelConfigSchema = {
       channels: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Raccoon channel names the hub joins (e.g. ["coordinator"]).',
+        description: 'Raccoon channel names the hub joins (e.g. ["assistant"]).',
       },
       staticDir: {
         type: 'string',
@@ -299,7 +299,7 @@ const configSchema: ChannelConfigSchema = {
     channels: {
       label: 'Raccoon channels',
       help: 'Comma-separated Raccoon channel names the hub subscribes to.',
-      placeholder: 'coordinator',
+      placeholder: 'assistant',
     },
   },
   runtime: {

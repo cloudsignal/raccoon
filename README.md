@@ -120,9 +120,11 @@ packages are not yet on the public npm registry):
     # staticDir must be an ABSOLUTE path (the gateway's cwd differs):
     export RACCOON_STATIC_DIR="$PWD/packages/app/dist-standalone"
 
-Configure `channels.raccoon` (instance URL, port, allowlist), restart the
-gateway, then enroll a user:
+Then let the connector write its own configuration (instance URL, channel
+name, allowlist, PWA path), restart the gateway, and enroll a user:
 
+    openclaw raccoon setup --url wss://chat.example.com/ --user <userId>
+    # (no proxy? --tunnel cloudflared gives you a temporary public URL)
     openclaw raccoon pair <userId>    # prints the pairing QR
 
 Configuration, the setup wizard, allowlist/DM policy, and the pairing CLI are

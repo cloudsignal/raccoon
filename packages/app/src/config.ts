@@ -38,12 +38,21 @@ const TONE_KEYS: ChannelTone[] = ['navy', 'amber', 'violet', 'rose', 'emerald'];
 
 export interface ChannelMeta { label: string; blurb: string; tone: ChannelTone }
 
+/** 'my-agent' / 'code_review' / 'ops.oncall' -> 'My Agent' / 'Code Review' / 'Ops Oncall'. */
+function humanize(id: string): string {
+  return id
+    .split(/[-_.\s]+/)
+    .filter((w) => w.length > 0)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
 export function channelMeta(id: string): ChannelMeta {
   const override = appConfig.channels[id] ?? {};
   let hash = 0;
   for (const ch of id) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
   return {
-    label: override.label ?? id.charAt(0).toUpperCase() + id.slice(1),
+    label: override.label ?? humanize(id),
     blurb: override.blurb ?? 'Agent channel',
     tone: override.tone ?? TONE_KEYS[hash % TONE_KEYS.length]!,
   };

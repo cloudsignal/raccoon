@@ -189,8 +189,8 @@ const instanceUrlInput: ChannelSetupWizardTextInput = {
 
 const channelsInput: ChannelSetupWizardTextInput = {
   inputKey: 'groupChannels',
-  message: 'Raccoon channel names the hub subscribes to (comma-separated)',
-  placeholder: 'coordinator',
+  message: 'Channel name for this agent (shown as the chat title in the app; comma-separated for several)',
+  placeholder: 'assistant',
   required: false,
 
   currentValue({ cfg }: { cfg: OpenClawConfig; accountId: string; credentialValues: Record<string, string | undefined> }): string | undefined {
@@ -216,7 +216,7 @@ const channelsInput: ChannelSetupWizardTextInput = {
       .split(',')
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
-    return patchRaccoonSection(cfg, { channels: channels.length > 0 ? channels : ['coordinator'] });
+    return patchRaccoonSection(cfg, { channels: channels.length > 0 ? channels : ['assistant'] });
   },
 };
 

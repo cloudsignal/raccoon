@@ -21,4 +21,10 @@ describe('brand config', () => {
     expect(a.label).toBe('Assistant');
     expect(a.tone).toBe(b.tone);
   });
+
+  it('humanizes multi-word channel ids (#2)', () => {
+    expect(channelMeta('my-agent').label).toBe('My Agent');
+    expect(channelMeta('code_review').label).toBe('Code Review');
+    expect(channelMeta('ops.oncall').label).toBe('Ops Oncall');
+  });
 });

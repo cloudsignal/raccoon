@@ -39,6 +39,42 @@ from wherever it landed:
 export RACCOON_STATIC_DIR="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@raccoon/app/package.json')), 'dist-standalone')")"
 ```
 
+## Setup in one command
+
+After the plugin is installed, `openclaw raccoon setup` writes the whole
+channel configuration for you:
+
+```bash
+openclaw raccoon setup --url wss://chat.example.com/ --user alice
+openclaw raccoon setup --tunnel cloudflared --user alice   # no proxy? quick tunnel
+```
+
+It merges `channels.raccoon` into `openclaw.json` (backing the file up
+first), adds `raccoon` to `plugins.allow`, resolves `staticDir` from the
+built PWA, and prints the two remaining steps: restart the gateway, then
+`openclaw raccoon pair <user>`. With `--tunnel cloudflared` it starts a
+Cloudflare quick tunnel on the hub port and uses the tunnel hostname as the
+pairing URL; keep that process running while you test (for something
+permanent, see the repo's `examples/hosting/`). Flags: `--url`, `--channel`,
+`--user`, `--port`, `--static-dir`, `--tunnel`, `--config`.
+
+## Renaming the channel
+
+The channel name is the chat's identity in the app (`agent:<channel>` on the
+wire, the chat title in the UI). The setup wizard prompts for it (default
+`assistant`); to rename later, change it and restart the gateway:
+
+```jsonc
+{ "channels": { "raccoon": { "channels": ["atlas"] } } }
+```
+
+Paired devices pick the new channel up on their next connection; the app
+humanizes the id for the title (`ops-oncall` renders as "Ops Oncall"), and a
+self-hosted app build can pin a label/blurb per id in `raccoon.config.json`.
+Message history in the app is stored per channel id, so the old channel's
+transcript stays under the old name; agent-side memory is unaffected (the
+agent is the same agent).
+
 ## Status: CHANNEL-NATIVE (2026-07-09)
 
 Reconciled against the real `openclaw@2026.6.11` SDK. The adapter is a full

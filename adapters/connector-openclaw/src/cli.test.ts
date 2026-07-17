@@ -16,6 +16,7 @@ interface StubCommand {
   command(name: string): StubCommand;
   description(desc: string): StubCommand;
   argument(syntax: string, desc?: string): StubCommand;
+  option(flags: string, desc?: string): StubCommand;
   action(fn: (...args: unknown[]) => Promise<void> | void): StubCommand;
   // Track registered subcommands for assertions
   _registeredCommands: string[];
@@ -31,6 +32,7 @@ function makeStubCommand(): StubCommand {
     },
     description() { return stub; },
     argument() { return stub; },
+    option() { return stub; },
     action() { return stub; },
   };
   return stub;
@@ -89,6 +91,7 @@ describe('registerRaccoonCli', () => {
       command(name) { racSubCmds.push(name); return raccoonStub; },
       description() { return raccoonStub; },
       argument() { return raccoonStub; },
+      option() { return raccoonStub; },
       action(fn) {
         if (racSubCmds[racSubCmds.length - 1] === 'pair') {
           pairAction = fn as (userId: string) => Promise<void>;
@@ -129,6 +132,7 @@ describe('registerRaccoonCli', () => {
       command(name) { racSubCmds.push(name); return raccoonStub; },
       description() { return raccoonStub; },
       argument() { return raccoonStub; },
+      option() { return raccoonStub; },
       action(fn) {
         if (racSubCmds[racSubCmds.length - 1] === 'revoke') {
           revokeAction = fn as (userId: string) => Promise<void>;
