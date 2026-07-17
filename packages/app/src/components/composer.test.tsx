@@ -42,16 +42,16 @@ describe('Composer', () => {
     const user = userEvent.setup();
     const box = screen.getByPlaceholderText(/message coordinator/i);
     await user.type(box, 'line one{Shift>}{Enter}{/Shift}line two');
-    expect(transport.sent).toHaveLength(0);
+    expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(0);
     await user.type(box, '{Enter}');
     await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(1));
-    const sent = transport.sent[0]!;
+    const sent = transport.sent.find((e) => e.kind === 'msg')!;
     expect(sent.kind === 'msg' && sent.payload.text).toContain('line one\nline two');
   });
 
   it('does not send blank input', async () => {
     const transport = await mount();
     await userEvent.setup().click(screen.getByRole('button', { name: /send message/i }));
-    expect(transport.sent).toHaveLength(0);
+    expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(0);
   });
 });

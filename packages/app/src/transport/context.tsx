@@ -639,15 +639,18 @@ export function TransportProvider(props: TransportProviderProps) {
         // after, covering both the recovered rows and normal pending ones.
         void outbox.recoverProcessing(identityScopeRef.current).then(() => drain());
         void drain();
-        // Catch up history on every (re)connect: re-request the active channel AND
-        // every already-loaded channel, so agent replies produced server-side while
-        // we were disconnected appear instead of staying absent until a full reload.
-        // The history reducer merges by id, so re-fetching the latest page is
-        // idempotent (already-shown messages are deduped).
+        // Catch up history on every (re)connect: request EVERY channel in the
+        // session, plus the active one and any already-loaded channels. Seeding
+        // from the session's channels is what hydrates the channel-list preview
+        // (last message + unread) on a fresh launch — without it the list stays
+        // blank until the user opens each chat, because state.messages is only
+        // populated by a history fetch. The reducer merges by id, so re-fetching
+        // the latest page is idempotent (already-shown messages are deduped).
         const active = activeRef.current;
-        const channels = new Set<string>(
-          Object.keys(stateRef.current.historyLoaded).filter((c) => stateRef.current.historyLoaded[c]),
-        );
+        const channels = new Set<string>([
+          ...(sessionRef.current?.channels ?? []),
+          ...Object.keys(stateRef.current.historyLoaded).filter((c) => stateRef.current.historyLoaded[c]),
+        ]);
         if (active) channels.add(active);
         for (const c of channels) requestHistory(c);
       }

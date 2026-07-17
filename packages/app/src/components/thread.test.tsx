@@ -52,11 +52,11 @@ describe('Thread', () => {
     act(() => { send('coordinator', 'outgoing'); });
     expect(await screen.findByText('outgoing')).toBeTruthy();
     expect(screen.getByTestId('tick-pending')).toBeTruthy();
-    await waitFor(() => expect(transport.sent).toHaveLength(1));
+    await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(1));
     act(() => {
       transport.emit(createEnvelope('ack', {
         from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
-        payload: { refId: transport.sent[0]!.id, status: 'received' },
+        payload: { refId: transport.sent.find((e) => e.kind === 'msg')!.id, status: 'received' },
       }));
     });
     await waitFor(() => expect(screen.getByTestId('tick-sent')).toBeTruthy());

@@ -36,6 +36,23 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
   });
 }
 
+/**
+ * Flatten markdown to a single line of plain text for one-line previews (the
+ * channel-list last-message subtitle). Strips emphasis/code markers, keeps
+ * link text and drops the URL, removes bullet markers, and collapses all
+ * whitespace (including newlines) to single spaces.
+ */
+export function toPlainText(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // [label](url) -> label
+    .replace(/`([^`]+)`/g, '$1')             // `code` -> code
+    .replace(/\*\*([^*]+)\*\*/g, '$1')       // **bold** -> bold
+    .replace(/\*([^*]+)\*/g, '$1')           // *italic* -> italic
+    .replace(/^\s*[-*]\s+/gm, '')            // bullet markers
+    .replace(/\s+/g, ' ')                    // collapse whitespace + newlines
+    .trim();
+}
+
 export function renderMarkdown(text: string): ReactNode {
   const lines = text.split('\n');
   const blocks: ReactNode[] = [];

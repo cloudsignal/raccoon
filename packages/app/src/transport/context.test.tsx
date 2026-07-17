@@ -556,6 +556,24 @@ describe('TransportProvider', () => {
     demoteSpy.mockRestore();
   });
 
+  it('requests history for every session channel on first connect so list previews hydrate before any chat is opened (#preview-hydration)', async () => {
+    const transport = new FakeTransport();
+    // Two channels the user has NEVER opened this session.
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['atlas', 'scout'], epoch: EPOCH });
+    render(
+      <TransportProvider makeTransport={() => transport}>
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+    // Without opening either channel, history must have been requested for BOTH
+    // (that is what fills state.messages -> the channel-list last-message preview).
+    await waitFor(() => {
+      expect(transport.sent.some((e) => e.kind === 'history.request' && e.channel === 'atlas')).toBe(true);
+      expect(transport.sent.some((e) => e.kind === 'history.request' && e.channel === 'scout')).toBe(true);
+    });
+  });
+
   it('re-requests history for loaded channels on reconnect so messages missed while offline appear (#10)', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
@@ -657,15 +675,15 @@ describe('TransportProvider', () => {
     // The row must not survive the wipe it raced: settled away rather than
     // left pending for a future session's drain() to pick up and send.
     expect(await outbox.listPending()).toEqual([]);
-    expect(transport.sent).toHaveLength(0);
+    expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(0);
   });
 
   it('sends optimistically, settles on ack', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
     act(() => { api.sendMessage('coordinator', 'hello'); });
-    await waitFor(() => expect(transport.sent).toHaveLength(1));
-    const sent = transport.sent[0]!;
+    await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(1));
+    const sent = transport.sent.find((e) => e.kind === 'msg')!;
     expect(sent.kind).toBe('msg');
     expect(api.state.messages['coordinator']![0]!.delivery).toBe('pending');
     act(() => {
@@ -758,7 +776,7 @@ describe('TransportProvider', () => {
     act(() => { transport.setStatus('closed'); transport.connected = false; });
     act(() => { api.sendMessage('coordinator', 'queued'); });
     await waitFor(() => expect(api.state.messages['coordinator']).toHaveLength(1));
-    expect(transport.sent).toHaveLength(0);
+    expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(0);
     await act(async () => { await transport.connect(); });
     await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(1));
   });
@@ -766,6 +784,9 @@ describe('TransportProvider', () => {
   it('requests history on reconnect for the active channel when it was opened offline', async () => {
     const transport = new FakeTransport();
     await mountPaired(transport);
+    // Boot already requested history for the session's channels (preview
+    // hydration); clear that so this test measures only the offline-open path.
+    transport.sent.length = 0;
     act(() => { transport.setStatus('closed'); transport.connected = false; });
     act(() => { api.openChannel('coordinator'); });
     expect(transport.sent.some((e) => e.kind === 'history.request')).toBe(false);
@@ -1019,8 +1040,8 @@ describe('TransportProvider', () => {
       );
       await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
       act(() => { api.sendMessage('coordinator', 'hello from host'); });
-      await waitFor(() => expect(transport.sent).toHaveLength(1));
-      const sent = transport.sent[0]!;
+      await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(1));
+      const sent = transport.sent.find((e) => e.kind === 'msg')!;
       expect(sent.kind).toBe('msg');
       expect(sent.from).toBe('user:u-host');
     });

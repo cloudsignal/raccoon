@@ -1,4 +1,5 @@
 import { channelMeta, TONES, appConfig } from '../config.js';
+import { toPlainText } from '../lib/markdown.js';
 import { useChat } from '../transport/context.js';
 import { PushBanner } from './push-banner.js';
 
@@ -33,7 +34,7 @@ export function ChannelList(props: { onOpen: (id: string) => void }) {
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[15px] font-semibold text-ink">{meta.label}</span>
-                <span className="block truncate text-sm text-ink-faint">{last ? last.text : meta.blurb}</span>
+                <span className="block truncate text-sm text-ink-faint">{last ? toPlainText(last.text) : meta.blurb}</span>
               </span>
               {unread > 0 ? (
                 <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-semibold text-white">
