@@ -17,11 +17,18 @@ So this example splits the deployment:
 If you'd rather run everything on one origin, skip Vercel and let the hub
 serve the PWA itself (its `staticDir` does exactly that).
 
-## Steps
+## One-click deploy
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fcloudsignal%2Fraccoon&project-name=raccoon-app&repository-name=raccoon)
+
+The repo ships a root [`vercel.json`](../../../vercel.json), so the clone
+builds and deploys the PWA with no configuration.
+
+## Manual steps (existing fork)
 
 1. Import the repo (or your fork) into Vercel.
-2. Copy [`vercel.json`](vercel.json) to the **repo root** of your fork — or
-   set the same values in the dashboard (*Settings → Build & Development*):
+2. The root `vercel.json` already sets everything; or configure the dashboard
+   (*Settings → Build & Development*):
    - **Build command**: `npm ci && BUILD_ID=$VERCEL_GIT_COMMIT_SHA npm run build:app`
    - **Output directory**: `packages/app/dist-standalone`
    - **Framework preset**: Other

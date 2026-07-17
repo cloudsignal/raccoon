@@ -62,7 +62,7 @@ if [ "$rc" -ge 2 ]; then
   echo "ERROR: grep failed (rc=$rc) scanning public docs — cannot verify (do NOT treat as clean)." >&2
   fail=1
 else
-  scan_out="$(printf '%s\n' "$raw_out" | grep -v 'github\.com/cloudsignal' || true)"
+  scan_out="$(printf '%s\n' "$raw_out" | grep -viE 'github\.com(/|%2F)cloudsignal' || true)"
   if [ -n "$scan_out" ]; then
     printf '%s\n' "$scan_out" >&2
     echo "ERROR: vendor/OAM naming found in public docs (above). Vendors arrive as plugins — reword or remove." >&2

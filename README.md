@@ -141,8 +141,8 @@ require a secure origin, and phones can't reach `ws://127.0.0.1`.
   Cloudflare Tunnel for HTTPS/WSS without opening ports, or serve the PWA
   from Cloudflare Pages.
 - [Vercel](examples/hosting/vercel/): host the static PWA on Vercel's CDN
-  while the hub (a long-lived WebSocket server) runs elsewhere, such as the
-  Railway or Tunnel setup.
+  (one-click deploy button included) while the hub (a long-lived WebSocket
+  server) runs elsewhere, such as the Railway or Tunnel setup.
 
 ## Packages
 
