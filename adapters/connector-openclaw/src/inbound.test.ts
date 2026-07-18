@@ -10,9 +10,27 @@ vi.mock('openclaw/plugin-sdk/channel-inbound', () => {
   };
 });
 
-// Import the mock AFTER vi.mock so we can configure per-test.
+// Mock the operator approvals gateway client (issue #5: card taps resolve
+// approvals DIRECTLY, without dispatching a chat turn on the session).
+vi.mock('openclaw/plugin-sdk/approval-gateway-runtime', () => {
+  return {
+    resolveApprovalOverGateway: vi.fn(),
+  };
+});
+
+// Import the mocks AFTER vi.mock so we can configure per-test.
 const { dispatchReplyFromConfigWithSettledDispatcher } = await import('openclaw/plugin-sdk/channel-inbound');
 const mockDispatch = vi.mocked(dispatchReplyFromConfigWithSettledDispatcher);
+const { resolveApprovalOverGateway } = await import('openclaw/plugin-sdk/approval-gateway-runtime');
+const mockResolveGateway = vi.mocked(resolveApprovalOverGateway);
+
+beforeEach(() => {
+  mockResolveGateway.mockReset();
+  mockResolveGateway.mockResolvedValue(undefined);
+  // Reset call history too: several tests assert mockDispatch was NOT called
+  // for the direct gateway path, which needs a clean slate per test.
+  mockDispatch.mockReset();
+});
 
 describe('buildRaccoonInboundRunner', () => {
   const opts: InboundRunnerOpts = {
@@ -119,15 +137,7 @@ describe('buildRaccoonInboundRunner', () => {
     expect(capturedBody).toContain('unknown-req');
   });
 
-  it('sends a REAL OpenClaw slash command (standalone, starting with "/") for a command-type approval choice (#R4-2)', async () => {
-    let capturedBody: string | undefined;
-    mockDispatch.mockImplementation(async (arg) => {
-      capturedBody = (arg.ctxPayload as { Body: string }).Body;
-      arg.dispatcher.sendFinalReply({ text: 'ok' });
-      arg.dispatcher.markComplete();
-      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
-    });
-
+  it('resolves an approve-command tap DIRECTLY over the approvals gateway — no chat turn dispatched (#5)', async () => {
     const store = createApprovalValueStore();
     store.remember('req-2', ctx.userId, new Map([
       ['Approve', { value: 'approve req-2 allow-once', isCommand: true }],
@@ -135,27 +145,29 @@ describe('buildRaccoonInboundRunner', () => {
 
     const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
     const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-2', choice: 'Approve' } };
-    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+    const chunks: string[] = [];
+    for await (const chunk of runner.run(approvalCtx)) chunks.push(chunk);
 
-    // Standalone message starting with '/' — the confirmed contract OpenClaw's
-    // command parser requires. Not wrapped in a bracket tag or any other text.
-    expect(capturedBody).toBe('/approve req-2 allow-once');
+    // Direct resolution: dispatching a /approve chat turn on the same
+    // sessionKey rebinds the session while the exec turn is blocked in
+    // waitDecision, dropping the completion follow-up (issue #5).
+    expect(mockResolveGateway).toHaveBeenCalledTimes(1);
+    expect(mockResolveGateway).toHaveBeenCalledWith({
+      cfg: opts.cfg,
+      approvalId: 'req-2',
+      decision: 'allow-once',
+      senderId: ctx.userId,
+      clientDisplayName: `Chat approval (raccoon:${ctx.userId})`,
+    });
+    expect(mockDispatch).not.toHaveBeenCalled();
+    // Success is silent: the forwarder's resolved payload is the confirmation.
+    expect(chunks).toEqual([]);
   });
 
-  it('a command value that already carries its leading slash is not double-slashed (#R5-2)', async () => {
-    let capturedBody: string | undefined;
-    mockDispatch.mockImplementation(async (arg) => {
-      capturedBody = (arg.ctxPayload as { Body: string }).Body;
-      arg.dispatcher.sendFinalReply({ text: 'ok' });
-      arg.dispatcher.markComplete();
-      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
-    });
-
+  it('an approve command that already carries its leading slash parses the same (#R5-2 lineage)', async () => {
     // OpenClaw supplies action.command WITH its leading slash; the stored
-    // value preserves it verbatim. Building the outgoing turn must normalize
-    // to exactly one '/', or the result ('//approve …') never matches
-    // OpenClaw's command parser and the approval silently becomes an
-    // ordinary message.
+    // value preserves it verbatim. The tap intercept must parse both forms
+    // to the same gateway resolution.
     const store = createApprovalValueStore();
     store.remember('req-4', ctx.userId, new Map([
       ['Approve', { value: '/approve req-4 allow-once', isCommand: true }],
@@ -165,7 +177,35 @@ describe('buildRaccoonInboundRunner', () => {
     const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-4', choice: 'Approve' } };
     for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
 
-    expect(capturedBody).toBe('/approve req-4 allow-once');
+    expect(mockResolveGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: 'req-4', decision: 'allow-once' }),
+    );
+    expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
+  it('a NON-approve command choice still dispatches as a standalone slash command, single-slashed (#R4-2/#R5-2)', async () => {
+    let capturedBody: string | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      capturedBody = (arg.ctxPayload as { Body: string }).Body;
+      arg.dispatcher.sendFinalReply({ text: 'ok' });
+      arg.dispatcher.markComplete();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
+    });
+
+    // '/deny deploy-9' is a command but NOT `approve <id> <decision>` — it
+    // keeps the ordinary dispatch path (OpenClaw's command parser handles it),
+    // normalized to exactly one leading slash.
+    const store = createApprovalValueStore();
+    store.remember('req-4b', ctx.userId, new Map([
+      ['Deny', { value: '/deny deploy-9', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = { ...ctx, text: 'Deny', approval: { refId: 'req-4b', choice: 'Deny' } };
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+
+    expect(capturedBody).toBe('/deny deploy-9');
+    expect(mockResolveGateway).not.toHaveBeenCalled();
   });
 
   it('does NOT send a command-type choice as a slash command when the user edited the text instead (#R4-2)', async () => {
@@ -193,12 +233,12 @@ describe('buildRaccoonInboundRunner', () => {
     expect(capturedBody).toContain('my custom reply');
   });
 
-  it('competing responses to one approval cannot both dispatch commands — the loser degrades to the bracket tag (#R6-1)', async () => {
+  it('competing responses to one approval cannot both act — the loser degrades to the bracket tag (#R6-1)', async () => {
     // The bridge dedups by ENVELOPE id, not refId, so two distinct clicks
     // (Allow, then Deny — two envelopes, same refId) both reach the runner.
-    // With resolution-as-reservation, only the first becomes a real slash
-    // command; the second must degrade to the non-command bracket tag, never
-    // a competing /deny alongside an already-dispatched /approve.
+    // With resolution-as-reservation, only the first resolves the approval
+    // (now directly over the gateway); the second must degrade to the
+    // non-command bracket tag, never a competing decision.
     const bodies: string[] = [];
     mockDispatch.mockImplementation(async (arg) => {
       bodies.push((arg.ctxPayload as { Body: string }).Body);
@@ -217,46 +257,35 @@ describe('buildRaccoonInboundRunner', () => {
     const allow = { ...ctx, text: 'Allow', approval: { refId: 'req-7', choice: 'Allow' } };
     const deny = { ...ctx, text: 'Deny', approval: { refId: 'req-7', choice: 'Deny' } };
 
-    // CONCURRENT turns — the reviewer's exact repro: both resolves happen
-    // before either turn finishes (so before any commit). The bridge does
-    // not serialize per-user turns, so this interleaving is real. Gate the
-    // first dispatch open only once the second turn has also dispatched.
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>((r) => { releaseFirst = r; });
-    mockDispatch.mockReset();
-    mockDispatch
-      .mockImplementationOnce(async (arg) => {
-        bodies.push((arg.ctxPayload as { Body: string }).Body);
-        await firstGate; // park mid-turn, resolution already taken
-        arg.dispatcher.sendFinalReply({ text: 'ok' });
-        arg.dispatcher.markComplete();
-        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
-      })
-      .mockImplementationOnce(async (arg) => {
-        bodies.push((arg.ctxPayload as { Body: string }).Body);
-        arg.dispatcher.sendFinalReply({ text: 'ok' });
-        arg.dispatcher.markComplete();
-        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
-      });
+    // CONCURRENT taps: park Allow's gateway resolution mid-flight (its
+    // reservation already taken) while Deny arrives. Deny's resolve() finds
+    // the entry reserved and degrades to the bracket tag.
+    let releaseAllow!: () => void;
+    const allowGate = new Promise<void>((r) => { releaseAllow = r; });
+    mockResolveGateway.mockImplementationOnce(async () => { await allowGate; });
 
     const allowDone = (async () => { for await (const _chunk of runner.run(allow)) { /* drain */ } })();
-    await new Promise((r) => setTimeout(r, 10)); // Allow's turn has resolved + dispatched, parked at the gate
+    await new Promise((r) => setTimeout(r, 10)); // Allow reserved + parked in gateway resolution
     const denyDone = (async () => { for await (const _chunk of runner.run(deny)) { /* drain */ } })();
-    await new Promise((r) => setTimeout(r, 10)); // Deny's turn resolves + dispatches while Allow is mid-turn
-    releaseFirst();
+    await new Promise((r) => setTimeout(r, 10)); // Deny degraded + dispatched while Allow is mid-flight
+    releaseAllow();
     await Promise.all([allowDone, denyDone]);
 
-    expect(bodies[0]).toBe('/approve req-7 allow-once');
-    expect(bodies[1]).not.toMatch(/^\//); // degraded, not a competing command
-    expect(bodies[1]).toContain('req-7'); // still correlated for the agent
+    expect(mockResolveGateway).toHaveBeenCalledTimes(1); // only Allow acted
+    expect(mockResolveGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: 'req-7', decision: 'allow-once' }),
+    );
+    expect(bodies).toHaveLength(1); // only the degraded loser dispatched a turn
+    expect(bodies[0]).not.toMatch(/^\//); // degraded, not a competing command
+    expect(bodies[0]).toContain('req-7'); // still correlated for the agent
   });
 
-  it('an edited response does not reserve the approval, so a concurrent real click still resolves the command (#R6-1b)', async () => {
-    // An edited free-text response can NEVER execute the command (it goes out
+  it('an edited response does not reserve the approval, so a concurrent real click still resolves it (#R6-1b)', async () => {
+    // An edited free-text response can NEVER act on the approval (it goes out
     // as bracket text). Reserving the approval for the duration of its
     // (potentially long) turn would make a concurrent real Allow degrade to
-    // ordinary text and get a successful ack while the edit later rolls back.
-    // The edit must not reserve at all.
+    // ordinary text while the edit later rolls back. The edit must not
+    // reserve at all.
     const bodies: string[] = [];
     let releaseEdit!: () => void;
     const editGate = new Promise<void>((r) => { releaseEdit = r; });
@@ -264,12 +293,6 @@ describe('buildRaccoonInboundRunner', () => {
       .mockImplementationOnce(async (arg) => { // the edited turn — parks mid-flight
         bodies.push((arg.ctxPayload as { Body: string }).Body);
         await editGate;
-        arg.dispatcher.sendFinalReply({ text: 'ok' });
-        arg.dispatcher.markComplete();
-        return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
-      })
-      .mockImplementationOnce(async (arg) => { // the concurrent real Allow
-        bodies.push((arg.ctxPayload as { Body: string }).Body);
         arg.dispatcher.sendFinalReply({ text: 'ok' });
         arg.dispatcher.markComplete();
         return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } } as DispatchFromConfigResult;
@@ -290,13 +313,15 @@ describe('buildRaccoonInboundRunner', () => {
     await new Promise((r) => setTimeout(r, 10)); // edit turn is parked mid-flight
 
     // The real Allow click, while the edit is still running: it must resolve
-    // the command, not find the approval reserved and degrade.
+    // the approval (directly over the gateway), not find it reserved.
     for await (const _ of runner.run({ ...ctx, text: 'Allow', approval: { refId: 'req-8', choice: 'Allow' } })) { /* drain */ }
     releaseEdit();
     await editTurn;
 
     expect(bodies[0]).not.toMatch(/^\//); // the edit went out as bracket text
-    expect(bodies[1]).toBe('/approve req-8 allow-once'); // the real click still executed
+    expect(mockResolveGateway).toHaveBeenCalledWith( // the real click still acted
+      expect.objectContaining({ approvalId: 'req-8', decision: 'allow-once' }),
+    );
   });
 
   it('an edited response is correlated to its refId only when it VALIDATES against the caller\'s own approval (#R7-CQ)', async () => {
@@ -335,7 +360,37 @@ describe('buildRaccoonInboundRunner', () => {
     expect(bodies[1]).not.toMatch(/^\//); // still not a command (edited)
   });
 
-  it('a transient dispatch failure does not burn the approval — the retry still resolves the command (#R5-8)', async () => {
+  it('a failed gateway resolution does not burn the approval — it yields an error line and a retry tap still resolves (#R5-8 lineage)', async () => {
+    mockResolveGateway
+      .mockRejectedValueOnce(new Error('unknown or expired approval id'))
+      .mockResolvedValueOnce(undefined);
+
+    const store = createApprovalValueStore();
+    store.remember('req-5', ctx.userId, new Map([
+      ['Approve', { value: 'approve req-5 allow-once', isCommand: true }],
+    ]));
+
+    const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
+    const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-5', choice: 'Approve' } };
+
+    // First tap: resolution fails. The user gets a plain error line (never a
+    // throw that would surface as a failed ack with no explanation), and the
+    // reservation rolls back — the entry is NOT consumed.
+    const chunks: string[] = [];
+    for await (const chunk of runner.run(approvalCtx)) chunks.push(chunk);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toContain('unknown or expired approval id');
+    expect(mockDispatch).not.toHaveBeenCalled();
+
+    // Retry tap: the mapping is still there and resolves again.
+    for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
+    expect(mockResolveGateway).toHaveBeenCalledTimes(2);
+    expect(mockResolveGateway).toHaveBeenLastCalledWith(
+      expect.objectContaining({ approvalId: 'req-5', decision: 'allow-once' }),
+    );
+  });
+
+  it('a transient dispatch failure does not burn a NON-approve command choice — the retry still dispatches it (#R5-8)', async () => {
     let capturedBody: string | undefined;
     mockDispatch
       .mockImplementationOnce(async () => { throw new Error('transient dispatch outage'); })
@@ -347,12 +402,12 @@ describe('buildRaccoonInboundRunner', () => {
       });
 
     const store = createApprovalValueStore();
-    store.remember('req-5', ctx.userId, new Map([
-      ['Approve', { value: 'approve req-5 allow-once', isCommand: true }],
+    store.remember('req-5b', ctx.userId, new Map([
+      ['Deny', { value: 'deny deploy-5b', isCommand: true }],
     ]));
 
     const runner = buildRaccoonInboundRunner({ ...opts, approvalValues: store });
-    const approvalCtx = { ...ctx, text: 'Approve', approval: { refId: 'req-5', choice: 'Approve' } };
+    const approvalCtx = { ...ctx, text: 'Deny', approval: { refId: 'req-5b', choice: 'Deny' } };
     // First attempt: dispatch throws. The store entry must NOT have been
     // consumed — nothing was actually delivered to OpenClaw.
     await expect(async () => {
@@ -362,7 +417,7 @@ describe('buildRaccoonInboundRunner', () => {
     // Retry (the bridge redelivers / the user clicks again): still resolves
     // to the real slash command instead of degrading to the bracket tag.
     for await (const _chunk of runner.run(approvalCtx)) { /* drain */ }
-    expect(capturedBody).toBe('/approve req-5 allow-once');
+    expect(capturedBody).toBe('/deny deploy-5b');
   });
 
   it('an edited response does not consume the command mapping — a later real click still resolves it (#R5-8)', async () => {
@@ -388,12 +443,16 @@ describe('buildRaccoonInboundRunner', () => {
     };
     for await (const _chunk of runner.run(edited)) { /* drain */ }
 
-    // Then actually clicks Approve. The mapping must still be there.
+    // Then actually clicks Approve. The mapping must still be there, and it
+    // resolves directly over the gateway (no second turn on the session).
     const clicked = { ...ctx, text: 'Approve', approval: { refId: 'req-6', choice: 'Approve' } };
     for await (const _chunk of runner.run(clicked)) { /* drain */ }
 
     expect(bodies[0]).not.toMatch(/^\//);
-    expect(bodies[1]).toBe('/approve req-6 allow-once');
+    expect(bodies).toHaveLength(1); // the click did not dispatch a turn
+    expect(mockResolveGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: 'req-6', decision: 'allow-once' }),
+    );
   });
 
   it('skips sendBlockReply and sendToolResult payloads', async () => {

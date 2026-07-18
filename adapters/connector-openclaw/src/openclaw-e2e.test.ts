@@ -43,8 +43,16 @@ import type { DispatchFromConfigResult } from './openclaw-missing-types.js';
 vi.mock('openclaw/plugin-sdk/channel-inbound', () => ({
   dispatchReplyFromConfigWithSettledDispatcher: vi.fn(),
 }));
+// And the operator approvals gateway client — a real dial needs a live
+// gateway. Card taps on `approve <id> <decision>` commands resolve through
+// THIS (issue #5: no chat turn on the session), so the e2e asserts the call.
+vi.mock('openclaw/plugin-sdk/approval-gateway-runtime', () => ({
+  resolveApprovalOverGateway: vi.fn(async () => undefined),
+}));
 const { dispatchReplyFromConfigWithSettledDispatcher } = await import('openclaw/plugin-sdk/channel-inbound');
 const mockDispatch = vi.mocked(dispatchReplyFromConfigWithSettledDispatcher);
+const { resolveApprovalOverGateway } = await import('openclaw/plugin-sdk/approval-gateway-runtime');
+const mockResolveGateway = vi.mocked(resolveApprovalOverGateway);
 
 // Connector under test (real code; picks up the hoisted mock via inbound.ts).
 import { buildRaccoonInboundRunner } from './inbound.js';
@@ -200,12 +208,16 @@ describe('OpenClaw connector e2e (real hub + client + connector; only the model 
     await client.send(userMsg('hi'));
     await waitUntil(() => received.some((e) => e.kind === 'msg' && e.payload.text === 'reply:hi'));
 
-    // 4 + 5a. Approval request → ALLOW resolves to the REAL /command.
+    // 4 + 5a. Approval request → ALLOW resolves DIRECTLY over the approvals
+    // gateway (issue #5: never a /approve chat turn, which would rebind the
+    // session while the exec turn is blocked in waitDecision).
     const refAllow = await raiseApproval(outbound, received, 'Deploy deploy-42 to prod?', 'deploy-42');
     expect(received.find(isApprovalRequest)!.payload.options).toEqual(['Allow', 'Deny']);
     dispatchedBodies.length = 0;
+    mockResolveGateway.mockClear();
     await client.send(approvalResponse(refAllow, 'Allow'));
-    await waitUntil(() => dispatchedBodies.includes('/approve deploy-42 allow-once'));
+    await waitUntil(() => mockResolveGateway.mock.calls.some((c) => c[0].approvalId === 'deploy-42' && c[0].decision === 'allow-once'));
+    expect(dispatchedBodies).toEqual([]); // no chat turn for the tap
 
     // 5b. DENY (fresh approval — a resolve is one-shot) → the REAL deny command.
     const refDeny = await raiseApproval(outbound, received, 'Deploy deploy-43?', 'deploy-43');
@@ -270,10 +282,13 @@ describe('OpenClaw connector e2e (real hub + client + connector; only the model 
     expect(card.payload.description).toContain('date');
     expect(card.payload.options).toEqual(['Allow Once', 'Allow Always', 'Deny']);
 
-    // Tap "Allow Once" → the REAL native approve command reaches dispatch.
+    // Tap "Allow Once" → resolved DIRECTLY over the approvals gateway
+    // (issue #5), with no chat turn dispatched on the session.
     dispatchedBodies.length = 0;
+    mockResolveGateway.mockClear();
     await client.send(approvalResponse(card.payload.refId, 'Allow Once'));
-    await waitUntil(() => dispatchedBodies.includes('/approve apr-e2e-1 allow-once'));
+    await waitUntil(() => mockResolveGateway.mock.calls.some((c) => c[0].approvalId === 'apr-e2e-1' && c[0].decision === 'allow-once'));
+    expect(dispatchedBodies).toEqual([]);
 
     // The resolved payload is plain text → an ordinary msg bubble.
     received.length = 0;

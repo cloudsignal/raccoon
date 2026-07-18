@@ -16,6 +16,7 @@
 
 import type { AgentContext, AgentRunner } from '@raccoon/bridge';
 import { dispatchReplyFromConfigWithSettledDispatcher } from 'openclaw/plugin-sdk/channel-inbound';
+import { resolveApprovalOverGateway } from 'openclaw/plugin-sdk/approval-gateway-runtime';
 import type {
   FinalizedMsgContext,
   ReplyDispatchKind,
@@ -107,6 +108,41 @@ export function buildRaccoonInboundRunner(
  * carrying the refId, so OpenClaw still sees which pending request this turn
  * answers instead of an unrelated-looking message.
  */
+/**
+ * Parse an exec/plugin approval slash command (`/approve <id> <decision>`)
+ * from a resolved BUTTON value. Returns null for anything else — including
+ * `/deny <id>` and other commands, which keep the ordinary dispatch path.
+ *
+ * Why this exists (raccoon issue #5): sending the tap as a `/approve` CHAT
+ * TURN dispatches on the same sessionKey while the exec turn is still blocked
+ * in `exec.approval.waitDecision`. That second dispatch REBINDS the session
+ * id, so OpenClaw drops the exec completion follow-up as stale ("session
+ * rebound … before the approval resolved") — the approved command runs but
+ * its output never reaches the chat. Card taps therefore resolve the
+ * approval DIRECTLY over the operator approvals gateway (the same
+ * `resolveApprovalOverGateway` call OpenClaw's own /approve handler makes),
+ * with no turn on the user's session: the original turn stays bound,
+ * waitDecision resolves in-turn, and the agent's own reply carries the
+ * output.
+ *
+ * Authorization note: this path is reachable only from a CARD TAP, which the
+ * approval-value store has already validated (user-scoped to whom the card
+ * was sent, expires with the approval, single-use reservation). A hand-TYPED
+ * `/approve …` message never reaches here — it flows through the ordinary
+ * dispatch into OpenClaw's command handler and its authorization chain.
+ */
+const APPROVE_DECISIONS = new Set(['allow-once', 'allow-always', 'deny']);
+
+export function parseApproveCommand(
+  value: string,
+): { id: string; decision: 'allow-once' | 'allow-always' | 'deny' } | null {
+  const tokens = value.replace(/^\/+/, '').trim().split(/\s+/);
+  if (tokens.length !== 3) return null;
+  const [cmd, id, decision] = tokens;
+  if (cmd !== 'approve' || !id || !decision || !APPROVE_DECISIONS.has(decision)) return null;
+  return { id, decision: decision as 'allow-once' | 'allow-always' | 'deny' };
+}
+
 function buildApprovalText(
   approval: NonNullable<AgentContext['approval']>,
   resolved: ApprovalChoice | undefined,
@@ -185,6 +221,36 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
   const resolvedApproval = ctx.approval && ctx.approval.editedText === undefined
     ? opts.approvalValues?.resolve(ctx.approval.refId, ctx.userId, ctx.approval.choice)
     : undefined;
+
+  // Card tap on an exec/plugin approval → resolve DIRECTLY over the operator
+  // approvals gateway instead of dispatching a `/approve` chat turn. The chat
+  // turn rebinds the session while the exec turn is blocked in waitDecision,
+  // which drops the completion follow-up (issue #5) — see parseApproveCommand
+  // for the full rationale. On success we yield NOTHING: the exec-approval
+  // forwarder delivers the resolved payload ("Exec approval allowed once by
+  // …") through the outbound, and the original turn continues with the exec
+  // output as the agent's own reply. On failure the reservation rolls back
+  // (a retry tap can resolve again) and the user gets a plain error line.
+  const approveCmd = resolvedApproval?.choice.isCommand
+    ? parseApproveCommand(resolvedApproval.choice.value)
+    : null;
+  if (resolvedApproval && approveCmd) {
+    try {
+      await resolveApprovalOverGateway({
+        cfg: opts.cfg,
+        approvalId: approveCmd.id,
+        decision: approveCmd.decision,
+        senderId: ctx.userId,
+        clientDisplayName: `Chat approval (raccoon:${ctx.userId})`,
+      });
+      resolvedApproval.commit();
+    } catch (err) {
+      resolvedApproval.rollback();
+      const reason = err instanceof Error ? err.message : String(err);
+      yield `Could not submit the approval (${approveCmd.decision}): ${reason}`;
+    }
+    return;
+  }
   // #R7-CQ: an EDITED response never reserves (above), but it must still be a
   // VALIDATED answer to this user's own, still-valid, real approval before it
   // is correlated to that refId. Otherwise a crafted edit could tag itself to
