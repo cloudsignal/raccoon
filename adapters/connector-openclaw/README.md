@@ -210,12 +210,21 @@ Requirements, both handled by `openclaw raccoon setup`:
   request back to the conversation that started the turn). Without it,
   OpenClaw never forwards exec approvals to ANY chat channel.
 - An exec-approval policy that actually prompts — `openclaw approvals set`
-  with `ask: on-miss` (or `always`). The default `ask: off` auto-runs.
+  with `ask: on-miss` (or `always`). With `ask: off` (the default) OpenClaw
+  never requests approval; the configured `security` policy alone decides
+  whether the command runs or is denied.
 
-Approval authorization is the channel gate itself: Raccoon is a 1:1
-paired-device DM channel, so the user in the conversation is the approver —
-the same trust model as answering the prompt in the terminal that started the
-run. The plugin registers no extra `authorizeActorAction`.
+Authorization model, stated precisely: the plugin registers no
+`authorizeActorAction`, so OpenClaw treats any command-authorized Raccoon
+sender (paired device + `allowFrom`) as able to resolve any approval ID they
+know via a typed `/approve` command. Card buttons are stricter than typed
+commands: the tap-to-command mapping in the approval-value store is scoped to
+the user the card was sent to, expires with the approval, and is single-use.
+The hub supports multiple users and multiple paired devices; deployments that
+need typed `/approve` restricted to specific approvers should configure
+OpenClaw's `commands.allowFrom.raccoon`, and a stricter explicit approver
+policy on the channel can be added later if multi-user deployments require
+it.
 
 ## Running the smoke test (Docker)
 

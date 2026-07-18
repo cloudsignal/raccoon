@@ -811,4 +811,61 @@ describe('createRaccoonOutbound', () => {
     if (env.kind === 'approval.request') expect(env.payload.options).toEqual(['Yes', 'No']);
     expect(result.messageId).toBe(env.id);
   });
+
+  // ---- approval expiry threading (exec approvals outlive the default TTL) ----
+
+  it('passes channelData.raccoonApproval.expiresAtMs through to approvalValues.remember (presentation path)', async () => {
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator',
+      approvalValues: { remember, resolve: () => undefined, validate: () => false },
+    });
+    const expiresAtMs = 1_700_000_000_000 + 30 * 60_000;
+    await adapter.sendPayload!({
+      ...makeCtx('Exec approval required', 'user:alice'),
+      payload: {
+        text: 'Exec approval required',
+        presentation: { blocks: [{ type: 'buttons' as const, buttons: [{ label: 'Allow Once', action: { type: 'command' as const, command: '/approve apr-1 allow-once' } }] }] },
+        channelData: { raccoonApproval: { expiresAtMs } },
+      },
+    });
+    expect(remember).toHaveBeenCalledTimes(1);
+    expect(remember.mock.calls[0]![3]).toBe(expiresAtMs);
+  });
+
+  it('remember gets NO expiry override when channelData carries no raccoonApproval metadata', async () => {
+    const remember = vi.fn();
+    const adapter = createRaccoonOutbound({
+      hub, channel: 'coordinator',
+      approvalValues: { remember, resolve: () => undefined, validate: () => false },
+    });
+    await adapter.sendPayload!({
+      ...makeCtx('Confirm?', 'user:alice'),
+      payload: {
+        text: 'Confirm?',
+        presentation: { blocks: [{ type: 'buttons' as const, buttons: [{ label: 'Yes' }, { label: 'No' }] }] },
+      },
+    });
+    expect(remember).toHaveBeenCalledTimes(1);
+    expect(remember.mock.calls[0]![3]).toBeUndefined();
+  });
+
+  it('ignores a malformed raccoonApproval.expiresAtMs (non-numeric / non-finite / non-positive)', async () => {
+    for (const bad of ['soon', Number.NaN, Infinity, 0, -5]) {
+      const remember = vi.fn();
+      const adapter = createRaccoonOutbound({
+        hub: makeFakeHub(), channel: 'coordinator',
+        approvalValues: { remember, resolve: () => undefined, validate: () => false },
+      });
+      await adapter.sendPayload!({
+        ...makeCtx('Exec?', 'user:alice'),
+        payload: {
+          text: 'Exec?',
+          presentation: { blocks: [{ type: 'buttons' as const, buttons: [{ label: 'Yes' }] }] },
+          channelData: { raccoonApproval: { expiresAtMs: bad } },
+        },
+      });
+      expect(remember.mock.calls[0]![3]).toBeUndefined();
+    }
+  });
 });

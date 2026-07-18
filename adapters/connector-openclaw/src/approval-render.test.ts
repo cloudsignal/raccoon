@@ -100,6 +100,12 @@ describe('buildRaccoonExecPendingPayload', () => {
     expect(payload.text).toContain('rm -rf ./build && npm run dist');
     expect(payload.text).toContain('/approve apr-123 allow-once|allow-always|deny');
   });
+
+  it('stows the request absolute expiry in channelData for the outbound to align the value-store TTL', () => {
+    const request = makeRequest();
+    const payload = buildRaccoonExecPendingPayload({ request, nowMs: NOW });
+    expect(payload.channelData).toEqual({ raccoonApproval: { expiresAtMs: request.expiresAtMs } });
+  });
 });
 
 describe('buildRaccoonExecResolvedPayload', () => {

@@ -59,7 +59,14 @@ export function ApprovalCard(props: { msg: ChatMessage }) {
           className="w-full rounded-[10px] border border-line bg-surface p-2.5 text-[13.5px] leading-normal text-ink outline-none focus:border-primary"
         />
       ) : (
-        <div className="rounded-[10px] bg-surface-dim px-3 py-2.5 text-[13.5px] leading-normal text-ink">
+        // whitespace-pre-wrap + font-mono + bounded scroll: the description can
+        // be a shell command awaiting approval (OpenClaw exec approvals). A
+        // plain div lets the browser collapse repeated spaces/tabs/newlines,
+        // so what the user reads could differ from what will execute — an
+        // approval UI must render it faithfully. break-words keeps unbroken
+        // tokens from forcing horizontal overflow; max-h + overflow-y-auto
+        // keeps long commands scrollable INSIDE the card.
+        <div className="max-h-48 overflow-y-auto rounded-[10px] bg-surface-dim px-3 py-2.5 font-mono text-[12.5px] leading-normal text-ink whitespace-pre-wrap break-words">
           {approval.description}
         </div>
       )}

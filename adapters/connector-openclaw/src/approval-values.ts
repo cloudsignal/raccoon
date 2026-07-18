@@ -92,8 +92,17 @@ export interface ResolvedApproval {
 
 export interface ApprovalValueStore {
   /** Record the label -> choice mapping for one approval.request, scoped to
-   *  the userId it was sent to. */
-  remember(refId: string, userId: string, labelToChoice: ReadonlyMap<string, ApprovalChoice>): void;
+   *  the userId it was sent to.
+   *
+   *  `expiresAtMs` (absolute epoch ms), when given, replaces the store's
+   *  default TTL for THIS entry. This matters for OpenClaw exec approvals:
+   *  their default timeout is 30 minutes while the store's default TTL is 10
+   *  — with the fixed TTL, a card tapped between minutes 10 and 30 looked
+   *  valid (OpenClaw still pending) but the label→command mapping was gone,
+   *  so the tap degraded to bracket text and the approval never resolved.
+   *  The renderer knows the request's real expiresAtMs; passing it through
+   *  keeps the buttons resolvable exactly as long as the approval itself. */
+  remember(refId: string, userId: string, labelToChoice: ReadonlyMap<string, ApprovalChoice>, expiresAtMs?: number): void;
   /**
    * Atomically RESERVE the choice for a (refId, userId, label) triple
    * (#R6-1). Returns undefined — the caller must treat the response as
@@ -121,15 +130,17 @@ export interface ApprovalValueStore {
 
 interface StoredApproval {
   userId: string;
-  issuedAt: number;
+  /** Absolute expiry (epoch ms): the request's own expiresAtMs when the
+   *  caller supplied one, otherwise issue time + the store's default TTL. */
+  expiresAt: number;
   choices: ReadonlyMap<string, ApprovalChoice>;
 }
 
 export function createApprovalValueStore(cap = DEFAULT_CAP, ttlMs = DEFAULT_TTL_MS): ApprovalValueStore {
   const byRefId = new Map<string, StoredApproval>();
   return {
-    remember(refId, userId, choices) {
-      byRefId.set(refId, { userId, issuedAt: Date.now(), choices });
+    remember(refId, userId, choices, expiresAtMs) {
+      byRefId.set(refId, { userId, expiresAt: expiresAtMs ?? Date.now() + ttlMs, choices });
       if (byRefId.size > cap) {
         const oldest = byRefId.keys().next().value;
         if (oldest !== undefined) byRefId.delete(oldest);
@@ -139,7 +150,7 @@ export function createApprovalValueStore(cap = DEFAULT_CAP, ttlMs = DEFAULT_TTL_
       const stored = byRefId.get(refId);
       if (!stored) return false;
       if (stored.userId !== userId) return false;                 // ownership
-      if (Date.now() - stored.issuedAt > ttlMs) return false;     // TTL (read-only: don't evict here)
+      if (Date.now() > stored.expiresAt) return false;            // expiry (read-only: don't evict here)
       return stored.choices.has(label);                           // exact-choice
     },
     resolve(refId, userId, label) {
@@ -149,7 +160,7 @@ export function createApprovalValueStore(cap = DEFAULT_CAP, ttlMs = DEFAULT_TTL_
       // someone else's refId must not be able to destroy their still-pending
       // approval as a side effect.
       if (stored.userId !== userId) return undefined;
-      if (Date.now() - stored.issuedAt > ttlMs) {
+      if (Date.now() > stored.expiresAt) {
         byRefId.delete(refId); // stale: safe to evict on the way out
         return undefined;
       }

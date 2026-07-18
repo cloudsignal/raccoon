@@ -46,6 +46,42 @@ describe('ApprovalCard', () => {
     expect(screen.getByRole('button', { name: 'Skip' })).toBeTruthy();
   });
 
+  it('renders the description with preserved whitespace, monospace, and bounded scroll (exec commands)', async () => {
+    // An exec-approval description IS the command awaiting approval. A plain
+    // div would let the browser collapse the double space and the newlines,
+    // making what the user reads differ from what will execute.
+    const command = 'echo  two-spaces\n\trm -rf ./build\nnpm run dist';
+    const transport = new FakeTransport();
+    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    render(
+      <TransportProvider makeTransport={() => transport}>
+        <Thread channel="coordinator" />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(transport.connected).toBe(true));
+    act(() => {
+      transport.emit(createEnvelope('approval.request', {
+        from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+        payload: {
+          refId: 'exec-1',
+          title: 'Exec approval required',
+          description: command,
+          options: ['Allow Once', 'Deny'],
+        },
+      }));
+    });
+    await screen.findByText('Exec approval required');
+
+    // The raw text (incl. repeated spaces, tab, newlines) reaches the DOM
+    // untouched…
+    const box = screen.getByText((_, el) => el?.textContent === command && el?.tagName === 'DIV');
+    // …and the container's classes preserve it visually and keep long
+    // commands scrolling INSIDE the card.
+    for (const cls of ['whitespace-pre-wrap', 'font-mono', 'break-words', 'max-h-48', 'overflow-y-auto']) {
+      expect(box.className).toContain(cls);
+    }
+  });
+
   it('sends approval.response on approve and collapses to a status line', async () => {
     const transport = await mount();
     await userEvent.setup().click(screen.getByRole('button', { name: 'Approve' }));

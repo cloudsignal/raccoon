@@ -57,6 +57,15 @@ import type {
 // documented way OpenClaw's command parser resolves an approval.
 // ---------------------------------------------------------------------------
 
+/**
+ * channelData key carrying raccoon-private approval metadata from the render
+ * hook to the outbound adapter ({ expiresAtMs }). Namespaced like
+ * RACCOON_PRESENTATION_KEY in outbound.ts, and for the same reason: core
+ * retains channelData through delivery, so it is the only reliable carrier
+ * between the forwarder's render step and the channel's send step.
+ */
+export const RACCOON_APPROVAL_META_KEY = 'raccoonApproval';
+
 const DECISION_META: ReadonlyArray<{
   decision: 'allow-once' | 'allow-always' | 'deny';
   label: string;
@@ -143,7 +152,16 @@ export function buildRaccoonExecPendingPayload(params: {
     `Reply with: /approve ${request.id} ${decisions}`,
   ].join('\n');
 
-  return { text, presentation };
+  // The request's ABSOLUTE expiry rides channelData so the outbound can align
+  // the approval-value store's entry lifetime with the approval itself. The
+  // store's default TTL (10m) is shorter than OpenClaw's default exec-approval
+  // timeout (30m); without this, a card tapped between those two marks looked
+  // valid but its label→command mapping was already gone.
+  return {
+    text,
+    presentation,
+    channelData: { [RACCOON_APPROVAL_META_KEY]: { expiresAtMs: request.expiresAtMs } },
+  };
 }
 
 const DECISION_LABEL: Record<string, string> = {
@@ -168,11 +186,16 @@ export function buildRaccoonExecResolvedPayload(params: {
 /**
  * The channel approval capability the raccoonChannelPlugin registers.
  * render-only on purpose:
- *   - no authorizeActorAction — Raccoon is a 1:1 paired-device DM channel;
- *     the pairing + allowFrom gate that admitted the sender IS the approval
- *     authorization (OpenClaw's /approve handler defaults to authorized when
- *     a channel registers no authorizeActorAction — same-chat trust model,
- *     identical to approving from the terminal that started the run).
+ *   - no authorizeActorAction — OpenClaw's /approve handler defaults to
+ *     authorized when a channel registers none, so ANY command-authorized
+ *     Raccoon sender (paired device + allowFrom) may resolve an approval ID
+ *     they know via a typed /approve command. Card TAPS are stricter: the
+ *     approval-value mapping is scoped to the user the card was sent to,
+ *     expires with the approval, and is single-use. The hub supports
+ *     multiple users/devices; operators needing typed commands restricted
+ *     too should set OpenClaw's commands.allowFrom.raccoon, and an explicit
+ *     approver policy here is a possible follow-up for multi-user
+ *     deployments.
  *   - no delivery/nativeRuntime — delivery rides the exec-approval
  *     forwarder + the channel's ordinary outbound; there is no separate
  *     native approval transport to manage.

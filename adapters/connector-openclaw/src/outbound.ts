@@ -43,6 +43,7 @@ import {
 import type { OutboundHub } from '@raccoon/bridge';
 import { chunkReplyText } from './formatting.js';
 import type { ApprovalChoice, ApprovalValueStore } from './approval-values.js';
+import { RACCOON_APPROVAL_META_KEY } from './approval-render.js';
 import type {
   ChannelOutboundAdapter,
   ChannelOutboundContext,
@@ -293,6 +294,7 @@ async function deliverPresentation(
   userId: string,
   presentation: MessagePresentation,
   fallbackText: string,
+  approvalExpiresAtMs?: number,
 ): Promise<OutboundDeliveryResult> {
   const buttons = findPresentationButtons(presentation);
   const selectOptions = buttons === null ? findPresentationSelect(presentation) : null;
@@ -316,7 +318,7 @@ async function deliverPresentation(
       channel,
       payload: { refId, title, description, options: choices.map((c) => c.label) },
     });
-    approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])));
+    approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])), approvalExpiresAtMs);
     hub.sendToUser(userId, env);
     return makeResult(env.id, channel);
   }
@@ -357,6 +359,23 @@ function presentationFromChannelData(channelData: unknown): MessagePresentation 
     return asMessagePresentation((channelData as Record<string, unknown>)[RACCOON_PRESENTATION_KEY]);
   }
   return null;
+}
+
+/** Recover the approval's ABSOLUTE expiry (epoch ms) the render hook stowed
+ *  in channelData (approval-render.ts), or undefined when this payload is not
+ *  a raccoon-rendered exec approval. Used to align the approval-value store's
+ *  entry lifetime with the approval itself: the store's default TTL (10m) is
+ *  shorter than OpenClaw's default exec-approval timeout (30m), and a card
+ *  that outlives its mapping degrades taps to bracket text. */
+function approvalExpiryFromChannelData(channelData: unknown): number | undefined {
+  if (channelData && typeof channelData === 'object') {
+    const meta = (channelData as Record<string, unknown>)[RACCOON_APPROVAL_META_KEY];
+    if (meta && typeof meta === 'object') {
+      const v = (meta as Record<string, unknown>)['expiresAtMs'];
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+    }
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +431,11 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
     const userId = parseRaccoonUserId(ctx.to);
     const payload = ctx.payload;
 
+    // Raccoon-rendered exec approvals carry their ABSOLUTE expiry in
+    // channelData (see approval-render.ts); align the value-store entry's
+    // lifetime with it on whichever mapping path runs below.
+    const approvalExpiresAtMs = approvalExpiryFromChannelData(payload.channelData);
+
     // Normalise the interactive field.
     const interactive = payload.interactive as InteractiveReply | undefined;
 
@@ -441,7 +465,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
             options: choices.map((c) => c.label),
           },
         });
-        approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])));
+        approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])), approvalExpiresAtMs);
         hub.sendToUser(userId, env);
         return makeResult(env.id, channel);
       }
@@ -476,7 +500,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
       ?? asMessagePresentation(payload.presentation);
     if (presentation) {
       const fallbackText = typeof payload.text === 'string' && payload.text.length > 0 ? payload.text : ctx.text;
-      return deliverPresentation(hub, channel, approvalValues, userId, presentation, fallbackText);
+      return deliverPresentation(hub, channel, approvalValues, userId, presentation, fallbackText, approvalExpiresAtMs);
     }
 
     // No interactive/presentation — plain text path (same logic as sendText).

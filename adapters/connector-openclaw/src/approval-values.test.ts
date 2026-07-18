@@ -140,6 +140,54 @@ describe('createApprovalValueStore', () => {
     }
   });
 
+  // An explicit expiresAtMs (the approval's OWN absolute expiry) replaces the
+  // default TTL for that entry. This is the OpenClaw exec-approval case: their
+  // default timeout is 30 minutes while the store default is 10 — a card
+  // tapped between those marks looked valid but its mapping was already gone.
+  it('a tap after the default TTL but before the request expiresAtMs still resolves', () => {
+    vi.useFakeTimers();
+    try {
+      const store = createApprovalValueStore(); // default 10m TTL
+      const expiresAtMs = Date.now() + 30 * 60_000; // OpenClaw default: 30m
+      store.remember('req-exec', 'alice', new Map([['Allow Once', approve]]), expiresAtMs);
+      vi.advanceTimersByTime(20 * 60_000); // minute 20: past default TTL, before expiry
+      expect(store.resolve('req-exec', 'alice', 'Allow Once')?.choice).toEqual(approve);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an explicit expiresAtMs is honored: resolve and validate fail after it, even under the default TTL', () => {
+    vi.useFakeTimers();
+    try {
+      const store = createApprovalValueStore(); // default 10m TTL
+      const expiresAtMs = Date.now() + 60_000; // this approval expires in 1m
+      store.remember('req-short', 'alice', new Map([['Allow Once', approve]]), expiresAtMs);
+      vi.advanceTimersByTime(60_001);
+      expect(store.validate('req-short', 'alice', 'Allow Once')).toBe(false);
+      expect(store.resolve('req-short', 'alice', 'Allow Once')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rollback() preserves the entry absolute expiry (a retry after rollback respects the original deadline)', () => {
+    vi.useFakeTimers();
+    try {
+      const store = createApprovalValueStore();
+      const expiresAtMs = Date.now() + 30 * 60_000;
+      store.remember('req-rb', 'alice', new Map([['Allow Once', approve]]), expiresAtMs);
+      vi.advanceTimersByTime(15 * 60_000);
+      const first = store.resolve('req-rb', 'alice', 'Allow Once');
+      first!.rollback();
+      // Still inside the approval's own window: resolvable again.
+      vi.advanceTimersByTime(10 * 60_000); // minute 25
+      expect(store.resolve('req-rb', 'alice', 'Allow Once')?.choice).toEqual(approve);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // ---- bounded FIFO capacity ------------------------------------------------
 
   it('evicts the oldest refId once the cap is exceeded', () => {

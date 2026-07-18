@@ -132,8 +132,10 @@ channel by hand, add:
 { "approvals": { "exec": { "enabled": true, "mode": "session" } } }
 ```
 
-The second is OpenClaw's own exec-approval policy — nothing prompts while
-`ask` is `off` (the default auto-runs):
+The second is OpenClaw's own exec-approval policy. With `ask: off` (the
+default) OpenClaw never requests approval; whether a command runs or is
+denied is decided entirely by the configured `security` policy. Set `ask` to
+`on-miss` (or `always`) to be prompted:
 
 ```bash
 echo '{"version":1,"defaults":{"security":"allowlist","ask":"on-miss"}}' \
@@ -143,10 +145,14 @@ echo '{"version":1,"defaults":{"security":"allowlist","ask":"on-miss"}}' \
 Now when the agent wants to run a command the policy does not pre-approve,
 the chat shows a card with the full command and Allow Once / Allow Always /
 Deny buttons; the tap resolves the approval and the agent's turn continues.
-Approval authorization follows the channel's own gate: only paired, allowlisted
-users can reach the conversation, and whoever is in the conversation can
-resolve its approvals (the same trust model as approving in the terminal that
-started the run).
+
+Authorization model: any Raccoon sender the channel admits (paired device +
+`allowFrom`) is command-authorized, and OpenClaw lets a command-authorized
+sender resolve any approval ID they know via a typed `/approve` command. Card
+buttons are stricter: the tap-to-command mapping is scoped to the user the
+card was sent to, so another user cannot resolve it by tapping. If a
+multi-user deployment needs typed commands restricted too, gate approvals to
+specific senders with OpenClaw's own `commands.allowFrom.raccoon` allowlist.
 
 ## Try the bundled demo
 
