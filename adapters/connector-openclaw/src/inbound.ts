@@ -64,7 +64,9 @@ export interface InboundRunnerGateOpts {
 
 /**
  * Builds an AgentRunner that drives OpenClaw's real inbound pipeline per
- * Raccoon message. Session key convention: `raccoon:user:<userId>`.
+ * Raccoon message. Session key convention: `agent:<agentId>:raccoon:user:<userId>`
+ * (the canonical OpenClaw agent-session-key shape — see the note at the
+ * sessionKey construction in runOneTurn).
  *
  * @param opts - Static runner options (cfg, storePath, agentId).
  * @param gate - Optional allowlist gate. When absent, all users are allowed.
@@ -194,7 +196,15 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     });
   }
 
-  const sessionKey = `raccoon:user:${ctx.userId}`;
+  // CANONICAL agent session key: `agent:<agentId>:<rest>` (the exact shape
+  // parseAgentSessionKey accepts). The previous raw form `raccoon:user:<id>`
+  // was non-canonical: the dispatch pipeline canonicalized it for the session
+  // STORE (the gateway logged "Canonicalized 1 orphaned session key(s)"), but
+  // the RAW value still rode into the exec tool's approval params — so the
+  // exec completion follow-up looked up the raw key, found the orphaned stale
+  // entry, mismatched the live session id, and was dropped as "session
+  // rebound" (issue #5). One canonical key end to end removes the split.
+  const sessionKey = `agent:${opts.agentId}:raccoon:user:${ctx.userId}`;
 
   // When this turn is a response to an approval.request, ctx.text is already
   // editedText ?? choice (set by RaccoonBridge), but that alone previously

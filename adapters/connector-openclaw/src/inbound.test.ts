@@ -603,7 +603,10 @@ describe('buildRaccoonInboundRunner', () => {
       // and hands it to the exec tool as turnSourceTo — without it the
       // exec-approval forwarder resolves NO delivery target for this channel.
       To: `user:${ctx.userId}`,
-      SessionKey: `raccoon:user:${ctx.userId}`,
+      // Canonical agent-session-key shape (issue #5): a raw key split the
+      // session store between a canonicalized live entry and an orphaned raw
+      // one, which made exec completion follow-ups drop as "session rebound".
+      SessionKey: `agent:${opts.agentId}:raccoon:user:${ctx.userId}`,
       AgentId: opts.agentId,
       MessageSid: ctx.messageId,
       CommandAuthorized: true, // no gate wired here -> reachable at all -> upstream-authorized (R2-4)
