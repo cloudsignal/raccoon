@@ -214,6 +214,17 @@ Requirements, both handled by `openclaw raccoon setup`:
   never requests approval; the configured `security` policy alone decides
   whether the command runs or is denied.
 
+One operational note: tell your agent how to behave at the gate. Smaller
+models that receive "Approval required" as a tool result may RETRY the
+command — every retry raises a new approval and a new card in the chat (and
+some will even try to send `/approve` themselves). Add a short section to the
+agent's workspace instructions (e.g. `TOOLS.md`): when exec returns "Approval
+required", stop, do not re-run the command, never self-approve, tell the user
+it is waiting for them, and end the turn — the follow-up delivers the result
+after the tap. Prefer `security: allowlist` + `ask: on-miss` over
+`ask: always`: Allow Always is then available on the card and repeat commands
+stop prompting.
+
 Authorization model, stated precisely: the plugin registers no
 `authorizeActorAction`, so OpenClaw treats any command-authorized Raccoon
 sender (paired device + `allowFrom`) as able to resolve any approval ID they
