@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { buildThreadItems } from '../lib/grouping.js';
 import { useChat } from '../transport/context.js';
 import { ApprovalCard } from './approval-card.js';
 import { MessageBubble } from './message-bubble.js';
+import { MessageMenu, type MessageMenuTarget } from './message-menu.js';
 
 function TypingDots() {
   return (
@@ -28,6 +29,8 @@ export function Thread(props: { channel: string }) {
   const items = buildThreadItems(messages);
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastId = messages.at(-1)?.id;
+  // Long-pressed message context menu (Copy / Share). One menu for the thread.
+  const [menu, setMenu] = useState<MessageMenuTarget | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -62,11 +65,13 @@ export function Thread(props: { channel: string }) {
               groupStart={item.groupStart}
               groupEnd={item.groupEnd}
               onRetry={(id) => retryMessage(props.channel, id)}
+              onLongPress={(msg, x, y) => setMenu({ text: msg.text, x, y })}
             />
           ),
         )}
         {typing ? <TypingDots /> : null}
       </div>
+      {menu ? <MessageMenu target={menu} onClose={() => setMenu(null)} /> : null}
     </div>
   );
 }
