@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,7 +8,22 @@ import tailwindcss from '@tailwindcss/vite';
 import { buildManifest, stampBuildId, versionJson } from './src/build/meta.ts';
 import { appConfig } from './src/config.ts';
 
-const buildId = process.env.BUILD_ID || 'dev';
+// BUILD_ID wins (CI / Docker pass it explicitly); otherwise default to the
+// git short sha. A 'dev' id DISABLES the whole PWA update chain (the update
+// check short-circuits on it and the service worker bytes never change), so
+// deploying a dist built without BUILD_ID silently froze installed clients on
+// the old cached shell forever. 'dev' remains only as the true fallback when
+// git itself is unavailable (e.g. a source tarball).
+function resolveBuildId(): string {
+  if (process.env.BUILD_ID) return process.env.BUILD_ID;
+  try {
+    return execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim() || 'dev';
+  } catch {
+    return 'dev';
+  }
+}
+const buildId = resolveBuildId();
 
 function raccoonAssets(): Plugin {
   let outDir = 'dist';
