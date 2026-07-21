@@ -11,6 +11,7 @@ import { saveSession } from '../lib/session.js';
 import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider } from '../transport/context.js';
 import { LONG_PRESS_MS } from '../lib/long-press.js';
+import { placeMenu } from './message-menu.js';
 import { Thread } from './thread.js';
 
 // jsdom has no PointerEvent — shim it over MouseEvent (carrying pointerType),
@@ -81,8 +82,41 @@ describe('message long-press menu', () => {
     expect(screen.getByRole('menuitem', { name: 'Share to WhatsApp' })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: 'Share to Telegram' })).toBeTruthy();
 
+    // Dismissal plays a short exit animation, THEN unmounts.
     await userEvent.setup().click(screen.getByTestId('message-menu-backdrop'));
-    expect(screen.queryByRole('menu')).toBeNull();
+    expect(screen.getByRole('menu').getAttribute('data-state')).toBe('exit');
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('places the menu below a press near the top, above a press near the composer', async () => {
+    // Pure placement logic — the animated component reads it verbatim.
+    const vp = { w: 390, h: 844 };
+    const high = placeMenu({ x: 60, y: 200 }, vp);
+    expect(high.openAbove).toBe(false);
+    expect(high.top).toBeGreaterThan(200); // opens below the finger
+
+    const nearComposer = placeMenu({ x: 60, y: 760 }, vp);
+    expect(nearComposer.openAbove).toBe(true);
+    expect(nearComposer.top).toBeLessThan(760); // opens above the finger
+    // The menu's bottom edge sits above the press point (finger gap included).
+    expect(nearComposer.top + 144).toBeLessThanOrEqual(760);
+
+    // Clamped: never offscreen even for edge presses.
+    const corner = placeMenu({ x: 5, y: 840 }, vp);
+    expect(corner.left).toBeGreaterThanOrEqual(8);
+    expect(corner.top).toBeGreaterThanOrEqual(8);
+  });
+
+  it('anchors the pop transform-origin at the press point (grows out of the finger)', async () => {
+    await mount();
+    longPress(bubble()); // press at x=60, y=300 (high on an 844px-tall window? jsdom default 768)
+    const menu = screen.getByRole('menu');
+    const origin = (menu as HTMLElement).style.transformOrigin;
+    // Vertical origin faces the press point: bottom edge ('100%') when the
+    // menu opens above the finger, top edge ('0%') when it opens below.
+    const placement = menu.getAttribute('data-placement');
+    expect(['above', 'below']).toContain(placement);
+    expect(origin.endsWith(placement === 'above' ? '100%' : '0%')).toBe(true);
   });
 
   it('does NOT open on a short tap or when the pointer moves (scroll)', async () => {
@@ -139,12 +173,15 @@ describe('message long-press menu', () => {
     await mount();
     longPress(bubble());
     await userEvent.setup().click(screen.getByRole('menuitem', { name: 'Share to WhatsApp' }));
+    // The window opens SYNCHRONOUSLY on the tap (deferring it past the exit
+    // animation would lose the user activation and popup-block on iOS)…
     expect(opened[0]).toBe(`https://wa.me/?text=${encodeURIComponent(MSG_TEXT)}`);
-    expect(screen.queryByRole('menu')).toBeNull();
+    // …and the menu unmounts after its exit animation.
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
 
     longPress(bubble());
     await userEvent.setup().click(screen.getByRole('menuitem', { name: 'Share to Telegram' }));
     expect(opened[1]).toBe(`https://t.me/share/url?url=${encodeURIComponent(MSG_TEXT)}`);
-    expect(screen.queryByRole('menu')).toBeNull();
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
   });
 });
