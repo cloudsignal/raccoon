@@ -108,6 +108,18 @@ describe('uploads client', () => {
     await expect(leaseUploads(['/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/a.txt'], 'env-1', provider)).resolves.toEqual({ ok: false, unknown: [] });
   });
 
+  it('leaseUploads bounds a hung reference call: resolves { ok: false } at the timeout instead of stalling the caller', async () => {
+    // A never-settling fetch that ignores its abort signal — the bound must
+    // come from leaseUploads itself, not from fetch honoring the signal. Small
+    // REAL timeout: AbortSignal.timeout is not driven by vitest fake timers.
+    const fetchSpy = vi.fn((..._args: unknown[]) => new Promise<Response>(() => { /* never settles */ }));
+    vi.stubGlobal('fetch', fetchSpy);
+    await expect(leaseUploads(['/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/a.txt'], 'env-1', provider, 25))
+      .resolves.toEqual({ ok: false, unknown: [] }); // settling at all is the assertion; vitest's test timeout is the backstop
+    // The signal still reaches fetch so a real request is actually canceled.
+    expect(fetchSpy).toHaveBeenCalledWith('/media/reference', expect.objectContaining({ signal: expect.anything() }));
+  });
+
   it('leaseUploads reports server-unknown paths and short-circuits on empty input', async () => {
     const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ known: [], unknown: ['/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/a.txt'] }), { status: 200 }));
     vi.stubGlobal('fetch', fetchSpy);

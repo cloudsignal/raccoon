@@ -74,19 +74,36 @@ export async function deleteUpload(attachment: Attachment, provider: UploadProvi
  *  messageId = the envelope id, for debuggability. NEVER rejects — token
  *  acquisition and fetch failures resolve { ok: false } so fire-and-forget
  *  callers cannot leak unhandled rejections; `unknown` reports paths the
- *  server no longer knows (expired lease + swept bytes). */
-export async function leaseUploads(paths: string[], messageId: string, provider: UploadProvider): Promise<{ ok: boolean; unknown: string[] }> {
+ *  server no longer knows (expired lease + swept bytes).
+ *
+ *  Bounded lifetime: the outbox drain AWAITS this before each attachment
+ *  send, so a hung call would stall the whole outbox. After timeoutMs it
+ *  resolves { ok: false } — the specified send-anyway path — and the drain
+ *  self-heals on its next pass. The race (not just the fetch signal) is the
+ *  bound, so it holds even if an environment's fetch ignores the signal. */
+export async function leaseUploads(paths: string[], messageId: string, provider: UploadProvider, timeoutMs = 10_000): Promise<{ ok: boolean; unknown: string[] }> {
   if (paths.length === 0) return { ok: true, unknown: [] };
-  try {
+  const signal = AbortSignal.timeout(timeoutMs);
+  const work = async (): Promise<{ ok: boolean; unknown: string[] }> => {
     const token = await provider.getBearerToken(); // inside the try: a token failure must not escape fire-and-forget callers
     const res = await fetch(`${provider.baseUrl ?? ''}/media/reference`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths, messageId }),
+      signal, // cancels the real request (headers AND body read) at the deadline
     });
     if (!res.ok) return { ok: false, unknown: [] };
     const body = (await res.json()) as { unknown?: unknown };
     return { ok: true, unknown: Array.isArray(body.unknown) ? body.unknown.filter((u): u is string => typeof u === 'string') : [] };
+  };
+  try {
+    return await Promise.race([
+      work(),
+      // TimeoutError rejection lands in the catch below like any other failure.
+      // Promise.race attaches handlers to both, so the loser never surfaces as
+      // an unhandled rejection.
+      new Promise<never>((_, reject) => { signal.addEventListener('abort', () => reject(signal.reason as Error), { once: true }); }),
+    ]);
   } catch {
     return { ok: false, unknown: [] };
   }
