@@ -49,14 +49,23 @@ export function MessageBubble(props: {
         </span>
         {renderMarkdown(msg.text)}
       </div>
-      {mine && msg.delivery === 'failed' && props.onRetry ? (
-        <button
-          type="button"
-          onClick={() => props.onRetry?.(msg.id)}
-          className="mt-1 text-xs font-medium text-ink-soft underline"
-        >
-          Not sent — tap to retry
-        </button>
+      {mine && msg.delivery === 'failed' ? (
+        msg.failureReason === 'attachments-expired' ? (
+          // Terminal, NOT retryable: the media lease expired and the bytes
+          // were swept — a resend would deliver dead URLs. Re-attaching
+          // creates a fresh message, so no retry affordance here.
+          <span className="mt-1 text-xs font-medium text-ink-soft" data-testid="attachments-expired-hint">
+            Attachments expired — remove and re-attach
+          </span>
+        ) : props.onRetry ? (
+          <button
+            type="button"
+            onClick={() => props.onRetry?.(msg.id)}
+            className="mt-1 text-xs font-medium text-ink-soft underline"
+          >
+            Not sent — tap to retry
+          </button>
+        ) : null
       ) : null}
       {/* #P1-A: a stalled turn is still running with an UNKNOWN outcome — show a
           non-actionable hint, NEVER a retry (a retry could double side effects). */}

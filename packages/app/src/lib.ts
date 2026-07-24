@@ -62,6 +62,12 @@ export { createHttpPushRegistrar } from './lib/push-registrar-http.js';
 // Session type — hosts using transportOverride need this for sessionOverride
 export type { Session } from './lib/session.js';
 
+// Media upload surface — a host supplying its own uploadProvider (see
+// TransportProviderProps) or building custom attachment UI uses these
+// directly rather than reaching into internal modules.
+export { uploadFile, validateFiles, deleteUpload, leaseUploads, MAX_ATTACHMENTS, MAX_FILE_BYTES } from './lib/uploads.js';
+export type { UploadProvider } from './lib/uploads.js';
+
 // Config / theming
 export { appConfig, channelMeta, TONES } from './config.js';
 export type { RaccoonConfig, ChannelTone, ChannelMeta } from './config.js';

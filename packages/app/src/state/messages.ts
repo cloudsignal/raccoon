@@ -1,4 +1,4 @@
-import { parseAddress, type Envelope, type HistoryMessage } from '@raccoon/protocol';
+import { parseAddress, type Attachment, type Envelope, type HistoryMessage } from '@raccoon/protocol';
 
 // 'stalled' (#P1-A): the server started the turn but it exceeded the deadline
 // and is still running with an UNKNOWN outcome. Terminal for the send state
@@ -12,9 +12,16 @@ export interface ChatMessage {
   sender: string;
   kind: 'text' | 'approval';
   text: string;
+  /** Hub-issued media this message carries (relative /media/... paths). */
+  attachments?: Attachment[];
   approval?: { refId: string; title: string; description: string; options: string[] };
   ts: string;
   delivery?: Delivery;
+  /** Why a terminal 'failed' delivery is NOT retryable. Currently only
+   *  'attachments-expired': the media lease lapsed and the sweep reclaimed
+   *  the bytes, so a resend would deliver dead URLs — the bubble surfaces a
+   *  specific notice and suppresses the tap-to-retry affordance. */
+  failureReason?: string;
   respondedChoice?: string;
   /** Delivery status of the approval.response envelope for respondedChoice
    *  (R2-5): 'pending' until acked, 'delivered' once acked, 'failed' on ack
@@ -52,7 +59,10 @@ export type ChatAction =
   | { type: 'approval'; env: Envelope<'approval.request'>; active: boolean }
   | { type: 'optimistic'; msg: ChatMessage }
   | { type: 'delivery'; channel: string; id: string; delivery: Delivery }
-  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' | 'stalled' }
+  // `reason` rides along with a locally-decided terminal 'failed' (e.g. the
+  // drain-time attachment-lease check) — applied only if the delivery
+  // actually lands on 'failed' (the monotonic gate still wins).
+  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' | 'stalled'; reason?: string }
   | { type: 'typing'; channel: string; on: boolean }
   | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string; editedText?: string }
   // #R7-2: rehydrate responded/failed state onto approval messages from
@@ -131,6 +141,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           sender: h.role === 'agent' ? action.agentId : 'you',
           kind: 'text' as const,
           text: h.text,
+          ...(h.attachments?.length ? { attachments: h.attachments } : {}),
           ts: h.ts,
           ...(h.role === 'user' ? { delivery: 'sent' as const } : {}),
         });
@@ -171,6 +182,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         sender: isAgent ? (from.id ?? channel) : 'you',
         kind: 'text',
         text: action.env.payload.text,
+        ...(action.env.payload.attachments?.length ? { attachments: action.env.payload.attachments } : {}),
         ts: action.env.ts,
         ...(isAgent ? {} : { delivery: 'sent' as const }),
       };
@@ -209,7 +221,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return patch(state, action.msg.channel, upsert(state.messages[action.msg.channel] ?? [], action.msg));
     case 'delivery': {
       const list = (state.messages[action.channel] ?? []).map((m) => {
-        if (m.id === action.id) return { ...m, delivery: action.delivery };
+        // An explicit delivery override (the retry reset) supersedes any
+        // recorded failure reason.
+        if (m.id === action.id) return { ...m, delivery: action.delivery, failureReason: undefined };
         if (m.responseEnvId === action.id) return { ...m, respondedDelivery: action.delivery };
         return m;
       });
@@ -218,7 +232,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'ack': {
       const next = ACK_DELIVERY[action.status];
       const list = (state.messages[action.channel] ?? []).map((m) => {
-        if (m.id === action.refId) return { ...m, delivery: advanceDelivery(m.delivery, next) };
+        if (m.id === action.refId) {
+          const delivery = advanceDelivery(m.delivery, next);
+          // Carry the failure reason only when the row actually lands on
+          // 'failed' — a higher-rank 'delivered' must not pick up a stale one.
+          return { ...m, delivery, ...(delivery === 'failed' && action.reason !== undefined ? { failureReason: action.reason } : {}) };
+        }
         if (m.responseEnvId === action.refId) return { ...m, respondedDelivery: advanceDelivery(m.respondedDelivery, next) };
         return m;
       });

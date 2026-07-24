@@ -4,7 +4,7 @@ import {
 } from 'react';
 import {
   agentAddress, createEnvelope, parsePairingPayload, userAddress,
-  type AnyEnvelope, type TransportStatus,
+  type AnyEnvelope, type Attachment, type TransportStatus,
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
 import { kvGet, kvSet, probeStorageWritable, wipeKvExceptSession } from '../lib/idb.js';
@@ -12,7 +12,7 @@ import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/p
 import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
 import { clearSessionIfMatches, loadSession, saveSession, type Session } from '../lib/session.js';
-import type { UploadProvider } from '../lib/uploads.js';
+import { leaseUploads, type UploadProvider } from '../lib/uploads.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
 import type { AppTransport, MakeTransport } from './types.js';
 
@@ -43,7 +43,9 @@ export interface ChatApi {
    *  moves to 'setup' (pairing enabled); otherwise stays in 'storage-error'. */
   retryStorage(): Promise<void>;
   openChannel(channel: string | null): void;
-  sendMessage(channel: string, text: string): void;
+  /** Empty text is legal WITH attachments (image-only sends); blank
+   *  no-attachment sends are rejected by the composer before this. */
+  sendMessage(channel: string, text: string, attachments?: Attachment[]): void;
   respondApproval(channel: string, refId: string, choice: string, editedText?: string): void;
   retryMessage(channel: string, id: string): void;
   loadOlder(channel: string): void;
@@ -302,6 +304,19 @@ export function TransportProvider(props: TransportProviderProps) {
   stateRef.current = state;
   activeRef.current = activeChannel;
 
+  // makeTransport pattern: the injected prop wins, else the built-in default.
+  // The default closes over sessionRef (stable for the component's lifetime)
+  // and reads the token per call, so no session dependency is needed here.
+  const uploadProvider = useMemo<UploadProvider>(
+    () => props.uploadProvider ?? buildDefaultUploadProvider(sessionRef),
+    [props.uploadProvider],
+  );
+  // Read at CALL time by the outbox lease paths (the enqueue-commit .then and
+  // the drain-time renewal in attempt()) — mirrors sessionRef/statusNowRef so
+  // an async continuation never captures a stale provider across a re-render.
+  const uploadProviderRef = useRef<UploadProvider>(uploadProvider);
+  uploadProviderRef.current = uploadProvider;
+
   const isActive = useCallback((channel: string) => activeRef.current === channel && document.visibilityState === 'visible', []);
 
   const handleEnvelope = useCallback((env: AnyEnvelope) => {
@@ -488,6 +503,31 @@ export function TransportProvider(props: TransportProviderProps) {
     // owner's in-flight send.
     const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, scope);
     if (!claimToken) return;
+    if (entry.env.kind === 'msg') {
+      const attachments = entry.env.payload.attachments;
+      if (attachments && attachments.length > 0) {
+        // Attachment lease RE-FIRED from durable outbox state before EVERY
+        // delivery attempt: the enqueue-time call alone is not durable (a
+        // crash/suspension right after enqueue, or a token hiccup, loses the
+        // one shot; a row can also outlive its lease across long retry
+        // windows). leaseUploads never rejects.
+        const lease = await leaseUploads(attachments.map((a) => a.url), entry.id, uploadProviderRef.current);
+        if (lease.ok && lease.unknown.length > 0) {
+          // The lease EXPIRED and the sweep reclaimed those bytes — sending
+          // would deliver dead URLs. Terminal and NOT retryable: the bubble
+          // shows "Attachments expired — remove and re-attach" with no retry
+          // affordance (re-attaching creates a fresh message). This caps a
+          // failed message's attachment lifetime at the lease TTL, explicitly.
+          const applied = await outbox.markFailed(entry.id, 'attachments-expired', claimToken);
+          // Monotonic 'ack' route (see the ACK_TIMEOUT note below): a genuine
+          // 'delivered' from an earlier attempt still outranks this.
+          if (applied) dispatch({ type: 'ack', channel: entry.channel, refId: entry.id, status: 'failed', reason: 'attachments-expired' });
+          return;
+        }
+        // { ok: false } = network/token trouble reaching the lease endpoint —
+        // proceed with the send; the lease self-heals on the next drain.
+      }
+    }
     try {
       await transport.send(entry.env);
       // msg and approval.response both get a server ack (bridge.ts) and so both
@@ -1126,22 +1166,37 @@ export function TransportProvider(props: TransportProviderProps) {
     if (!scope) return; // no identity: sendMessage/respondApproval already gate, this is belt-and-braces
     void outbox.enqueue(env, scope).then(() => {
       if (sessionGenRef.current !== gen) { void outbox.settle(env.id); return; }
+      if (env.kind === 'msg' && env.payload.attachments?.length) {
+        // LEASE, not permanent: keeps the bytes alive for the outbox's retry
+        // window (renewable); the SERVER performs the permanent reference
+        // when it accepts the message. A permanently-failed or wiped outbox
+        // row therefore cannot leak media forever — its lease expires and the
+        // sweep reclaims. Fired only once the DURABLE row committed, and
+        // BEFORE/independent of first delivery. Fire-and-forget HERE (it
+        // never rejects); the drain loop re-fires it from durable state
+        // before every delivery attempt (see attempt()).
+        void leaseUploads(env.payload.attachments.map((a) => a.url), env.id, uploadProviderRef.current);
+      }
       if (statusNowRef.current === 'open') void drain();
     });
   }, [drain]);
 
-  const sendMessage = useCallback((channel: string, text: string) => {
+  const sendMessage = useCallback((channel: string, text: string, attachments?: Attachment[]) => {
     // R4-3: validUserIdRef, not sessionRef — see its declaration comment.
     // Nulled synchronously the instant a wipe/unpair decision is made, so a
     // send attempt from that point onward is rejected outright.
     const userId = validUserIdRef.current;
     if (!userId) return;
     const env = createEnvelope('msg', {
-      from: userAddress(userId), to: agentAddress(channel), channel, payload: { text },
+      from: userAddress(userId), to: agentAddress(channel), channel,
+      payload: { text, ...(attachments?.length ? { attachments } : {}) },
     });
     dispatch({
       type: 'optimistic',
-      msg: { id: env.id, channel, role: 'user', sender: 'you', kind: 'text', text, ts: env.ts, delivery: 'pending' },
+      msg: {
+        id: env.id, channel, role: 'user', sender: 'you', kind: 'text', text, ts: env.ts, delivery: 'pending',
+        ...(attachments?.length ? { attachments } : {}),
+      },
     });
     sendEnvelope(env);
   }, [sendEnvelope]);
@@ -1293,14 +1348,6 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [wipeAndReset, props.pushRegistrarOverride]);
 
   const canEnablePush = !!session?.vapidPublicKey || !!props.pushRegistrarOverride;
-
-  // makeTransport pattern: the injected prop wins, else the built-in default.
-  // The default closes over sessionRef (stable for the component's lifetime)
-  // and reads the token per call, so no session dependency is needed here.
-  const uploadProvider = useMemo<UploadProvider>(
-    () => props.uploadProvider ?? buildDefaultUploadProvider(sessionRef),
-    [props.uploadProvider],
-  );
 
   const retryStorage = useCallback(async () => {
     // #F6: re-probe durable storage from the storage-error state. On success,
