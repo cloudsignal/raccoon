@@ -1085,4 +1085,37 @@ describe('TransportProvider', () => {
       expect(api.authError).toContain('unpaired');
     });
   });
+
+  describe('uploadProvider seam', () => {
+    it('default uploadProvider presents the LIVE session token', async () => {
+      const transport = new FakeTransport();
+      await mountPaired(transport); // saves sessionToken 't'
+      await expect(api.uploadProvider.getBearerToken()).resolves.toBe('t');
+    });
+
+    it('default uploadProvider rejects with a clear error when no session token exists', async () => {
+      render(
+        <TransportProvider makeTransport={() => new FakeTransport()}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('setup'));
+      await expect(api.uploadProvider.getBearerToken()).rejects.toThrow(/session token/i);
+    });
+
+    it('an injected uploadProvider prop wins over the default', async () => {
+      // A session token exists, so the DEFAULT would resolve 't' — proving the
+      // injected provider takes precedence, not merely filling an absence.
+      await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH });
+      const injected = { getBearerToken: async () => 'host-tok' };
+      render(
+        <TransportProvider makeTransport={() => new FakeTransport()} uploadProvider={injected}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+      expect(api.uploadProvider).toBe(injected);
+      await expect(api.uploadProvider.getBearerToken()).resolves.toBe('host-tok');
+    });
+  });
 });

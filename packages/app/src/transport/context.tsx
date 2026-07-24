@@ -12,6 +12,7 @@ import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/p
 import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
 import { clearSessionIfMatches, loadSession, saveSession, type Session } from '../lib/session.js';
+import type { UploadProvider } from '../lib/uploads.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
 import type { AppTransport, MakeTransport } from './types.js';
 
@@ -50,6 +51,12 @@ export interface ChatApi {
   /** True when some push path is available: a VAPID key on the session or a
    *  host-supplied registrar override. Drives PushBanner eligibility. */
   canEnablePush: boolean;
+  /** Auth seam for media uploads — uploadFile/deleteUpload/leaseUploads
+   *  (lib/uploads.ts) take it as an argument. The default presents the LIVE
+   *  session token on every call (rejecting with a clear error when there is
+   *  none); an embedding host injects its own via the `uploadProvider` prop
+   *  (it may hold a rotating external token instead of a session token). */
+  uploadProvider: UploadProvider;
   unpair(): Promise<void>;
 }
 
@@ -121,6 +128,25 @@ function settleWithinCall(fn: () => unknown, ms: number): Promise<void> {
 
 const defaultMakeTransport: MakeTransport = (opts) => new WsClientTransport(opts) as AppTransport;
 
+/** Default upload auth for the standalone app: present the LIVE session's
+ *  token, read from the ref at CALL time (not captured at build time), so a
+ *  re-pair mid-composer never uploads with a stale token and a token that
+ *  arrives after mount is picked up without rebuilding the provider.
+ *  Exported so the factory is unit-testable without mounting the provider. */
+export function buildDefaultUploadProvider(
+  sessionRef: { readonly current: { sessionToken?: string } | null },
+): UploadProvider {
+  return {
+    async getBearerToken() {
+      const token = sessionRef.current?.sessionToken;
+      // A host-managed session may legitimately carry no token (auth happens
+      // out-of-band) — such hosts must inject their own uploadProvider.
+      if (!token) throw new Error('No session token available for uploads. Pair this device first, or supply an uploadProvider when embedding.');
+      return token;
+    },
+  };
+}
+
 /**
  * Props for TransportProvider.
  *
@@ -171,6 +197,14 @@ export interface TransportProviderProps {
    * available even without session.vapidPublicKey.
    */
   pushRegistrarOverride?: PushRegistrar;
+  /**
+   * Host-supplied auth for media uploads. Mirrors `makeTransport`: optional,
+   * with the default built in-provider from the live session token. A host
+   * whose transport authenticates out-of-band (no real sessionToken on the
+   * override session) MUST supply one for uploads to work — the default
+   * rejects when no token is present.
+   */
+  uploadProvider?: UploadProvider;
   children: ReactNode;
 }
 
@@ -1260,6 +1294,14 @@ export function TransportProvider(props: TransportProviderProps) {
 
   const canEnablePush = !!session?.vapidPublicKey || !!props.pushRegistrarOverride;
 
+  // makeTransport pattern: the injected prop wins, else the built-in default.
+  // The default closes over sessionRef (stable for the component's lifetime)
+  // and reads the token per call, so no session dependency is needed here.
+  const uploadProvider = useMemo<UploadProvider>(
+    () => props.uploadProvider ?? buildDefaultUploadProvider(sessionRef),
+    [props.uploadProvider],
+  );
+
   const retryStorage = useCallback(async () => {
     // #F6: re-probe durable storage from the storage-error state. On success,
     // enable pairing (setup); a prior stored session is not auto-restored — the
@@ -1272,7 +1314,7 @@ export function TransportProvider(props: TransportProviderProps) {
 
   const api = useMemo<ChatApi>(() => ({
     phase, status, session, state, activeChannel, authError,
-    pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, unpair,
+    pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, uploadProvider, unpair,
     // sendMessage, respondApproval, retryMessage are only wired once the
     // session is loaded and the transport is connected (phase === 'ready').
     // Before ready they are undefined at runtime (the `as` cast is intentional —
@@ -1282,7 +1324,7 @@ export function TransportProvider(props: TransportProviderProps) {
     sendMessage: (phase === 'ready' ? sendMessage : undefined) as ChatApi['sendMessage'],
     respondApproval: (phase === 'ready' ? respondApproval : undefined) as ChatApi['respondApproval'],
     retryMessage: (phase === 'ready' ? retryMessage : undefined) as ChatApi['retryMessage'],
-  }), [phase, status, session, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, unpair]);
+  }), [phase, status, session, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair]);
 
   return <ChatContext.Provider value={api}>{props.children}</ChatContext.Provider>;
 }
