@@ -10,11 +10,30 @@ const address = z.union([
 ]);
 export type Address = z.infer<typeof address>;
 
+// Hub-issued media path: 26-char ulid-alphabet id + sanitized display name.
+// Attachment URLs are RELATIVE, hub-issued paths ONLY — never absolute URLs.
+// This is the SSRF boundary: nothing user-controlled can point server-side
+// fetchers (which absolutize against their OWN configured origin) anywhere
+// but the deployment's media store. The filename segment is decorative; the
+// server locates content by id alone.
+export const MEDIA_PATH_RE = /^\/media\/[0-9A-HJKMNP-TV-Z]{26}\/[A-Za-z0-9._-]{1,80}$/;
+
+export const attachmentSchema = z.object({
+  url: z.string().regex(MEDIA_PATH_RE),
+  /** Display/routing HINT — the serve endpoint's stored metadata is the
+   *  authority for what bytes get labeled what. */
+  mime: z.string().min(1),
+  name: z.string().min(1).max(80).optional(),
+  size: z.number().int().positive().optional(),
+});
+export type Attachment = z.infer<typeof attachmentSchema>;
+
 const historyMessage = z.object({
   id: z.string().min(1),
   role: z.enum(['user', 'agent']),
   text: z.string(),
   ts: z.iso.datetime(),
+  attachments: z.array(attachmentSchema).max(4).optional(),
 });
 export type HistoryMessage = z.infer<typeof historyMessage>;
 
@@ -27,10 +46,17 @@ const base = z.object({
   ts: z.iso.datetime(),
 });
 
-const msgPayload = z.object({
-  text: z.string().min(1),
-  attachments: z.array(z.object({ url: z.string().url(), mime: z.string() })).optional(),
-});
+const msgPayload = z
+  .object({
+    // Empty text is legal ONLY alongside attachments (image-only sends);
+    // enforced by the refine below. NOT wire-compatible with peers built
+    // before this change — rollout is server-first (see docs/quickstart).
+    text: z.string(),
+    attachments: z.array(attachmentSchema).max(4).optional(),
+  })
+  .refine((p) => p.text.length > 0 || (p.attachments?.length ?? 0) > 0, {
+    message: 'msg requires text or at least one attachment',
+  });
 
 // 'failed' (#R6-2): the server received the envelope but the turn it drives
 // failed terminally on the server side — the client should surface a retry
