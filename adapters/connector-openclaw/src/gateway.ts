@@ -84,6 +84,7 @@ export interface StartAccountDeps {
     runner: AgentRunner;
     buildId?: string;
     staticDir?: string;
+    mediaDir?: string;
     vapid?: { publicKey: string; privateKey: string; subject: string };
     sessionStore?: CredentialStore;
   }) => Pick<RaccoonAgentChannel, 'hub' | 'start' | 'stop' | 'revoke'>;
@@ -195,14 +196,21 @@ async function doStart(
   const approvalStore = createApprovalValueStore();
   approvalValues.set(accountId, approvalStore);
 
+  // One per-account store path for everything durable: the session file, the
+  // media blobs, and whatever the runner grows to keep there.
+  const storePath = resolveStorePath(accountId);
+
   // Build the REAL inbound runner (T1) + apply the T5 allowlist gate.
   const runner: AgentRunner = buildRaccoonInboundRunner(
     {
       cfg: ctx.cfg,
-      storePath: resolveStorePath(accountId),
+      storePath,
       agentId: resolveAgentId(account),
       accountId,
       approvalValues: approvalStore,
+      // Absolutizes hub-issued /media attachment paths into MediaUrls the
+      // OpenClaw gateway can fetch server-side (ws(s) origin -> http(s)).
+      publicOrigin: account.instanceUrl,
     },
     deps.checkAllowed ? { checkAllowed: deps.checkAllowed } : undefined,
   );
@@ -215,7 +223,7 @@ async function doStart(
   // #F4: back sessions with a FILE store keyed to the account's storePath, so a
   // real connector-process restart RESUMES confirmed sessions instead of forcing
   // every paired device to re-pair (the in-memory default loses them on bounce).
-  const sessionStore = new FileCredentialStore({ path: join(resolveStorePath(accountId), 'sessions.json') });
+  const sessionStore = new FileCredentialStore({ path: join(storePath, 'sessions.json') });
 
   const factory = deps.createChannel ?? createRaccoonChannel;
   const channel = factory({
@@ -227,6 +235,9 @@ async function doStart(
     channels: account.channels,
     runner,
     sessionStore,
+    // Media blobs live beside the session file, under the SAME per-account
+    // store path — not the WsHub's cwd-relative default.
+    mediaDir: join(storePath, 'media'),
     ...(account.vapid !== undefined ? { vapid: account.vapid } : {}),
   });
 

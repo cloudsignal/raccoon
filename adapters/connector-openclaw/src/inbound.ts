@@ -46,6 +46,13 @@ export interface InboundRunnerOpts {
    *  approval-values.ts). Used to resolve ctx.approval.choice (a label) back
    *  to the button's real value before it reaches OpenClaw. */
   approvalValues?: ApprovalValueStore;
+  /**
+   * The account's public instance URL (e.g. 'wss://chat.example.com/'), used
+   * to absolutize hub-issued /media paths into MediaUrls the OpenClaw gateway
+   * can fetch server-side. ws(s) scheme is swapped to http(s); a trailing
+   * slash is trimmed. When absent, attachment paths pass through as-is.
+   */
+  publicOrigin?: string;
 }
 
 /**
@@ -274,6 +281,16 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     ? buildApprovalText(ctx.approval, resolvedApproval?.choice, editValidated)
     : ctx.text;
 
+  // Hub-issued media paths → absolute URLs on OUR configured origin (ws(s) →
+  // http(s)). The protocol schema admits ONLY /media/<id>/<name> paths, so
+  // nothing user-controlled can steer this fetch anywhere else (SSRF-proof by
+  // construction). The gateway's media pipeline downloads these and runs
+  // image understanding — the model actually sees the image.
+  const mediaUrls = (ctx.attachments ?? []).map((a) => {
+    const origin = (opts.publicOrigin ?? '').replace(/\/$/, '').replace(/^ws(s?):\/\//, 'http$1://');
+    return `${origin}${a.url}`;
+  });
+
   // Build a minimal FinalizedMsgContext from the Raccoon AgentContext.
   const ctxPayload: FinalizedMsgContext = {
     Body: approvalText,
@@ -318,6 +335,7 @@ async function* runOneTurn(opts: InboundRunnerOpts, ctx: AgentContext): AsyncIte
     // superseding this). See adapters/openclaw/src/inbound.test.ts for the
     // test asserting the invariant this relies on.
     CommandAuthorized: true,
+    ...(mediaUrls.length ? { MediaUrls: mediaUrls, MediaTypes: (ctx.attachments ?? []).map((a) => a.mime) } : {}),
   };
 
   // Build the dispatcher that funnels final payloads into our queue.

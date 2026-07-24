@@ -19,6 +19,13 @@ export interface RaccoonChannelOptions {
   buildId?: string;
   /** Serve the built @raccoon/app (dist/) on the same port. */
   staticDir?: string;
+  /**
+   * Directory for uploaded media blobs — forwarded to the WsHub's media
+   * store. Hosts with a per-account store path (the gateway) pass
+   * `<storePath>/media`; when absent the hub falls back to its cwd-relative
+   * default (`<cwd>/.raccoon-store/media`).
+   */
+  mediaDir?: string;
   /** Enable self-hosted web-push for offline delivery. */
   vapid?: { publicKey: string; privateKey: string; subject: string };
   /**
@@ -54,6 +61,7 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
     port: opts.port,
     channels: opts.channels,
     staticDir: opts.staticDir,
+    mediaDir: opts.mediaDir,
     vapidPublicKey: opts.vapid?.publicKey,
     // Only override the WsHub's in-memory default when a store is supplied, so
     // an omitted sessionStore keeps the built-in (undefined would not).
@@ -75,7 +83,10 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
     clearPushForUser = wrapped.clearForUser;
   }
 
-  const bridge = new RaccoonBridge({ hub: bridgeHub, runner: opts.runner, store: new InMemoryMessageStore() });
+  // media: the hub's OWN store (Task 4 seam) — the bridge permanently
+  // references a message's attachments after its durable append, so the
+  // store's sweep never deletes blobs a recorded message points at.
+  const bridge = new RaccoonBridge({ hub: bridgeHub, runner: opts.runner, store: new InMemoryMessageStore(), media: hub.media });
 
   let stopBridge: (() => void) | null = null;
 

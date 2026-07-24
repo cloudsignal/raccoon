@@ -195,6 +195,24 @@ describe('gateway.startAccount / stopAccount', () => {
     expect(runnerArg).toBe(mockBuildRunner.mock.results[0]!.value);
   });
 
+  it('threads the account instanceUrl into the runner (publicOrigin) and a storePath-scoped mediaDir into the channel (#media)', async () => {
+    const { factory } = makeFakeChannelFactory();
+    const account = makeAccount();
+
+    await startAccount(makeCtx(account), { createChannel: factory });
+
+    // publicOrigin lets the inbound runner absolutize hub-issued /media paths
+    // into MediaUrls the OpenClaw gateway can fetch server-side.
+    const [runnerOpts] = mockBuildRunner.mock.calls[0]!;
+    expect(runnerOpts.publicOrigin).toBe(account.instanceUrl);
+
+    // The hub's media blobs must live under the SAME per-account store path as
+    // the session file — not the WsHub's cwd-relative default.
+    const factoryMock = factory as unknown as { mock: { calls: Array<[{ mediaDir?: string }]> } };
+    const factoryOpts = factoryMock.mock.calls[0]![0];
+    expect(factoryOpts.mediaDir).toBe(join(runnerOpts.storePath, 'media'));
+  });
+
   it('applies the allowlist gate (checkAllowed) to the inbound runner', async () => {
     const { factory } = makeFakeChannelFactory();
     const account = makeAccount();

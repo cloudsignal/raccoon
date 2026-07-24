@@ -618,6 +618,68 @@ describe('buildRaccoonInboundRunner', () => {
       AccountId: opts.accountId,
     });
   });
+
+  it('maps msg attachments to absolute MediaUrls/MediaTypes from the public origin (#media)', async () => {
+    let captured: { MediaUrls?: string[]; MediaTypes?: string[] } | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      captured = arg.ctxPayload as typeof captured;
+      arg.dispatcher.markComplete();
+      return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } } as DispatchFromConfigResult;
+    });
+    const runner = buildRaccoonInboundRunner({ ...opts, publicOrigin: 'wss://chat.example.com/' });
+    const mediaCtx = {
+      ...ctx,
+      attachments: [{ url: '/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/pic.png', mime: 'image/png', name: 'pic.png', size: 5 }],
+    };
+    for await (const _ of runner.run(mediaCtx)) { /* drain */ }
+    expect(captured?.MediaUrls).toEqual(['https://chat.example.com/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/pic.png']);
+    expect(captured?.MediaTypes).toEqual(['image/png']);
+  });
+
+  it('swaps a plain ws:// origin to http:// and preserves attachment order (#media)', async () => {
+    let captured: { MediaUrls?: string[]; MediaTypes?: string[] } | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      captured = arg.ctxPayload as typeof captured;
+      arg.dispatcher.markComplete();
+      return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } } as DispatchFromConfigResult;
+    });
+    // No trailing slash on purpose: the trim must be a no-op, not a requirement.
+    const runner = buildRaccoonInboundRunner({ ...opts, publicOrigin: 'ws://127.0.0.1:8790' });
+    const mediaCtx = {
+      ...ctx,
+      attachments: [
+        { url: '/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/pic.png', mime: 'image/png', name: 'pic.png', size: 5 },
+        { url: '/media/01BX5ZZKBKACTAV9WEVGEMMVRZ/doc.pdf', mime: 'application/pdf', name: 'doc.pdf', size: 9 },
+      ],
+    };
+    for await (const _ of runner.run(mediaCtx)) { /* drain */ }
+    expect(captured?.MediaUrls).toEqual([
+      'http://127.0.0.1:8790/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/pic.png',
+      'http://127.0.0.1:8790/media/01BX5ZZKBKACTAV9WEVGEMMVRZ/doc.pdf',
+    ]);
+    expect(captured?.MediaTypes).toEqual(['image/png', 'application/pdf']);
+  });
+
+  it('adds NO Media fields when the msg carries no attachments (#media)', async () => {
+    let captured: Record<string, unknown> | undefined;
+    mockDispatch.mockImplementation(async (arg) => {
+      captured = arg.ctxPayload as Record<string, unknown>;
+      arg.dispatcher.markComplete();
+      return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } } as DispatchFromConfigResult;
+    });
+    const runner = buildRaccoonInboundRunner({ ...opts, publicOrigin: 'wss://chat.example.com/' });
+
+    // attachments absent entirely
+    for await (const _ of runner.run(ctx)) { /* drain */ }
+    expect(captured).toBeDefined();
+    expect('MediaUrls' in captured!).toBe(false);
+    expect('MediaTypes' in captured!).toBe(false);
+
+    // attachments present but empty
+    for await (const _ of runner.run({ ...ctx, attachments: [] })) { /* drain */ }
+    expect('MediaUrls' in captured!).toBe(false);
+    expect('MediaTypes' in captured!).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
