@@ -1,5 +1,5 @@
-import { agentAddress, createEnvelope, userAddress, type AnyEnvelope } from '@raccoon/protocol';
-import type { AgentContext, AgentRunner, MessageStore, OutboundHub } from './types.js';
+import { agentAddress, createEnvelope, userAddress, type AnyEnvelope, type Attachment } from '@raccoon/protocol';
+import type { AgentContext, AgentRunner, MediaReferencer, MessageStore, OutboundHub } from './types.js';
 
 const DEFAULT_HISTORY_CAP = 200;
 const DEFAULT_DEDUP_CAP = 500;
@@ -34,6 +34,10 @@ export class RaccoonBridge {
   private readonly hub: OutboundHub;
   private readonly runner: AgentRunner;
   private readonly store: MessageStore;
+  // Optional: absent when the host has no media store (e.g. a transport with
+  // no uploads). Structural (see MediaReferencer) so the bridge never imports
+  // a transport package.
+  private readonly media?: MediaReferencer;
   private readonly cap: number;
   private readonly dedupCap: number;
   // `${userId}:${envelopeId}` -> the in-flight/settled persistence outcome for
@@ -78,10 +82,11 @@ export class RaccoonBridge {
 
   private readonly turnDeadlineMs: number;
 
-  constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; historyLimitCap?: number; dedupCap?: number; turnDeadlineMs?: number }) {
+  constructor(opts: { hub: OutboundHub; runner: AgentRunner; store: MessageStore; media?: MediaReferencer; historyLimitCap?: number; dedupCap?: number; turnDeadlineMs?: number }) {
     this.hub = opts.hub;
     this.runner = opts.runner;
     this.store = opts.store;
+    this.media = opts.media;
     this.cap = opts.historyLimitCap ?? DEFAULT_HISTORY_CAP;
     this.dedupCap = opts.dedupCap ?? DEFAULT_DEDUP_CAP;
     this.turnDeadlineMs = opts.turnDeadlineMs ?? DEFAULT_TURN_DEADLINE_MS;
@@ -170,7 +175,14 @@ export class RaccoonBridge {
     // produced an ack with zero runs under the old boolean-Set design).
     const { succeeded, isOriginal, markTurnDone } = await this.claim(dedupKey, async () => {
       const ts = new Date().toISOString();
-      await this.store.append({ id: env.id, channel, userId, role: 'user', text: env.payload.text, ts });
+      // The row stores the CLIENT-CLAIMED attachments: it is written BEFORE
+      // the permanent-reference call below, and v1 adds no row-update
+      // machinery (history canonicalization is a non-goal — the canonical
+      // values feed the RUNNER).
+      await this.store.append({
+        id: env.id, channel, userId, role: 'user', text: env.payload.text, ts,
+        ...(env.payload.attachments ? { attachments: env.payload.attachments } : {}),
+      });
       return true;
     });
 
@@ -183,6 +195,17 @@ export class RaccoonBridge {
     // never after a failed append — a failed append means nothing durable
     // happened, so there is no acked message to act on).
     if (!isOriginal || !succeeded) return;
+
+    // THE standalone permanent-reference point: AFTER the append durably
+    // recorded the message, transition its attachments unreferenced->referenced
+    // so the sweep never deletes media a persisted message points at.
+    // Append-then-reference ordering means a failed append never leaks a
+    // permanent reference; the converse (reference failing after a successful
+    // append) is tolerable — sweep-side leak-proofing comes from the lease
+    // model. The store-CANONICAL `known` result feeds the runner; on an absent
+    // media dep or a reference failure this falls back to the client-claimed
+    // values (logged) — a media hiccup must NEVER block the turn.
+    const attachments = await this.resolveAttachments(env.payload.attachments);
 
     // R4-7: markTurnDone() only after the turn (success OR failure) fully
     // resolves — a `finally` so a throw from runTurn/emitReply still marks
@@ -200,7 +223,7 @@ export class RaccoonBridge {
       this.safeSend(userId, createEnvelope('typing', { from: agent, to, channel, payload: { state: 'start' } }));
 
       const res = await this.runTurn(
-        { userId, channel, text: env.payload.text, messageId: env.id },
+        { userId, channel, text: env.payload.text, messageId: env.id, ...(attachments ? { attachments } : {}) },
         () => markTurnDone(), // drainLate marks the timed-out turn done only when it finally ends
       );
       outcome = res.outcome;
@@ -219,6 +242,29 @@ export class RaccoonBridge {
       // Timeout: drainLate owns markTurnDone (called when the background turn
       // ends). Anything else: the turn is over, mark it done now.
       if (outcome !== 'timeout') markTurnDone();
+    }
+  }
+
+  /** Permanently reference a msg's attachments and return the values the
+   *  RUNNER should see: the store-CANONICAL `known` set when referencing
+   *  succeeds, the client-claimed values otherwise (absent media dep, or
+   *  reference threw — logged, never thrown: a media failure must not block
+   *  the turn). Undefined when the msg carried no attachments. */
+  private async resolveAttachments(claimed: Attachment[] | undefined): Promise<Attachment[] | undefined> {
+    if (!claimed || claimed.length === 0) return undefined;
+    if (!this.media) {
+      // Loud on purpose: attachments arrived but nothing can reference them,
+      // so the media store's sweep will eventually delete what these rows
+      // point at — a host wiring bug, not a user error.
+      console.error('[raccoon-bridge] msg carries attachments but no media dep is wired; falling back to client-claimed values');
+      return claimed;
+    }
+    try {
+      const { known } = await this.media.reference(claimed.map((a) => a.url));
+      return known;
+    } catch (err) {
+      console.error('[raccoon-bridge] media.reference failed; falling back to client-claimed values:', err);
+      return claimed;
     }
   }
 

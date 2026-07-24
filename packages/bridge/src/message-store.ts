@@ -32,6 +32,7 @@ export class InMemoryMessageStore implements MessageStore {
       role: m.role,
       text: m.text,
       ts: m.ts,
+      ...(m.attachments ? { attachments: m.attachments } : {}),
     }));
     const result: { messages: HistoryMessage[]; nextBefore?: string } = { messages };
     if (start > 0 && slice.length > 0) result.nextBefore = slice[0].id;

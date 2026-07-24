@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { createEnvelope, type AnyEnvelope } from '@raccoon/protocol';
+import { describe, expect, it, vi } from 'vitest';
+import { createEnvelope, type AnyEnvelope, type Attachment } from '@raccoon/protocol';
 import { RaccoonBridge, RetryableTurnError } from './bridge.js';
 import { InMemoryMessageStore } from './message-store.js';
-import type { AgentContext, AgentRunner, OutboundHub } from './types.js';
+import type { AgentContext, AgentRunner, OutboundHub, StoredMessage } from './types.js';
 
 /** Fake hub: captures sends, lets tests inject inbound envelopes. */
 class FakeHub implements OutboundHub {
@@ -683,5 +683,157 @@ describe('RaccoonBridge', () => {
     gate.release?.();
     await settle();
     expect(runsFor['A']).toBe(1);
+  });
+});
+
+// ---- Media attachments: THE standalone permanent-reference point ----
+
+const MEDIA_A: Attachment = { url: '/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/a.png', mime: 'image/png', name: 'a.png', size: 3 };
+const MEDIA_B: Attachment = { url: '/media/01BX5ZZKBKACTAV9WEVGEMMVRZ/b.jpg', mime: 'image/jpeg', name: 'b.jpg', size: 7 };
+
+function attachmentMsg(text: string, attachments: Attachment[], channel = 'coordinator'): AnyEnvelope {
+  return createEnvelope('msg', {
+    from: 'user:u1', to: `agent:${channel}`, channel, payload: { text, attachments },
+  });
+}
+
+describe('RaccoonBridge media attachments', () => {
+  it('references attachments AFTER the append succeeds and passes the CANONICAL known result to the runner ctx', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const events: string[] = [];
+    const originalAppend = store.append.bind(store);
+    store.append = async (m) => { events.push(`append:${m.role}`); return originalAppend(m); };
+    // The store is the authority: it returns a CANONICAL attachment whose size
+    // differs from the client-claimed one, so the test can tell which reached
+    // the runner.
+    const canonical: Attachment = { ...MEDIA_A, size: 1234 };
+    const media = {
+      reference: async (paths: string[]) => {
+        events.push(`reference:${paths.join(',')}`);
+        return { known: [canonical], unknown: [] };
+      },
+    };
+    const seen: AgentContext[] = [];
+    const capture: AgentRunner = { async *run(ctx) { seen.push(ctx); yield 'got it'; } };
+    const bridge = new RaccoonBridge({ hub, runner: capture, store, media });
+    bridge.start();
+
+    hub.inject(attachmentMsg('see attached', [MEDIA_A]), 'u1');
+    await settle();
+
+    // The permanent-reference transition happens AFTER the user append succeeded.
+    expect(events.slice(0, 2)).toEqual(['append:user', `reference:${MEDIA_A.url}`]);
+    // The runner sees the store-canonical attachment, not the client claim.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.attachments).toEqual([canonical]);
+    // The history ROW keeps the client-claimed values: it was written before
+    // the reference call, and v1 adds no row-update machinery (history
+    // canonicalization is a non-goal — the canonical values feed the RUNNER).
+    const page = await store.page('coordinator', { userId: 'u1', limit: 10 });
+    expect(page.messages[0]).toMatchObject({ role: 'user', text: 'see attached', attachments: [MEDIA_A] });
+
+    // A plain text msg must NOT invoke reference at all.
+    hub.inject(userMsg('no media here'), 'u1');
+    await settle();
+    expect(events.filter((e) => e.startsWith('reference:'))).toHaveLength(1);
+  });
+
+  it('passes msg attachments through to the runner ctx and persists them in history when no media dep is wired', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const hub = new FakeHub();
+      const store = new InMemoryMessageStore();
+      const appendedRows: StoredMessage[] = [];
+      const originalAppend = store.append.bind(store);
+      store.append = async (m) => { appendedRows.push(m); return originalAppend(m); };
+      const seen: AgentContext[] = [];
+      const capture: AgentRunner = { async *run(ctx) { seen.push(ctx); yield 'noted'; } };
+      const bridge = new RaccoonBridge({ hub, runner: capture, store }); // no media dep
+      bridge.start();
+
+      hub.inject(attachmentMsg('see attached', [MEDIA_A, MEDIA_B]), 'u1');
+      await settle();
+
+      // Client-claimed values reach the runner unchanged (nothing to canonicalize against).
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.attachments).toEqual([MEDIA_A, MEDIA_B]);
+      // The user row carries the attachments; the agent reply row does not.
+      expect(appendedRows[0]).toMatchObject({ role: 'user', text: 'see attached', attachments: [MEDIA_A, MEDIA_B] });
+      expect(appendedRows[1]!.attachments).toBeUndefined();
+      // Misconfiguration is loud: attachments arrived but nothing can reference them.
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('a media.reference failure never blocks the turn — client-claimed values reach the runner', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const hub = new FakeHub();
+      const store = new InMemoryMessageStore();
+      const media = { reference: async (_paths: string[]): Promise<{ known: Attachment[]; unknown: string[] }> => { throw new Error('media store offline'); } };
+      const seen: AgentContext[] = [];
+      const capture: AgentRunner = { async *run(ctx) { seen.push(ctx); yield 'still works'; } };
+      const bridge = new RaccoonBridge({ hub, runner: capture, store, media });
+      bridge.start();
+
+      hub.inject(attachmentMsg('see attached', [MEDIA_A]), 'u1');
+      await settle();
+
+      // Full turn despite the reference failure: ack, typing pair, reply.
+      expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg']);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.attachments).toEqual([MEDIA_A]); // fallback to the client claim
+      expect(errSpy).toHaveBeenCalled(); // the failure is logged, not swallowed silently
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('history replay returns attachments on the HistoryMessage', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    await store.append({ id: 'm1', channel: 'coordinator', userId: 'u1', role: 'user', text: 'photo', ts: '2026-07-04T10:00:00.000Z', attachments: [MEDIA_A] });
+    await store.append({ id: 'm2', channel: 'coordinator', userId: 'u1', role: 'agent', text: 'nice', ts: '2026-07-04T10:01:00.000Z' });
+    const bridge = new RaccoonBridge({ hub, runner: echoRunner, store });
+    bridge.start();
+
+    hub.inject(createEnvelope('history.request', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator',
+      payload: { channel: 'coordinator', limit: 10 },
+    }), 'u1');
+    await settle();
+
+    expect(hub.sent).toHaveLength(1);
+    const page = hub.sent[0]!.env;
+    expect(page.kind).toBe('history.page');
+    if (page.kind === 'history.page') {
+      expect(page.payload.messages[0]!.attachments).toEqual([MEDIA_A]);
+      // A row without attachments round-trips without the key.
+      expect('attachments' in page.payload.messages[1]!).toBe(false);
+    }
+  });
+
+  it('handles an attachment-only msg (empty text) end-to-end', async () => {
+    const hub = new FakeHub();
+    const store = new InMemoryMessageStore();
+    const media = { reference: async (_paths: string[]) => ({ known: [MEDIA_A], unknown: [] }) };
+    const seen: AgentContext[] = [];
+    const capture: AgentRunner = { async *run(ctx) { seen.push(ctx); yield 'nice photo'; } };
+    const bridge = new RaccoonBridge({ hub, runner: capture, store, media });
+    bridge.start();
+
+    hub.inject(attachmentMsg('', [MEDIA_A]), 'u1');
+    await settle();
+
+    expect(hub.sent.map((s) => s.env.kind)).toEqual(['ack', 'typing', 'typing', 'msg']);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.text).toBe('');
+    expect(seen[0]!.attachments).toEqual([MEDIA_A]);
+    const page = await store.page('coordinator', { userId: 'u1', limit: 10 });
+    expect(page.messages.map((m) => [m.role, m.text])).toEqual([['user', ''], ['agent', 'nice photo']]);
+    expect(page.messages[0]!.attachments).toEqual([MEDIA_A]);
   });
 });

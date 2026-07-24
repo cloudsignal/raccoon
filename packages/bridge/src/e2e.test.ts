@@ -21,7 +21,9 @@ describe('bridge e2e over ws transport', () => {
   it('a paired client gets ack + typing + concatenated reply, then history', async () => {
     hub = new WsHub({ instance: 'test', channels: ['coordinator'] });
     const { port } = await hub.start();
-    const bridge = new RaccoonBridge({ hub, runner: upperRunner, store: new InMemoryMessageStore() });
+    // media: hub.media pins, at compile time, that a real transport's
+    // MediaStore structurally satisfies the bridge's MediaReferencer seam.
+    const bridge = new RaccoonBridge({ hub, runner: upperRunner, store: new InMemoryMessageStore(), media: hub.media });
     bridge.start();
 
     const token = hub.issuePairingToken('u1');

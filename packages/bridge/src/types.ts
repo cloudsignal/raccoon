@@ -1,4 +1,4 @@
-import type { AnyEnvelope, HistoryMessage } from '@raccoon/protocol';
+import type { AnyEnvelope, Attachment, HistoryMessage } from '@raccoon/protocol';
 
 /** The subset of a transport hub the bridge needs. Plan A's WsHub
  *  structurally satisfies this; MQTT and other transport hubs will too. */
@@ -7,11 +7,23 @@ export interface OutboundHub {
   onEnvelope(handler: (env: AnyEnvelope, userId: string) => void): () => void;
 }
 
+/** The subset of a media store the bridge needs: the PERMANENT-reference
+ *  transition for hub-issued attachment paths (see handleMsg — the bridge is
+ *  the standalone reference point). transport-ws's MediaStore structurally
+ *  satisfies this (hosts wire `media: hub.media`); the bridge itself stays
+ *  transport-agnostic. */
+export interface MediaReferencer {
+  reference(paths: string[]): Promise<{ known: Attachment[]; unknown: string[] }>;
+}
+
 export interface AgentContext {
   userId: string;
   channel: string;
   text: string;
   messageId: string;
+  /** Hub-issued media the user attached (validated media paths). Runners
+   *  that do not model media can ignore this. */
+  attachments?: Attachment[];
   /** Present when this turn is the user's response to an approval.request.
    *  `text` carries the edited text (if any) or the chosen option; `approval`
    *  gives the runner the original request id and the raw choice. Runners that
@@ -35,6 +47,12 @@ export interface StoredMessage {
   role: 'user' | 'agent';
   text: string;
   ts: string;
+  /** Hub-issued attachments as CLAIMED by the client at append time. The row
+   *  is written BEFORE the permanent-reference call (append-then-reference —
+   *  see handleMsg), and v1 deliberately has no row-update machinery: the
+   *  store-canonical values feed the RUNNER only; history canonicalization is
+   *  a non-goal. */
+  attachments?: Attachment[];
 }
 
 export interface MessageStore {
