@@ -1,3 +1,4 @@
+import { FileText } from 'lucide-react';
 import { channelMeta, TONES } from '../config.js';
 import { formatTime } from '../lib/time.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -6,6 +7,13 @@ import type { ChatMessage } from '../state/messages.js';
 import { Ticks } from './ticks.js';
 
 const SHADOW = { boxShadow: '0 1px 2px 0 rgb(0 0 0 / 0.06)' };
+
+/** 34500 -> "34 KB", 2621440 -> "2.5 MB" (KB floor of 1 so tiny files never show 0). */
+function humanSize(bytes: number): string {
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
 
 export function MessageBubble(props: {
   msg: ChatMessage;
@@ -47,7 +55,31 @@ export function MessageBubble(props: {
           {formatTime(msg.ts)}
           {mine && msg.delivery ? <Ticks delivery={msg.delivery} /> : null}
         </span>
-        {renderMarkdown(msg.text)}
+        {/* Attachment URLs are RELATIVE hub-issued /media/... paths — rendered
+            as-is (same-origin); the app never absolutizes them. */}
+        {msg.attachments?.map((a) =>
+          a.mime.startsWith('image/') ? (
+            <a key={a.url} href={a.url} target="_blank" rel="noopener noreferrer" className="mb-1 block">
+              <img src={a.url} alt={a.name ?? 'image'} loading="lazy" className="max-h-64 w-auto rounded-lg" />
+            </a>
+          ) : (
+            <a
+              key={a.url}
+              href={a.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              download={a.name}
+              className="mb-1 flex items-center gap-2 rounded-lg bg-surface-dim px-2.5 py-2"
+            >
+              <FileText size={16} className="shrink-0" aria-hidden />
+              <span className="min-w-0">
+                <span className="block truncate text-[13px] font-medium">{a.name ?? 'file'}</span>
+                {a.size ? <span className="block text-[11px] text-ink-faint">{humanSize(a.size)}</span> : null}
+              </span>
+            </a>
+          ),
+        )}
+        {msg.text ? renderMarkdown(msg.text) : null}
       </div>
       {mine && msg.delivery === 'failed' ? (
         msg.failureReason === 'attachments-expired' ? (

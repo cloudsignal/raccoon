@@ -1,7 +1,18 @@
 import { channelMeta, TONES, appConfig } from '../config.js';
 import { toPlainText } from '../lib/markdown.js';
+import type { ChatMessage } from '../state/messages.js';
 import { useChat } from '../transport/context.js';
 import { PushBanner } from './push-banner.js';
+
+/** One-line row preview. Attachment-only messages carry legally-empty text —
+ *  fall back to a media hint: Photo for images, else the file's name. */
+function previewText(last: ChatMessage): string {
+  const text = toPlainText(last.text);
+  if (text) return text;
+  const a = last.attachments?.[0];
+  if (!a) return '';
+  return a.mime.startsWith('image/') ? 'Photo' : a.name ?? 'File';
+}
 
 export function ChannelList(props: { onOpen: (id: string) => void }) {
   const { session, state, status } = useChat();
@@ -34,7 +45,7 @@ export function ChannelList(props: { onOpen: (id: string) => void }) {
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[15px] font-semibold text-ink">{meta.label}</span>
-                <span className="block truncate text-sm text-ink-faint">{last ? toPlainText(last.text) : meta.blurb}</span>
+                <span className="block truncate text-sm text-ink-faint">{last ? previewText(last) : meta.blurb}</span>
               </span>
               {unread > 0 ? (
                 <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-semibold text-white">
