@@ -58,6 +58,27 @@ With TLS in front of the hub:
   process-locally; see [connector-authoring.md](connector-authoring.md). A
   redelivery after a restart with a non-durable store can re-run a turn.
 
+## Media attachments: capability URLs
+
+Uploaded files are served at `/media/<id>/<name>` where `<id>` is 26
+characters drawn from 128 bits of cryptographic randomness. Reads are NOT
+authenticated: possession of the link grants read access (the model most
+chat platforms use for media). What bounds this:
+
+- Uploading requires an authenticated session; anonymous clients cannot write.
+- The id space is unguessable in practice and there is no listing endpoint;
+  the filename segment is decorative — content resolves by id only.
+- Deployments are TLS-only, so links do not transit in the clear.
+- Unreferenced uploads are swept automatically; an uploader can delete their
+  own pending upload before a message references it.
+
+The consequence to understand: anyone a media link is forwarded to (or any
+system that logs full URLs) can fetch that file. Do not treat a media URL as
+a secret-keeping boundary stronger than the conversation it belongs to.
+Uploaded HTML/SVG and other active content is never served inline — it is
+forced to download as `application/octet-stream` — so a capability URL
+cannot be used to run script on the hub origin.
+
 ## Deployment checklist
 
 - [ ] Hub is behind `wss://` (TLS terminated by a proxy); the hub itself binds

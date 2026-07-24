@@ -154,6 +154,15 @@ card was sent to, so another user cannot resolve it by tapping. If a
 multi-user deployment needs typed commands restricted too, gate approvals to
 specific senders with OpenClaw's own `commands.allowFrom.raccoon` allowlist.
 
+### Send images and files
+
+The composer's paperclip (plus paste and desktop drag-drop) attaches up to 4
+files of 25MB each per message. Files upload to your hub and are served back
+as unguessable capability URLs — see the media section of
+[security.md](security.md) for exactly what that model does and does not
+protect. On OpenClaw, images you send are fetched by the gateway's media
+pipeline, so the agent genuinely sees them.
+
 ## Try the bundled demo
 
 From a clone of the monorepo:
