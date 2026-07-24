@@ -10,6 +10,8 @@ import {
   type AnyEnvelope,
 } from '@raccoon/protocol';
 import { MemoryCredentialStore, type CredentialStore } from './credential-store.js';
+import { createMediaStore, type MediaStore } from './media-store.js';
+import { createMediaHttpHandler } from './media-http.js';
 
 interface PairingToken { userId: string; expiresAt: number; used: boolean }
 
@@ -73,6 +75,10 @@ export interface WsHubOptions {
   maxPayloadBytes?: number;
   /** Serve a static SPA build (the Raccoon app dist/) over plain HTTP on the same port. */
   staticDir?: string;
+  /** Directory for uploaded media blobs (the /media capability-URL store).
+   *  Defaults to `<cwd>/.raccoon-store/media`; hosts with their own store
+   *  path (connectors, downstream relays) pass `<storePath>/media` explicitly. */
+  mediaDir?: string;
   /** Advertised in pair.grant so clients can register web-push subscriptions. */
   vapidPublicKey?: string;
   /** #P1-C: how long a PROVISIONAL (paired-but-unconfirmed) session survives
@@ -103,6 +109,9 @@ export class WsHub {
   private readonly vapidPublicKey: string | null;
   private readonly provisionalTtlMs: number;
   private readonly validatePairingToken: ((token: string, signal?: AbortSignal) => Promise<string | null>) | null;
+  private readonly mediaStore: MediaStore;
+  private readonly mediaHttp: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
+  private sweepTimer: NodeJS.Timeout | null = null;
 
   private server: Server | null = null;
   private wss: WebSocketServer | null = null;
@@ -180,6 +189,21 @@ export class WsHub {
     this.staticDir = opts.staticDir ?? null;
     this.vapidPublicKey = opts.vapidPublicKey ?? null;
     this.validatePairingToken = opts.validatePairingToken ?? null;
+    // Media uploads (capability-URL store) — served on the same port, mounted
+    // BEFORE the static SPA so /media/* is never shadowed by the SPA fallback.
+    // Upload auth is the hub's own session store: a bearer session token.
+    this.mediaStore = createMediaStore({
+      dir: opts.mediaDir ?? join(process.cwd(), '.raccoon-store', 'media'),
+      maxTotalBytes: Number(process.env.RACCOON_MEDIA_MAX_BYTES) > 0 ? Number(process.env.RACCOON_MEDIA_MAX_BYTES) : undefined,
+    });
+    this.mediaHttp = createMediaHttpHandler(this.mediaStore, { verifyBearer: (t) => this.store.verifySession(t) });
+  }
+
+  /** The hub's media store, exposed for host wiring: the bridge performs the
+   *  PERMANENT reference here after its durable append (Task 4) — the hub
+   *  itself never flips references on the route path. */
+  get media(): MediaStore {
+    return this.mediaStore;
   }
 
   async start(): Promise<{ port: number }> {
@@ -292,11 +316,25 @@ export class WsHub {
         resolve();
       });
     });
+    // Media sweep: reclaim unreferenced/lease-expired uploads — once at start
+    // (a restart must not wait a day to reclaim), then daily. unref'd so the
+    // timer never holds the process open; cleared in stop(). The startup pass
+    // only logs when it actually reclaimed something (boots stay quiet).
+    void this.mediaStore.sweep()
+      .then((r) => { if (r.deleted > 0) console.log('[raccoon] media sweep', JSON.stringify(r)); })
+      .catch(() => { /* sweep failure must never take the hub down */ });
+    this.sweepTimer = setInterval(() => {
+      void this.mediaStore.sweep()
+        .then((r) => console.log('[raccoon] media sweep', JSON.stringify(r)))
+        .catch(() => { /* retried next interval */ });
+    }, 24 * 60 * 60 * 1000);
+    if (typeof this.sweepTimer.unref === 'function') this.sweepTimer.unref();
     const addr = this.server.address();
     return { port: typeof addr === 'object' && addr ? addr.port : this.portOpt };
   }
 
   async stop(): Promise<void> {
+    if (this.sweepTimer) { clearInterval(this.sweepTimer); this.sweepTimer = null; }
     if (this.wss) for (const ws of this.wss.clients) ws.terminate();
     for (const set of this.byUser.values()) for (const ws of set) ws.terminate();
     this.byUser.clear();
@@ -351,6 +389,16 @@ export class WsHub {
   }
 
   private serveHttp(req: IncomingMessage, res: ServerResponse): void {
+    // /media/* first (upload/serve/delete/reference), then the static SPA.
+    void this.mediaHttp(req, res)
+      .then((handled) => {
+        if (handled) return;
+        this.serveStatic(req, res);
+      })
+      .catch(() => { try { res.destroy(); } catch { /* already gone */ } }); // belt-and-braces: the handler has its own boundary
+  }
+
+  private serveStatic(req: IncomingMessage, res: ServerResponse): void {
     if (!this.staticDir) { res.statusCode = 404; res.end('not found'); return; }
     let pathname: string;
     try { pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://local').pathname); }

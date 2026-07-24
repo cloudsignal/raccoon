@@ -17,3 +17,5 @@ release-artifacts/
 *.local
 *.log
 data/
+# default on-disk store (connector storePath + hub media) when no explicit path is configured
+.raccoon-store/
