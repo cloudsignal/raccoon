@@ -99,6 +99,10 @@ export function createMediaStore(opts: MediaStoreOptions): MediaStore {
   // Root + tmp dirs exist before ANY statfs/quota/save path runs — a fresh
   // deployment must not fail its first upload on a missing directory.
   const ready = mkdir(join(dir, 'tmp'), { recursive: true });
+  // The eager promise must never float unhandled (process-fatal on an
+  // unwritable dir at construction); save() still awaits `ready` and
+  // surfaces the real failure to its caller.
+  ready.catch(() => undefined);
 
   // ---- admission ledger (identity rolling window + global total) ----------
   const ledger = new Map<string, Array<{ ts: number; bytes: number }>>();

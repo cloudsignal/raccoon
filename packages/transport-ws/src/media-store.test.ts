@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -42,6 +42,27 @@ describe('save + open', () => {
     const store = createMediaStore({ dir: join(base, 'nested', 'media') }); // real statfs default
     const r = await store.save(body('x'), { mime: 'text/plain', name: 'a.txt', uploadedBy: 'u1' });
     expect(r.ok).toBe(true);
+  });
+
+  it('construction on an unwritable dir floats no unhandled rejection; the first save surfaces it', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'raccoon-media-'));
+    dirs.push(base);
+    const blocker = join(base, 'not-a-dir');
+    writeFileSync(blocker, 'x'); // a FILE where the store needs a directory → eager mkdir fails
+    const onUnhandled = vi.fn();
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const store = createMediaStore({ dir: join(blocker, 'media'), freeBytes: async () => 10 * 1024 ** 3 });
+      // Give the eager mkdir's failure macrotask turns to fire BEFORE any save
+      // attaches a handler — a floating rejection would be reported here.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(onUnhandled).not.toHaveBeenCalled();
+      await expect(
+        store.save(body('x'), { mime: 'text/plain', name: 'a.txt', uploadedBy: 'u1' }),
+      ).rejects.toThrow();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('an fd stream opened before a delete still serves the bytes (GET-vs-delete race)', async () => {
