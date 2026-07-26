@@ -187,7 +187,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ...(isAgent ? {} : { delivery: 'sent' as const }),
       };
       const list = upsert(state.messages[channel] ?? [], msg);
-      if (list === state.messages[channel]) return state;
+      if (list === state.messages[channel]) {
+        // Dedupe no-op (same id redelivered) — the reply DID arrive, so a
+        // live typing indicator must still clear; nothing else changes (in
+        // particular the unread badge must not double-count).
+        if (isAgent && state.typing[channel]) {
+          return { ...state, typing: { ...state.typing, [channel]: false } };
+        }
+        return state;
+      }
       const bump = isAgent && !action.active;
       return {
         ...patch(state, channel, list),
@@ -209,7 +217,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ts: action.env.ts,
       };
       const list = upsert(state.messages[channel] ?? [], msg);
-      if (list === state.messages[channel]) return state;
+      if (list === state.messages[channel]) {
+        // Same dedupe-no-op rescue as 'message' above.
+        if (state.typing[channel]) {
+          return { ...state, typing: { ...state.typing, [channel]: false } };
+        }
+        return state;
+      }
       const bump = !action.active;
       return {
         ...patch(state, channel, list),
@@ -243,8 +257,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       });
       return patch(state, action.channel, list);
     }
-    case 'typing':
+    case 'typing': {
+      if ((state.typing[action.channel] ?? false) === action.on) return state;
       return { ...state, typing: { ...state.typing, [action.channel]: action.on } };
+    }
     case 'responded': {
       const list = (state.messages[action.channel] ?? []).map((m) =>
         m.kind === 'approval' && m.approval?.refId === action.refId

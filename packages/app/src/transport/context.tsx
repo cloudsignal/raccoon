@@ -22,6 +22,14 @@ export const ACK_TIMEOUT_MS = 10_000;
 // failure. Generous — a real agent turn (LLM + tools) can legitimately take a
 // while — but bounded, so a hung server turn can't spin forever.
 export const PROCESSING_TIMEOUT_MS = 120_000;
+// Self-healing typing dots: a 'typing stop' can be lost or reordered (QoS1
+// redelivery across a reconnect can even replay a stale 'start' AFTER the
+// reply landed), and nothing else would ever clear the indicator. Every
+// 'start' arms this deadline; a fresh 'start' extends it, a 'stop' or the
+// reply itself disarms it. Generous so a legitimately long agent turn keeps
+// its dots for a while — but bounded, so the UI can't show a phantom
+// "thinking" forever.
+export const TYPING_AUTO_CLEAR_MS = 75_000;
 const HISTORY_LIMIT = 50;
 // #R10: during interactive pairing, connect() can REJECT on a lost pair.confirmed
 // even though the transport recovers in the background and re-emits the grant.
@@ -296,6 +304,8 @@ export function TransportProvider(props: TransportProviderProps) {
   // Managed in lockstep with validUserIdRef at every identity transition.
   const identityScopeRef = useRef<string | null>(null);
   const ackTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // channel → auto-clear deadline for the typing indicator (TYPING_AUTO_CLEAR_MS).
+  const typingTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const [activeChannel, setActiveChannel] = useState<string | null>(null);
   // Finding 1: track unsubscribe functions so we can clean them up before re-wiring
   const unsubsRef = useRef<Array<() => void>>([]);
@@ -319,12 +329,30 @@ export function TransportProvider(props: TransportProviderProps) {
 
   const isActive = useCallback((channel: string) => activeRef.current === channel && document.visibilityState === 'visible', []);
 
+  const clearTypingTimer = useCallback((channel: string) => {
+    const timer = typingTimers.current.get(channel);
+    if (timer) { clearTimeout(timer); typingTimers.current.delete(channel); }
+  }, []);
+
   const handleEnvelope = useCallback((env: AnyEnvelope) => {
     if (env.kind === 'msg') {
+      clearTypingTimer(env.channel); // the reply is the definitive 'stop'
       dispatch({ type: 'message', env, active: isActive(env.channel) });
       if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
-    } else if (env.kind === 'typing') dispatch({ type: 'typing', channel: env.channel, on: env.payload.state === 'start' });
+    } else if (env.kind === 'typing') {
+      const on = env.payload.state === 'start';
+      clearTypingTimer(env.channel);
+      if (on) {
+        // Arm the self-heal deadline (see TYPING_AUTO_CLEAR_MS).
+        typingTimers.current.set(env.channel, setTimeout(() => {
+          typingTimers.current.delete(env.channel);
+          dispatch({ type: 'typing', channel: env.channel, on: false });
+        }, TYPING_AUTO_CLEAR_MS));
+      }
+      dispatch({ type: 'typing', channel: env.channel, on });
+    }
     else if (env.kind === 'approval.request') {
+      clearTypingTimer(env.channel);
       dispatch({ type: 'approval', env, active: isActive(env.channel) });
       if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
       // #R8-1: persist the request under this identity scope so a reload can
@@ -464,7 +492,7 @@ export function TransportProvider(props: TransportProviderProps) {
         });
       });
     }
-  }, [isActive]);
+  }, [isActive, clearTypingTimer]);
 
   const attempt = useCallback(async (entry: outbox.OutboxEntry) => {
     const transport = transportRef.current;
@@ -657,6 +685,8 @@ export function TransportProvider(props: TransportProviderProps) {
   const wipeAndReset = useCallback(async (wiped: ActiveSession | null) => {
     for (const timer of ackTimers.current.values()) clearTimeout(timer);
     ackTimers.current.clear();
+    for (const timer of typingTimers.current.values()) clearTimeout(timer);
+    typingTimers.current.clear();
     // #R6-5b: cancel any scheduled lease sweep — it must not survive a
     // wipe/re-pair and fire against a fresh identity.
     if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
@@ -891,6 +921,8 @@ export function TransportProvider(props: TransportProviderProps) {
         unsubsRef.current = [];
         for (const timer of ackTimers.current.values()) clearTimeout(timer);
         ackTimers.current.clear();
+        for (const timer of typingTimers.current.values()) clearTimeout(timer);
+        typingTimers.current.clear();
         // Do NOT close the override transport — the host owns its lifecycle.
         transportRef.current = null;
       };

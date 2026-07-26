@@ -73,6 +73,41 @@ describe('chatReducer', () => {
     expect(state.unread['coordinator']).toBe(0);
   });
 
+  it('a redelivered agent message (dedupe no-op) still clears a live typing indicator', () => {
+    const env = agentMsg('hello');
+    let state = chatReducer(emptyChatState, { type: 'message', env, active: false });
+    // The ephemeral 'typing start' got redelivered AFTER the reply (QoS1
+    // reorder across a reconnect) — indicator is back on with no stop coming.
+    state = chatReducer(state, { type: 'typing', channel: 'coordinator', on: true });
+    const unreadBefore = state.unread['coordinator'];
+    // The reply's own QoS1 redelivery must rescue the stuck indicator...
+    state = chatReducer(state, { type: 'message', env, active: false });
+    expect(state.typing['coordinator']).toBe(false);
+    // ...without double-counting the message or the unread badge.
+    expect(state.messages['coordinator']).toHaveLength(1);
+    expect(state.unread['coordinator']).toBe(unreadBefore);
+  });
+
+  it('a redelivered approval request (dedupe no-op) still clears typing', () => {
+    const env = createEnvelope('approval.request', {
+      from: 'agent:assistant', to: 'user:u1', channel: 'coordinator',
+      payload: { refId: 'task-9', title: 'T', description: 'D', options: ['approve', 'skip'] },
+    });
+    let state = chatReducer(emptyChatState, { type: 'approval', env, active: true });
+    state = chatReducer(state, { type: 'typing', channel: 'coordinator', on: true });
+    state = chatReducer(state, { type: 'approval', env, active: true });
+    expect(state.typing['coordinator']).toBe(false);
+    expect(state.messages['coordinator']).toHaveLength(1);
+  });
+
+  it('typing action is a state no-op when the flag is unchanged', () => {
+    const s1 = chatReducer(emptyChatState, { type: 'typing', channel: 'coordinator', on: false });
+    expect(s1).toBe(emptyChatState);
+    const s2 = chatReducer(s1, { type: 'typing', channel: 'coordinator', on: true });
+    const s3 = chatReducer(s2, { type: 'typing', channel: 'coordinator', on: true });
+    expect(s3).toBe(s2);
+  });
+
   it('tracks optimistic sends through ack to delivery', () => {
     let state = chatReducer(emptyChatState, { type: 'optimistic', msg: optimistic('m1', 'hi', '2026-07-04T09:12:00.000Z') });
     expect(state.messages['coordinator']![0]!.delivery).toBe('pending');

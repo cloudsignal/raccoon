@@ -7,7 +7,7 @@ import { closeDbForTests, kvGet, kvSet } from '../lib/idb.js';
 import { loadSession, saveSession } from '../lib/session.js';
 import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
-import { TransportProvider, useChat, type ChatApi } from './context.js';
+import { TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from './context.js';
 
 // Unmount every rendered provider BEFORE resetting the DB — the boot effect's
 // cleanup clears its periodic lease sweep, BroadcastChannels, and timers, so a
@@ -108,6 +108,31 @@ describe('TransportProvider', () => {
     const saved = await loadSession();
     expect(saved?.sessionToken).toBe('s-recovered');
     expect(saved?.userId).toBe('u1');
+  });
+
+  it('auto-clears a typing indicator whose stop never arrives (TYPING_AUTO_CLEAR_MS)', async () => {
+    // A lost 'typing stop' (or a QoS1-redelivered stale 'start' landing after
+    // the reply) must not pin the dots forever — the deadline self-heals it.
+    // Mount under real timers (the boot flow needs them), then freeze the
+    // clock so the deadline armed by the 'start' can be advanced past.
+    const transport = new FakeTransport();
+    await mountPaired(transport);
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        transport.emit(createEnvelope('typing', {
+          from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+          payload: { state: 'start' },
+        }));
+      });
+      expect(api.state.typing['coordinator']).toBe(true);
+      act(() => {
+        vi.advanceTimersByTime(TYPING_AUTO_CLEAR_MS + 1_000);
+      });
+      expect(api.state.typing['coordinator']).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('unpair wipes local identity state (outbox + kv + chat state) so a re-pair cannot leak the prior user', async () => {
