@@ -14,7 +14,7 @@ import { TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from '
 // prior test's provider can't run async outbox work against the next test's
 // shared fake-IndexedDB (a cross-test flake once 'open' began scheduling
 // recoverProcessing()/drain(), #R6-2b/#R6-5b).
-afterEach(async () => { cleanup(); await closeDbForTests(); });
+afterEach(async () => { cleanup(); currentPairingTransport = null; await closeDbForTests(); });
 
 // The pairingId IS the outbox/approvals scope and every per-conversation key
 // prefix. Seeded pairings use a fixed ULID so keys are deterministic across
@@ -22,6 +22,8 @@ afterEach(async () => { cleanup(); await closeDbForTests(); });
 const EPOCH = 'e1';
 const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const CK = `${P1}/coordinator`;
+const P2 = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
+const CK2 = `${P2}/coordinator`;
 const OTHER_SCOPE = '01OTHERPAIRINGSCOPEAAAAAAA'; // a pairing this provider does not hold
 
 let api: ChatApi;
@@ -30,13 +32,31 @@ function Probe() {
   return <div data-testid="phase">{api.phase}</div>;
 }
 
+// Harness hook for re-pair tests: when set, mountPaired's makeTransport hands
+// out THIS transport instead of the boot one — the boot dial (no onAdoptGrant
+// in its opts) keeps the default transport, while a later pairWithPayload
+// (which passes onAdoptGrant) picks up the staged re-scan transport.
+let currentPairingTransport: FakeTransport | null = null;
+
+/** Inbound agent message envelope with the BARE channel (the wire never
+ *  carries a pairingId — boundary stamping names the pairing). */
+function agentMsg(channel: string, text: string) {
+  return createEnvelope('msg', {
+    from: `agent:${channel}`, to: 'user:u1', channel, payload: { text },
+  });
+}
+
 async function mountPaired(transport: FakeTransport) {
   await savePairings([{
     url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i',
     channels: ['coordinator'], epoch: EPOCH, pairingId: P1, transportKind: 'ws',
   }]);
   render(
-    <TransportProvider makeTransport={() => transport}>
+    <TransportProvider makeTransport={(opts) => {
+      const t = (opts.onAdoptGrant && currentPairingTransport) || transport;
+      if (opts.onAdoptGrant) t.onAdoptGrant = opts.onAdoptGrant;
+      return t;
+    }}>
       <Probe />
     </TransportProvider>,
   );
@@ -45,6 +65,20 @@ async function mountPaired(transport: FakeTransport) {
   // still-empty outbox before the test seeds rows, so a late mount-drain can't
   // race the seed (claim a just-seeded row to 'sending' and fail a precondition
   // that expects it 'pending'). Quiescence, not arbitrary timing.
+  await new Promise((r) => setTimeout(r, 20));
+}
+
+async function mountTwoPaired(tA: FakeTransport, tB: FakeTransport) {
+  await savePairings([
+    { url: 'ws://a/', sessionToken: 'tA', userId: 'u1', instance: 'alpha', channels: ['coordinator'], epoch: 'eA', pairingId: P1, transportKind: 'ws' },
+    { url: 'ws://b/', sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eB', pairingId: P2, transportKind: 'ws' },
+  ]);
+  render(
+    <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
+      <Probe />
+    </TransportProvider>,
+  );
+  await waitFor(() => expect(api.phase).toBe('ready'));
   await new Promise((r) => setTimeout(r, 20));
 }
 
@@ -1232,23 +1266,6 @@ describe('TransportProvider', () => {
   });
 
   describe('two pairings (spec §6)', () => {
-    const P2 = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
-    const CK2 = `${P2}/coordinator`;
-
-    async function mountTwoPaired(tA: FakeTransport, tB: FakeTransport) {
-      await savePairings([
-        { url: 'ws://a/', sessionToken: 'tA', userId: 'u1', instance: 'alpha', channels: ['coordinator'], epoch: 'eA', pairingId: P1, transportKind: 'ws' },
-        { url: 'ws://b/', sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eB', pairingId: P2, transportKind: 'ws' },
-      ]);
-      render(
-        <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
-          <Probe />
-        </TransportProvider>,
-      );
-      await waitFor(() => expect(api.phase).toBe('ready'));
-      await new Promise((r) => setTimeout(r, 20));
-    }
-
     it('routes outbound sends to the owning pairing\'s transport, with the BARE channel on the wire', async () => {
       const tA = new FakeTransport();
       const tB = new FakeTransport();
@@ -1362,6 +1379,113 @@ describe('TransportProvider', () => {
       for (const e of tA.sent) {
         expect(e.channel.includes(P1)).toBe(false);
       }
+    });
+  });
+
+  describe('identity lifecycle — per-pairing unpair, auth-error, cross-tab wipe (Task 6)', () => {
+    it('unpair(P1) wipes only pairing A state; B keeps messages, outbox, lastread', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB);
+      act(() => {
+        tA.emit(agentMsg('coordinator', 'from A'));
+        tB.emit(agentMsg('coordinator', 'from B'));
+      });
+      await waitFor(() => expect(api.state.messages[CK2]).toHaveLength(1));
+      // queue a row on B while its transport is closed, so it survives in the outbox
+      act(() => { tB.setStatus('closed'); });
+      act(() => { api.sendMessage(CK2, 'queued on B'); });
+      act(() => { api.openChannel(CK2); }); // set a lastread marker for B
+      await waitFor(async () => expect((await outbox.listForChannel('coordinator', P2)).length).toBe(1));
+      await act(async () => { await api.unpair(P1); });
+      await waitFor(() => expect(api.pairings).toHaveLength(1));
+      expect(api.phase).toBe('ready');                       // NOT setup — B remains
+      expect(api.state.messages[CK]).toBeUndefined();        // A's chat state dropped
+      expect(api.state.messages[CK2]).toBeDefined();         // B untouched
+      expect((await outbox.listForChannel('coordinator', P2)).length).toBe(1); // B row kept
+      expect((await outbox.listForChannel('coordinator', P1)).length).toBe(0); // A rows gone
+      expect(await kvGet(`lastread:${P2}/coordinator`)).toBeTruthy();
+      expect(await kvGet(`lastread:${P1}/coordinator`)).toBeUndefined();
+      expect(await loadPairingsRaw()).toHaveLength(1);
+    });
+
+    it('unpairing the last pairing lands on setup', async () => {
+      const t = new FakeTransport();
+      await mountPaired(t);
+      await act(async () => { await api.unpair(P1); });
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      expect(api.pairings).toHaveLength(0);
+      expect(await loadPairingsRaw()).toEqual([]);
+    });
+
+    it('a terminal auth error on pairing A unpairs only A and surfaces its name', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB);
+      act(() => { tA.authFail(4401); });
+      await waitFor(() => expect(api.pairings).toHaveLength(1));
+      expect(api.pairings[0]!.pairingId).toBe(P2);
+      expect(api.phase).toBe('ready');
+      expect(api.authError).toContain('alpha');   // names the affected instance
+      // B still live:
+      act(() => { tB.emit(agentMsg('coordinator', 'still works')); });
+      await waitFor(() => expect(api.state.messages[CK2]!.some((m) => m.text === 'still works')).toBe(true));
+    });
+
+    it('cross-tab identity-wiped for (P1, eA) tears down only that pairing and ignores a stale epoch', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB);
+      const bc = new BroadcastChannel('raccoon-identity');
+      bc.postMessage({ type: 'identity-wiped', pairingId: P1, epoch: 'WRONG-EPOCH' });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(api.pairings).toHaveLength(2);       // #R6-8b: stale event ignored
+      bc.postMessage({ type: 'identity-wiped', pairingId: P1, epoch: 'eA' });
+      await waitFor(() => expect(api.pairings).toHaveLength(1));
+      expect(api.pairings[0]!.pairingId).toBe(P2);
+      bc.close();
+    });
+
+    it('re-scanning an already-paired instance refreshes in place: same pairingId, state kept', async () => {
+      const t = new FakeTransport();
+      await mountPaired(t);                              // stored pairing: P1, url 'ws://x/', u1
+      act(() => { t.emit(agentMsg('coordinator', 'before refresh')); });
+      await waitFor(() => expect(api.state.messages[CK]).toHaveLength(1));
+      // Drive the pairing flow for the SAME url+userId with a fresh token —
+      // mountPaired's makeTransport hands pairWithPayload the staged transport.
+      const t2 = new FakeTransport();
+      currentPairingTransport = t2;
+      let pair!: Promise<void>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://x/', transport: 'ws', token: 'fresh' })); });
+      await act(async () => {
+        await t2.grant(createEnvelope('pair.grant', {
+          from: 'system', to: 'user:u1', channel: 'pairing',
+          payload: { sessionToken: 't2', userId: 'u1', instance: 'i', channels: ['coordinator'] },
+        }));
+        await pair;
+      });
+      const list = await loadPairingsRaw();
+      expect(list).toHaveLength(1);
+      expect(list[0]!.pairingId).toBe(P1);               // preserved
+      expect(list[0]!.sessionToken).toBe('t2');          // refreshed
+      expect(list[0]!.epoch).not.toBe(EPOCH);            // new epoch
+      expect(api.pairings).toHaveLength(1);
+      expect(api.state.messages[CK]).toHaveLength(1);    // chat state under P1 survives
+    });
+
+    it('duplicate-guard miss: same url as a DIFFERENT user appends a second pairing', async () => {
+      const t = new FakeTransport();
+      await mountPaired(t);
+      const t2 = new FakeTransport();
+      currentPairingTransport = t2;
+      let pair!: Promise<void>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://x/', transport: 'ws', token: 'other' })); });
+      await act(async () => {
+        await t2.grant(createEnvelope('pair.grant', {
+          from: 'system', to: 'user:u9', channel: 'pairing',
+          payload: { sessionToken: 't9', userId: 'u9', instance: 'i', channels: ['coordinator'] },
+        }));
+        await pair;
+      });
+      expect(api.pairings).toHaveLength(2);
+      expect((await loadPairingsRaw()).map((p) => p.userId).sort()).toEqual(['u1', 'u9']);
     });
   });
 });

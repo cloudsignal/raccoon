@@ -70,7 +70,7 @@ export interface ChatApi {
   activeChannel: ConvKey | null;
   authError: string | null;
   /** Appends a pairing (or refreshes a re-scanned one in place); never wipes
-   *  other pairings. (Task 6 finishes the full multi-pairing semantics.) */
+   *  other pairings. */
   pairWithPayload(json: string): Promise<void>;
   /** #F6: re-probe durable storage from the 'storage-error' phase. On success,
    *  moves to 'setup' (pairing enabled); otherwise stays in 'storage-error'. */
@@ -92,7 +92,7 @@ export interface ChatApi {
    *  the first pairing), read at call time; an embedding host injects its own
    *  via the `uploadProvider` prop. */
   uploadProvider: UploadProvider;
-  /** Unpairs ONE pairing; the others keep running. (Task 6 hardens.) */
+  /** Unpairs ONE pairing; the others keep running. */
   unpair(pairingId: string): Promise<void>;
   /** Local display-name override; empty string clears it back to the default. */
   renamePairing(pairingId: string, displayName: string): Promise<void>;
@@ -325,7 +325,13 @@ export function TransportProvider(props: TransportProviderProps) {
   // continuation's cancel checks compare against it, alongside the per-pairing
   // runtime-existence checks that replace the old global sessionGenRef here.
   const bootGenRef = useRef(0);
-  const ackTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // refId → the armed no-ack/processing timer PLUS the ConvKey its deferred
+  // dispatch would target. The convKey is stored so the per-pairing wipes can
+  // prune EXACTLY this pairing's timers by key prefix: a timer left armed
+  // across a wipe has row/claim-gated durable writes (those no-op), but its
+  // dispatch into a since-dropped ConvKey would resurrect an invisible empty
+  // state slice for the wiped pairing.
+  const ackTimers = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; convKey: ConvKey }>());
   // ConvKey → auto-clear deadline for the typing indicator (TYPING_AUTO_CLEAR_MS).
   const typingTimers = useRef(new Map<ConvKey, ReturnType<typeof setTimeout>>());
 
@@ -401,6 +407,19 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, []);
 
+  /** Cancel every ack/processing timer belonging to one pairing. Timers are
+   *  refId-keyed ACROSS pairings, so the captured convKey (prefixed by the
+   *  pairingId) is what scopes the prune — other pairings' live timers stay
+   *  armed. Used by every per-pairing teardown (unpair, auth-error, cross-tab
+   *  wipe): a surviving timer's durable writes are claim-gated no-ops, but its
+   *  dispatch would land in a dropped ConvKey and mint an empty state slice. */
+  const clearPairingAckTimers = useCallback((pairingId: string) => {
+    const prefix = `${pairingId}/`;
+    for (const [refId, entry] of ackTimers.current) {
+      if (entry.convKey.startsWith(prefix)) { clearTimeout(entry.timer); ackTimers.current.delete(refId); }
+    }
+  }, []);
+
   /**
    * Boundary stamping: envelope handling is a FACTORY closed over the source
    * pairingId — the wire never carries a pairingId, so the transport a message
@@ -444,8 +463,8 @@ export function TransportProvider(props: TransportProviderProps) {
       // The server responded for this envelope — stop the local no-ack
       // timeout regardless of which status it carries.
       const refId = env.payload.refId;
-      const timer = ackTimers.current.get(refId);
-      if (timer) { clearTimeout(timer); ackTimers.current.delete(refId); }
+      const armed = ackTimers.current.get(refId);
+      if (armed) { clearTimeout(armed.timer); ackTimers.current.delete(refId); }
       // #R6-2b: 'received' is terminal only for a msg; for an approval.response
       // it moves the row to a DURABLE 'processing' state (acknowledgeReceipt
       // decides by envelope kind) so a lost terminal ack no longer deletes the
@@ -477,7 +496,7 @@ export function TransportProvider(props: TransportProviderProps) {
               if (applied) dispatch({ type: 'ack', convKey: ck, refId, status: 'failed' });
             });
           }, PROCESSING_TIMEOUT_MS);
-          ackTimers.current.set(refId, processingTimer);
+          ackTimers.current.set(refId, { timer: processingTimer, convKey: ck });
         });
       }
       else if (st === 'failed') void outbox.failByServer(refId);
@@ -655,7 +674,7 @@ export function TransportProvider(props: TransportProviderProps) {
       if (entry.env.kind === 'msg' || entry.env.kind === 'approval.response') {
         // Clear any prior stale timer before arming a new one for the same entry.
         const prior = ackTimers.current.get(entry.id);
-        if (prior) clearTimeout(prior);
+        if (prior) clearTimeout(prior.timer);
         const timer = setTimeout(() => {
           ackTimers.current.delete(entry.id);
           // #R6-7: only drive UI state when the token-gated write actually
@@ -670,7 +689,7 @@ export function TransportProvider(props: TransportProviderProps) {
             if (applied) dispatch({ type: 'ack', convKey: ck, refId: entry.id, status: 'failed' });
           });
         }, ACK_TIMEOUT_MS);
-        ackTimers.current.set(entry.id, timer);
+        ackTimers.current.set(entry.id, { timer, convKey: ck });
       } else {
         // Other non-msg envelopes (e.g. push.subscribe) are genuinely
         // fire-and-forget; settle them immediately without waiting for an ack.
@@ -797,13 +816,16 @@ export function TransportProvider(props: TransportProviderProps) {
    * (removePairingIfMatches) — an older unpair racing a newer re-pair (fresh
    * epoch, same pairingId) must not erase the newer stored pairing.
    *
-   * Ack timers are deliberately LEFT armed: they are refId-keyed across
-   * pairings, and their outbox writes are row/claim-gated, so once this scope's
-   * rows are cleared they settle as no-ops — clearing ALL of them (the old
-   * global wipe) would now cancel other pairings' live timers.
+   * Ack timers are pruned by convKey prefix (clearPairingAckTimers): their
+   * durable writes are row/claim-gated no-ops once this scope's rows are
+   * cleared, but a timer firing after the wipe would still dispatch into a
+   * dropped ConvKey and mint an invisible empty state slice. Other pairings'
+   * refId-keyed timers stay armed — clearing ALL of them (the old global
+   * wipe) would cancel their live deadlines.
    */
   const wipePairingDurable = useCallback(async (pairingId: string, epoch: string) => {
     clearPairingTypingTimers(pairingId);
+    clearPairingAckTimers(pairingId);
     await Promise.all([
       removePairingIfMatches(pairingId, epoch).catch(() => { /* best-effort retry of the hoisted removal */ }),
       outbox.clearScope(pairingId),
@@ -815,7 +837,55 @@ export function TransportProvider(props: TransportProviderProps) {
     // One pairing's slice only — a global 'reset' would wipe other pairings'
     // live conversations.
     dispatch({ type: 'drop-pairing', pairingId });
-  }, [clearPairingTypingTimers]);
+  }, [clearPairingTypingTimers, clearPairingAckTimers]);
+
+  /**
+   * Shared teardown TAIL for unpair() and the terminal auth-error path — one
+   * implementation of "listeners off, transport released, durable slice
+   * wiped, runtime dropped, React state adjusted". The caller has already run
+   * the synchronous-kill preamble (gen bump + validUserId null BEFORE any
+   * await, identity-wiped broadcast) and captured myGen/wipedEpoch from it.
+   *
+   * closeTransport: true (unpair) bounds the close with settleWithinCall —
+   * the transport is live and close() is not timeout-bounded on its own.
+   * false (auth-error) — the transport already closed itself; just release it
+   * fire-and-forget.
+   *
+   * Returns whether the final React-state transition APPLIED: false when a
+   * newer wipe or a newer successful re-pair superseded this one mid-flight
+   * (the R4-3 guard), in which case the caller must not surface UI for it.
+   */
+  const wipePairing = useCallback(async (
+    rt: PairingRuntime, myGen: number, wipedEpoch: string, opts: { closeTransport: boolean },
+  ): Promise<boolean> => {
+    const pid = rt.pairing.pairingId;
+    // Detach status/envelope listeners BEFORE closing, so a deliberate close
+    // never fires our onStatus('closed') handler and never schedules a
+    // releaseOwnedSending() call in the first place (defense in depth on top
+    // of the clearScope()/release serialization in the outbox module).
+    for (const u of rt.unsubs) u();
+    rt.unsubs = [];
+    // Never close an override transport — the host owns its lifecycle.
+    if (rt.transport && rt.transport !== props.transportOverride) {
+      if (opts.closeTransport) await settleWithinCall(() => rt.transport?.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
+      else void rt.transport?.close(); // auth-error: already closed; release fire-and-forget
+    }
+    rt.transport = null;
+    await wipePairingDurable(pid, wipedEpoch);
+    // R4-3 guard: skip the final state transition if a newer wipe OR a newer
+    // successful re-pair has already bumped this runtime's gen (or replaced
+    // the runtime) — applying it now would clobber the transition that
+    // superseded this one (the TOCTOU the deferral pattern exists to avoid).
+    if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return false;
+    runtimesRef.current.delete(pid);
+    refreshViews();
+    // R2-10: clear a stale active conversation belonging to this pairing (and
+    // the URL's ?c= param, via ChatScreen) so it cannot reopen under a fresh
+    // pairing.
+    if (activeRef.current && resolveConvKey(activeRef.current, [pid])) setActiveChannel(null);
+    setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
+    return true;
+  }, [wipePairingDurable, refreshViews, props.transportOverride]);
 
   /** Open-time catch-up for ONE pairing: re-drive its processing rows, drain
    *  its queued sends, and re-request history for its channels + its already-
@@ -881,7 +951,6 @@ export function TransportProvider(props: TransportProviderProps) {
         return;
       }
       // Default (standalone) path: terminal unpair of THIS pairing only.
-      // (Interim implementation — Task 6 hardens ordering/timeout behavior.)
       // Guard: only act while this runtime is still the installed one.
       if (runtimesRef.current.get(pid) !== rt) return;
       // R4-3: bump AND null validUserId synchronously, FIRST, before
@@ -893,7 +962,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // when it's null, so this alone rejects any send attempt through this
       // pairing from this instant onward — "leaves A's identity usable until
       // asynchronous cleanup completes" is exactly the gap this closes.
-      // myGen is captured for the deferred state updates below.
+      // myGen is captured for the deferred state updates in wipePairing.
       rt.gen += 1;
       const myGen = rt.gen;
       const wiped = rt.pairing;
@@ -906,37 +975,29 @@ export function TransportProvider(props: TransportProviderProps) {
       bcRef.current?.postMessage({ type: 'identity-wiped', pairingId: pid, epoch: wiped.epoch });
       // The transport is already closed here, so there is no live connection
       // to ask the server to drop the subscription (unlike unpair(), which
-      // runs before closing). Still invalidate the browser-level subscription:
-      // that tells the push service to stop routing to this endpoint AT ALL,
-      // so even a stale server-side row for the now-revoked user can no
-      // longer deliver here (a later send to it just 404/410s, which the
-      // store already prunes on).
-      void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
-      for (const u of rt.unsubs) u();
-      rt.unsubs = [];
-      void rt.transport?.close();
-      rt.transport = null;
-      // The REACT-STATE side of the transition still defers until the wipe
-      // settles — but guarded by the generation captured above, not by "is
-      // this the only in-flight wipe": if a newer wipe OR a newer successful
-      // re-pair has already bumped this runtime's gen (or replaced the
-      // runtime) by the time this resolves, skip — applying it now would
-      // clobber a state transition that has already superseded this one (the
-      // original R4-3 TOCTOU this deferral pattern was written to avoid).
-      void wipePairingDurable(pid, wiped.epoch).finally(() => {
-        if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return;
-        runtimesRef.current.delete(pid);
-        refreshViews();
-        // R2-10: clear a stale active conversation belonging to this pairing
-        // (and the URL's ?c= param, via ChatScreen) so it cannot reopen under
-        // a fresh pairing.
-        if (activeRef.current && resolveConvKey(activeRef.current, [pid])) setActiveChannel(null);
-        setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
-        setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
+      // runs before closing). Still invalidate the browser-level subscription
+      // — but ONLY when this was the last pairing: the endpoint is shared
+      // browser-wide, and killing it while other pairings still deliver push
+      // through it would silence THEIR notifications too. (Task 7 refines the
+      // per-pairing server-side bookkeeping.) It tells the push service to
+      // stop routing to this endpoint AT ALL, so even a stale server-side row
+      // for the now-revoked user can no longer deliver here (a later send to
+      // it just 404/410s, which the store already prunes on).
+      if (runtimesRef.current.size === 1) {
+        void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
+      }
+      // The REACT-STATE side of the transition defers until the wipe settles,
+      // guarded inside wipePairing by the generation captured above: only if
+      // the transition actually APPLIED does the instance-named error surface
+      // — a superseding re-pair must not flash "unpaired" for a pairing that
+      // just came back.
+      void wipePairing(rt, myGen, wiped.epoch, { closeTransport: false }).then((applied) => {
+        if (!applied) return;
+        setAuthError(`${wiped.displayName ?? wiped.instance} was unpaired by its server. Scan a new QR code to reconnect it.`);
       });
     });
     rt.unsubs = [u1, u2, u3];
-  }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairingDurable, props.transportOverride]);
+  }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairing, props.transportOverride]);
 
   useEffect(() => {
     bootGenRef.current += 1;
@@ -983,7 +1044,7 @@ export function TransportProvider(props: TransportProviderProps) {
       runtimesRef.current.clear();
     };
     const clearTimers = (): void => {
-      for (const timer of ackTimers.current.values()) clearTimeout(timer);
+      for (const { timer } of ackTimers.current.values()) clearTimeout(timer);
       ackTimers.current.clear();
       for (const timer of typingTimers.current.values()) clearTimeout(timer);
       typingTimers.current.clear();
@@ -1083,11 +1144,14 @@ export function TransportProvider(props: TransportProviderProps) {
         void rt.transport?.close();
         rt.transport = null;
         clearPairingTypingTimers(data.pairingId);
+        // Prune THIS pairing's ack timers too: their row/claim-gated durable
+        // writes no-op once the wiping tab's clearScope commits, but a timer
+        // firing in the sub-window would still dispatch into the ConvKey
+        // dropped below, minting an invisible empty state slice. Scoped by
+        // convKey prefix — other pairings' live timers stay armed.
+        clearPairingAckTimers(data.pairingId);
         // The wiping tab owns the durable clears; this tab only drops its
-        // in-memory slice. Ack timers stay armed — their row/claim-gated
-        // writes no-op once the wiping tab's clearScope commits (cancelling
-        // ALL of them, as the old single-identity wipe did, would now cancel
-        // other pairings' live timers).
+        // in-memory slice.
         dispatch({ type: 'drop-pairing', pairingId: data.pairingId });
         runtimesRef.current.delete(data.pairingId);
         refreshViews();
@@ -1263,6 +1327,11 @@ export function TransportProvider(props: TransportProviderProps) {
     // installed SYNCHRONOUSLY inside the grant callback — before the
     // transport emits its post-grant 'open' status — so the freshly wired
     // onStatus handler catches that emission and runs the open catch-up.
+    // Set the instant ANY status event lands on a wired runtime for this
+    // transport — consulted by the post-race sync below to tell "the 'open'
+    // fired before we wired (missed)" apart from "a status event (possibly
+    // 'closed') already updated statusNow after wiring".
+    let statusSeenSinceWire = false;
     const paired = new Promise<PairedSession>((resolve) => {
       transport.onGrant!(() => {
         const stored = adopted;
@@ -1286,6 +1355,9 @@ export function TransportProvider(props: TransportProviderProps) {
         };
         runtimesRef.current.set(stored.pairingId, rt);
         wirePairing(rt, transport);
+        // Registered AFTER wirePairing's own onStatus (which keeps statusNow
+        // current), torn down with the rest of the runtime's subscriptions.
+        rt.unsubs.push(transport.onStatus(() => { statusSeenSinceWire = true; }));
         refreshViews();
         resolve(stored);
       });
@@ -1325,9 +1397,13 @@ export function TransportProvider(props: TransportProviderProps) {
     // `stored` is ALREADY durably persisted (onAdoptGrant) and its runtime
     // installed by the grant callback. If the transport's 'open' status fired
     // BEFORE the grant installed the runtime (wire-after-grant), sync the
-    // mirror and run the open catch-up now.
+    // mirror and run the open catch-up now — but ONLY when no status event
+    // has been observed since wiring: a 'closed' landing in the microtask gap
+    // between the grant callback and this continuation already updated
+    // statusNow, and forcing 'open' over it would burn a drain retry attempt
+    // over a dead connection (and misreport the pairing as live).
     const rt = runtimesRef.current.get(stored.pairingId);
-    if (rt && rt.transport === transport && rt.statusNow !== 'open') {
+    if (rt && rt.transport === transport && rt.statusNow !== 'open' && !statusSeenSinceWire) {
       rt.statusNow = 'open';
       refreshViews();
       catchUpOnOpen(rt);
@@ -1496,8 +1572,7 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [props.pushRegistrarOverride]);
 
   const unpair = useCallback(async (pairingId: string) => {
-    // Per-pairing unpair — the other pairings keep running. (Interim
-    // implementation; Task 6 hardens ordering/timeout behavior.)
+    // Per-pairing unpair — the other pairings keep running.
     const rt = runtimesRef.current.get(pairingId);
     if (!rt) return;
     // R4-3: bump FIRST, synchronously, before any await — see the
@@ -1550,25 +1625,11 @@ export function TransportProvider(props: TransportProviderProps) {
         await settleWithinCall(() => unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
       }
     }
-    // Detach status/envelope listeners BEFORE closing, so this deliberate close
-    // never fires our onStatus('closed') handler and never schedules a
-    // releaseOwnedSending() call in the first place (defense in depth on top
-    // of the clearScope()/release serialization in the outbox module).
-    for (const u of rt.unsubs) u();
-    rt.unsubs = [];
-    if (rt.transport && rt.transport !== props.transportOverride) {
-      await settleWithinCall(() => rt.transport?.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
-    }
-    rt.transport = null;
-    await wipePairingDurable(pairingId, wiped.epoch);
-    // Guarded the same way as the auth-error path: skip if a newer wipe or a
-    // newer successful re-pair has already superseded this one (R4-3).
-    if (runtimesRef.current.get(pairingId) !== rt || rt.gen !== myGen) return;
-    runtimesRef.current.delete(pairingId);
-    refreshViews();
-    if (activeRef.current && resolveConvKey(activeRef.current, [pairingId])) setActiveChannel(null);
-    setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
-  }, [wipePairingDurable, refreshViews, props.pushRegistrarOverride, props.transportOverride]);
+    // Shared teardown tail with the auth-error path (listeners off, bounded
+    // transport close, durable wipe, runtime delete, React-state adjustment)
+    // — wipePairing carries the R4-3 supersession guard.
+    await wipePairing(rt, myGen, wiped.epoch, { closeTransport: true });
+  }, [wipePairing, props.pushRegistrarOverride]);
 
   const renamePairing = useCallback(async (pairingId: string, displayName: string) => {
     // updatePairingMeta validates before write and treats an empty value as
