@@ -1495,6 +1495,50 @@ describe('TransportProvider', () => {
       expect(api.state.messages[CK]).toHaveLength(1);    // chat state under P1 survives
     });
 
+    it('a stale unpair (another tab refreshed the pairing) erases nothing and self-heals onto the refreshed credentials (#ER-1)', async () => {
+      const approvals = await import('../lib/approvals.js');
+      const transport = new FakeTransport();
+      await mountPaired(transport); // P1 @ epoch 'e1'
+      // Keep the seeded outbox row queued (an open transport would drain it).
+      act(() => { transport.setStatus('closed'); transport.connected = false; });
+      const row = await outbox.enqueue(createEnvelope('msg', {
+        from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'queued before the stale unpair' },
+      }), P1);
+      await approvals.saveApproval(P1, createEnvelope('approval.request', {
+        from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator',
+        payload: { refId: 'task-1', title: 'Draft', description: 'approve?', options: ['approve'] },
+      }));
+      await kvSet(`lastread:${CK}`, '2026-01-01T00:00:00.000Z');
+      // Another tab re-scans the same instance: the refresh keeps the
+      // pairingId but lands a FRESH token + epoch in the durable store. THIS
+      // tab's runtime never hears about it (there is no cross-tab refresh
+      // broadcast) and still holds epoch 'e1'.
+      await savePairings([{
+        url: 'ws://x/', sessionToken: 'tok2', userId: 'u1', instance: 'i',
+        channels: ['coordinator'], epoch: 'e2', pairingId: P1, transportKind: 'ws',
+      }]);
+
+      // Stale unpair: the epoch-gated removal cannot match, so NOTHING
+      // durable may be wiped — the old code still ran the unconditional
+      // clears and erased the refreshed pairing's state.
+      await act(async () => { await api.unpair(P1); });
+
+      // The refreshed stored pairing survives untouched…
+      const stored = await loadPairingsRaw();
+      expect(stored).toHaveLength(1);
+      expect(stored[0]!.epoch).toBe('e2');
+      expect(stored[0]!.sessionToken).toBe('tok2');
+      // …and so does every durable slice the wipe used to clear regardless.
+      expect(await outbox.getEntry(row.id)).toBeDefined();
+      expect(await approvals.listApprovals(P1, 'coordinator')).toHaveLength(1);
+      expect(await kvGet(`lastread:${CK}`)).toBe('2026-01-01T00:00:00.000Z');
+      // The tab self-heals: the pairing is re-installed from the refreshed
+      // store (fresh runtime, wired + connected via the boot path) and the
+      // provider never leaves 'ready'.
+      await waitFor(() => expect(api.pairings.some((p) => p.pairingId === P1)).toBe(true));
+      expect(api.phase).toBe('ready');
+    });
+
     it('duplicate-guard miss: same url as a DIFFERENT user appends a second pairing', async () => {
       const t = new FakeTransport();
       await mountPaired(t);

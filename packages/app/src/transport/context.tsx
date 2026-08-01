@@ -14,7 +14,7 @@ import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
 import * as adopt from '../lib/adopt.js';
 import {
-  hostIdentityKey, removePairingIfMatches, updatePairingMeta, upsertPairing,
+  hostIdentityKey, loadPairingsRaw, removePairingIfMatches, updatePairingMeta, upsertPairing,
   type PairedSession, type Session,
 } from '../lib/session.js';
 import { accentColor, convKeyOf, resolveConvKey, type ConvKey } from '../lib/conv-key.js';
@@ -345,6 +345,12 @@ export function TransportProvider(props: TransportProviderProps) {
   const ackTimers = useRef(new Map<string, { timer: ReturnType<typeof setTimeout>; convKey: ConvKey }>());
   // ConvKey → auto-clear deadline for the typing indicator (TYPING_AUTO_CLEAR_MS).
   const typingTimers = useRef(new Map<ConvKey, ReturnType<typeof setTimeout>>());
+  // #ER-1: dial-a-stored-pairing helper, reached through a ref because the
+  // useCallback chain is circular otherwise (wipePairing needs it for the
+  // stale-unpair self-heal, wirePairing needs wipePairing, dialPairing needs
+  // wirePairing). Assigned right after dialPairing's definition — same
+  // pattern as sweepLeasesRef.
+  const dialPairingRef = useRef<(rt: PairingRuntime) => void>(() => {});
 
   stateRef.current = state;
   activeRef.current = activeChannel;
@@ -829,18 +835,37 @@ export function TransportProvider(props: TransportProviderProps) {
    * (removePairingIfMatches) — an older unpair racing a newer re-pair (fresh
    * epoch, same pairingId) must not erase the newer stored pairing.
    *
+   * #ER-1: that epoch-gated removal is not just cleanup — its result is the
+   * AUTHORIZATION for every destructive clear below. A refresh-in-place
+   * (re-scanning an already-paired instance) keeps the pairingId but mints a
+   * NEW epoch, and there is no cross-tab refresh broadcast — so a caller
+   * holding a STALE epoch (e.g. a tab whose runtime never saw another tab's
+   * refresh) loses the compare-and-remove, and running the unconditional
+   * clears anyway would erase the REFRESHED pairing's outbox rows, approval
+   * cards, and read markers. `hoistedRemoved` carries the result of unpair()'s
+   * hoisted #P1-F3 removal (on that path the retry here legitimately returns
+   * false — the pairing is already removed); the auth-error path has no
+   * hoisted removal, so the retry here is its authorization. When NEITHER
+   * matched, perform NO durable writes and NO drop-pairing dispatch — return
+   * false so wipePairing can self-heal onto the refreshed credentials.
+   *
    * Ack timers are pruned by convKey prefix (clearPairingAckTimers): their
    * durable writes are row/claim-gated no-ops once this scope's rows are
    * cleared, but a timer firing after the wipe would still dispatch into a
    * dropped ConvKey and mint an invisible empty state slice. Other pairings'
    * refId-keyed timers stay armed — clearing ALL of them (the old global
    * wipe) would cancel their live deadlines.
+   *
+   * Returns whether the wipe was authorized (and therefore performed).
    */
-  const wipePairingDurable = useCallback(async (pairingId: string, epoch: string) => {
+  const wipePairingDurable = useCallback(async (
+    pairingId: string, epoch: string, hoistedRemoved: boolean,
+  ): Promise<boolean> => {
+    const retryRemoved = await removePairingIfMatches(pairingId, epoch).catch(() => false);
+    if (!hoistedRemoved && !retryRemoved) return false; // #ER-1: stale epoch — wipe nothing
     clearPairingTypingTimers(pairingId);
     clearPairingAckTimers(pairingId);
     await Promise.all([
-      removePairingIfMatches(pairingId, epoch).catch(() => { /* best-effort retry of the hoisted removal */ }),
       outbox.clearScope(pairingId),
       // #R8-1: drop this pairing's durable approval requests too, so a
       // re-pair as a different user cannot re-render the prior user's cards.
@@ -850,6 +875,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // One pairing's slice only — a global 'reset' would wipe other pairings'
     // live conversations.
     dispatch({ type: 'drop-pairing', pairingId });
+    return true;
   }, [clearPairingTypingTimers, clearPairingAckTimers]);
 
   /**
@@ -864,12 +890,18 @@ export function TransportProvider(props: TransportProviderProps) {
    * false (auth-error) — the transport already closed itself; just release it
    * fire-and-forget.
    *
+   * hoistedRemoved: unpair()'s hoisted #P1-F3 removal result, threaded into
+   * wipePairingDurable's #ER-1 authorization (absent on the auth-error path,
+   * whose authorization is the durable wipe's own retry removal).
+   *
    * Returns whether the final React-state transition APPLIED: false when a
    * newer wipe or a newer successful re-pair superseded this one mid-flight
-   * (the R4-3 guard), in which case the caller must not surface UI for it.
+   * (the R4-3 guard), OR when the wipe was refused as stale (#ER-1) — in
+   * either case the caller must not surface UI for it.
    */
   const wipePairing = useCallback(async (
-    rt: PairingRuntime, myGen: number, wipedEpoch: string, opts: { closeTransport: boolean },
+    rt: PairingRuntime, myGen: number, wipedEpoch: string,
+    opts: { closeTransport: boolean; hoistedRemoved?: boolean },
   ): Promise<boolean> => {
     const pid = rt.pairing.pairingId;
     // Detach status/envelope listeners BEFORE closing, so a deliberate close
@@ -884,7 +916,48 @@ export function TransportProvider(props: TransportProviderProps) {
       else void rt.transport?.close(); // auth-error: already closed; release fire-and-forget
     }
     rt.transport = null;
-    await wipePairingDurable(pid, wipedEpoch);
+    const authorized = await wipePairingDurable(pid, wipedEpoch, opts.hoistedRemoved ?? false);
+    if (!authorized) {
+      // #ER-1 self-heal: this caller's epoch is STALE — the stored pairing
+      // was refreshed in place (same pairingId, new epoch/token) and NOTHING
+      // durable was wiped above. The local runtime, though, holds the
+      // superseded credentials, and its listeners/transport are already torn
+      // down — finish the local teardown (timers) and RE-INSTALL the pairing
+      // from the durable store, wiring + connecting through the same path
+      // boot uses. Net effect: the stale unpair is a no-op that self-heals
+      // this tab onto the refreshed credentials. (The 'identity-wiped'
+      // broadcast the caller already posted carries the OLD epoch and is
+      // correctly ignored by other tabs — #R6-8b.)
+      clearPairingTypingTimers(pid);
+      clearPairingAckTimers(pid);
+      // Same supersession guard as the authorized path: only swap the runtime
+      // while this one is still the installed one.
+      if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return false;
+      runtimesRef.current.delete(pid);
+      const myBootGen = bootGenRef.current;
+      const list = await loadPairingsRaw().catch((): PairedSession[] => []);
+      // Unmount/storage-error teardown, or a concurrent install for the same
+      // pairingId, landed across the await — do not resurrect over it.
+      if (bootGenRef.current !== myBootGen || runtimesRef.current.has(pid)) return false;
+      const stored = list.find((p) => p.pairingId === pid);
+      if (stored) {
+        const fresh: PairingRuntime = {
+          pairing: stored, transport: null, statusNow: 'closed', unsubs: [],
+          // Monotonic across the swap (R4-3): a stale sendEnvelope
+          // continuation fenced on the old runtime's pre-bump gen must not
+          // match the fresh runtime.
+          gen: myGen + 1, validUserId: stored.userId,
+        };
+        runtimesRef.current.set(pid, fresh);
+        dialPairingRef.current(fresh);
+      }
+      refreshViews();
+      // Phase stays 'ready' when the pairing was re-installed; if the store
+      // no longer holds it at all, fall back to the same size-based phase the
+      // authorized path uses.
+      setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
+      return false;
+    }
     // R4-3 guard: skip the final state transition if a newer wipe OR a newer
     // successful re-pair has already bumped this runtime's gen (or replaced
     // the runtime) — applying it now would clobber the transition that
@@ -1024,6 +1097,22 @@ export function TransportProvider(props: TransportProviderProps) {
     });
     rt.unsubs = [u1, u2, u3];
   }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairing, props.transportOverride]);
+
+  /** Dial + wire + connect ONE stored pairing's transport onto an installed
+   *  runtime — the shared install path for the boot effect and the
+   *  stale-unpair self-heal (#ER-1). #A3: no registered factory for the
+   *  pairing's kind, or no stored url ⇒ the pairing stays LISTED but offline
+   *  (transport null, status 'closed') — its history remains readable and its
+   *  sends queue in the outbox. */
+  const dialPairing = useCallback((rt: PairingRuntime) => {
+    const p = rt.pairing;
+    const make = registry[p.transportKind];
+    if (!make || !p.url) return;
+    const transport = make({ url: p.url, session: p.sessionToken, device: 'raccoon-app' });
+    wirePairing(rt, transport);
+    void transport.connect().catch(() => { /* per-pairing reconnect loop handles it */ });
+  }, [registry, wirePairing]);
+  dialPairingRef.current = dialPairing;
 
   useEffect(() => {
     bootGenRef.current += 1;
@@ -1242,16 +1331,9 @@ export function TransportProvider(props: TransportProviderProps) {
         if (cancelled || bootGenRef.current !== bootGen) return;
         for (const p of live) {
           const rt = runtimesRef.current.get(p.pairingId);
-          if (rt !== undefined && rt.pairing === p) {
-            const make = registry[p.transportKind];
-            // #A3: this default boot path DIALS the transport from the stored
-            // url, so it needs one — and a factory registered for the
-            // pairing's kind. No url or unknown kind ⇒ listed but offline.
-            if (!make || !p.url) continue;
-            const transport = make({ url: p.url, session: p.sessionToken, device: 'raccoon-app' });
-            wirePairing(rt, transport);
-            void transport.connect().catch(() => { /* per-pairing reconnect loop handles it */ });
-          }
+          // #A3: dialPairing dials from the stored url via the registered
+          // factory; no url or unknown kind ⇒ listed but offline.
+          if (rt !== undefined && rt.pairing === p) dialPairingRef.current(rt);
           // else: torn down during the sweep await (#R6-4) — do not resurrect.
         }
         if (runtimesRef.current.size === 0) { setPhase('setup'); return; }
@@ -1668,8 +1750,12 @@ export function TransportProvider(props: TransportProviderProps) {
     // user closing the tab) during those awaits left the pairing row in IDB
     // and the "unpaired" device silently reconnected on next boot.
     // Compare-and-remove (epoch-gated) so a concurrent re-pair's newer entry
-    // is not erased; wipePairingDurable's own removal then no-ops.
-    await removePairingIfMatches(pairingId, wiped.epoch).catch(() => { /* best-effort; wipePairingDurable re-runs it (now always reached — see the bounded awaits below) */ });
+    // is not erased. #ER-1: the RESULT is captured and threaded into the
+    // durable wipe — together with the wipe's own retry it authorizes the
+    // destructive clears (a stale-epoch caller matches neither and the wipe
+    // self-heals instead of erasing the refreshed pairing's state).
+    const hoistedRemoved = await removePairingIfMatches(pairingId, wiped.epoch)
+      .catch(() => false); /* best-effort; wipePairingDurable re-runs it (always reached — see the bounded awaits below) */
     // #P1-F3 (adv): bound each best-effort cleanup so a hung host disable() /
     // server unsubscribe cannot prevent the durable wipe from running its
     // clear retry. The cleanup keeps running detached; we just stop waiting.
@@ -1694,8 +1780,9 @@ export function TransportProvider(props: TransportProviderProps) {
     }
     // Shared teardown tail with the auth-error path (listeners off, bounded
     // transport close, durable wipe, runtime delete, React-state adjustment)
-    // — wipePairing carries the R4-3 supersession guard.
-    await wipePairing(rt, myGen, wiped.epoch, { closeTransport: true });
+    // — wipePairing carries the R4-3 supersession guard and the #ER-1
+    // stale-epoch self-heal.
+    await wipePairing(rt, myGen, wiped.epoch, { closeTransport: true, hoistedRemoved });
   }, [wipePairing, props.pushRegistrarOverride]);
 
   const renamePairing = useCallback(async (pairingId: string, displayName: string) => {
