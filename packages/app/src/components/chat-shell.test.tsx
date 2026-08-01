@@ -87,7 +87,10 @@ describe('chat shell', () => {
     const user = userEvent.setup();
     await user.click(screen.getByText('Coordinator'));
     await user.click(await screen.findByRole('button', { name: /open settings/i }));
-    await user.click(await screen.findByRole('button', { name: /unpair this device/i }));
+    // Two-step: arm the row's confirm, then confirm. displayName defaults to
+    // the instance name ('i'), so the arm button reads "Unpair i".
+    await user.click(await screen.findByRole('button', { name: 'Unpair i' }));
+    await user.click(await screen.findByRole('button', { name: 'Unpair' }));
     await waitFor(() => expect(screen.getByText(/pair this device/i)).toBeTruthy());
   });
 
