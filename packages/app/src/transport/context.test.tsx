@@ -1156,7 +1156,7 @@ describe('TransportProvider', () => {
       // The documented host API permits a stable placeholder sessionToken and
       // may omit epoch. The scope stamped on outbox rows (the pairingId) must
       // NOT derive from that secret token — a per-mount epoch is minted instead.
-      const noEpoch = { url: 'wss://x/', sessionToken: 'super-secret-token', userId: 'u1', instance: 'gtm', channels: ['coordinator'] };
+      const noEpoch = { url: 'wss://x/', sessionToken: 'super-secret-token', userId: 'u1', instance: 'atlas', channels: ['coordinator'] };
       const transport = new FakeTransport();
       render(
         <TransportProvider transportOverride={transport} sessionOverride={noEpoch}>
@@ -1175,7 +1175,7 @@ describe('TransportProvider', () => {
       // The scope is the structured identity key with a minted epoch, not a token.
       const parsed = JSON.parse(row.scope!);
       expect(parsed.u).toBe('u1');
-      expect(parsed.i).toBe('gtm');
+      expect(parsed.i).toBe('atlas');
       expect(typeof parsed.e).toBe('string');
       expect(parsed.e).not.toBe('super-secret-token');
     });
