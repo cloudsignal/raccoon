@@ -52,29 +52,35 @@ export function browserPushEnv(): PushEnv | null {
   };
 }
 
+/** Genuinely never-throwing — fails closed (false) on ANY error. In
+ *  particular, pushManager.subscribe() rejects with InvalidStateError when
+ *  the existing browser subscription holds a DIFFERENT applicationServerKey;
+ *  a throw here would abort enablePush's multi-pairing fan-out loop, leaving
+ *  the remaining pairings unregistered (and every fire-and-forget caller with
+ *  an unhandled rejection). */
 export async function enablePushFlow(opts: {
   env: PushEnv;
   vapidPublicKey: string;
   userId: string;
   send: (env: AnyEnvelope) => Promise<void>;
 }): Promise<boolean> {
-  let permission = opts.env.permission();
-  if (permission === 'denied') return false;
-  if (permission === 'default') permission = await opts.env.requestPermission();
-  if (permission !== 'granted') return false;
-  const subscription = await opts.env.getSubscription(opts.vapidPublicKey);
-  if (!subscription) return false;
   try {
+    let permission = opts.env.permission();
+    if (permission === 'denied') return false;
+    if (permission === 'default') permission = await opts.env.requestPermission();
+    if (permission !== 'granted') return false;
+    const subscription = await opts.env.getSubscription(opts.vapidPublicKey);
+    if (!subscription) return false;
     await opts.send(createEnvelope('push.subscribe', {
       from: userAddress(opts.userId),
       to: 'system',
       channel: 'system',
       payload: { subscription },
     }));
+    return true;
   } catch {
     return false;
   }
-  return true;
 }
 
 /**

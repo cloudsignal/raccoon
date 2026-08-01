@@ -66,6 +66,20 @@ describe('push client', () => {
     expect(ok).toBe(false);
   });
 
+  it('returns false instead of throwing when getSubscription rejects (mismatched applicationServerKey)', async () => {
+    // Per the Push API, subscribing while an existing subscription holds a
+    // DIFFERENT applicationServerKey rejects with InvalidStateError — the
+    // flow must fail closed, not propagate (a throw would abort enablePush's
+    // multi-pairing fan-out loop).
+    const ok = await enablePushFlow({
+      env: env({ getSubscription: async () => { throw new DOMException('existing subscription has a different applicationServerKey', 'InvalidStateError'); } }),
+      vapidPublicKey: 'BKey',
+      userId: 'u1',
+      send: async () => {},
+    });
+    expect(ok).toBe(false);
+  });
+
   it('returns false instead of throwing when send fails', async () => {
     const ok = await enablePushFlow({
       env: env({}),

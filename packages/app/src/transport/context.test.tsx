@@ -1544,6 +1544,34 @@ describe('TransportProvider', () => {
       expect(fakeEnv.unsubscribeLocalCalls).toBe(1);   // last pairing gone: local teardown
     });
 
+    it('a mismatched-key getSubscription rejection fails closed for that pairing without aborting the fan-out', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB, { vapid: 'BKey' });
+      // First pairing's subscribe attempt rejects (InvalidStateError-style:
+      // the existing browser subscription holds a DIFFERENT
+      // applicationServerKey); the second succeeds. The rejection must fail
+      // closed — not abort the loop, not skip push-enabled, not surface an
+      // unhandled rejection out of enablePush().
+      let calls = 0;
+      __setPushEnvForTests({
+        permission: () => 'granted',
+        requestPermission: async () => 'granted',
+        getSubscription: async () => {
+          calls += 1;
+          if (calls === 1) throw new DOMException('existing subscription has a different applicationServerKey', 'InvalidStateError');
+          return { endpoint: 'https://push.example/ep1', keys: { p256dh: 'p', auth: 'a' } };
+        },
+        currentEndpoint: async () => 'https://push.example/ep1',
+        unsubscribeLocal: async () => {},
+      });
+      let ok!: boolean;
+      await act(async () => { ok = await api.enablePush(); });
+      expect(ok).toBe(true);                   // one pairing succeeded
+      expect(pushSubs(tA)).toHaveLength(0);    // mismatched-key pairing failed closed, no envelope
+      expect(pushSubs(tB)).toHaveLength(1);    // fan-out continued past the rejection
+      expect(await kvGet<boolean>('push-enabled')).toBe(true);
+    });
+
     it('a pairing added while push is enabled gets registered automatically', async () => {
       const t = new FakeTransport();
       await mountPaired(t, { vapid: 'BKey' });         // single pairing seeding vapidPublicKey: 'BKey'
