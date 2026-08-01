@@ -1477,14 +1477,14 @@ describe('TransportProvider', () => {
       // mountPaired's makeTransport hands pairWithPayload the staged transport.
       const t2 = new FakeTransport();
       currentPairingTransport = t2;
-      let pair!: Promise<void>;
+      let pair!: Promise<boolean>;
       act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://x/', transport: 'ws', token: 'fresh' })); });
       await act(async () => {
         await t2.grant(createEnvelope('pair.grant', {
           from: 'system', to: 'user:u1', channel: 'pairing',
           payload: { sessionToken: 't2', userId: 'u1', instance: 'i', channels: ['coordinator'] },
         }));
-        await pair;
+        expect(await pair).toBe(true); // boolean contract: success reported
       });
       const list = await loadPairingsRaw();
       expect(list).toHaveLength(1);
@@ -1500,14 +1500,14 @@ describe('TransportProvider', () => {
       await mountPaired(t);
       const t2 = new FakeTransport();
       currentPairingTransport = t2;
-      let pair!: Promise<void>;
+      let pair!: Promise<boolean>;
       act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://x/', transport: 'ws', token: 'other' })); });
       await act(async () => {
         await t2.grant(createEnvelope('pair.grant', {
           from: 'system', to: 'user:u9', channel: 'pairing',
           payload: { sessionToken: 't9', userId: 'u9', instance: 'i', channels: ['coordinator'] },
         }));
-        await pair;
+        expect(await pair).toBe(true); // boolean contract: success reported
       });
       expect(api.pairings).toHaveLength(2);
       expect((await loadPairingsRaw()).map((p) => p.userId).sort()).toEqual(['u1', 'u9']);
@@ -1582,14 +1582,14 @@ describe('TransportProvider', () => {
       expect(pushSubs(t)).toHaveLength(1);
       const t2 = new FakeTransport();
       currentPairingTransport = t2;
-      let pair!: Promise<void>;
+      let pair!: Promise<boolean>;
       act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://b/', transport: 'ws', token: 'tok' })); });
       await act(async () => {
         await t2.grant(createEnvelope('pair.grant', {
           from: 'system', to: 'user:u2', channel: 'pairing',
           payload: { sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], vapidPublicKey: 'BKey' },
         }));
-        await pair;
+        expect(await pair).toBe(true); // boolean contract: success reported
       });
       await waitFor(() => expect(pushSubs(t2)).toHaveLength(1));
     });
