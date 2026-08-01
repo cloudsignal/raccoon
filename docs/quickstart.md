@@ -88,11 +88,64 @@ function Shell() {
 }
 ```
 
+`makeTransport` replaces the built-in WebSocket transport factory (the
+registry's `ws` slot); the QR-pairing flow still runs, but connections go
+through your transport. To support **additional** transport kinds, register
+per-kind factories with the `transports` prop:
+
+```tsx
+<TransportProvider transports={{ mykind: (opts) => new MyTransport(opts) }}>
+```
+
+The pairing QR's `transport` field selects the factory at scan time; `ws` is
+built in. A stored pairing whose kind has no registered factory stays listed
+but offline — its history remains readable and its sends queue until a build
+that registers the kind loads.
+
 For the standalone, self-serving build (the hub serves the PWA on its own port),
 either install `@raccoon/app` and serve its prebuilt `dist-standalone/`
 (published in the package — no clone needed), or, from a monorepo clone, run
 `npm run build:app` and serve the generated `packages/app/dist-standalone/`. Pass
 that path as `staticDir` to the hub. See [`packages/app/README.md`](../packages/app/README.md).
+
+### Pair a second platform
+
+The app holds any number of pairings at once — two instances of your own
+agent, or your agent plus a second platform entirely. Conversations from
+every pairing appear in one merged list, and each pairing keeps its own
+connection status (the chat header shows which instance a conversation
+belongs to).
+
+Manage pairings in **Settings → Platforms**: each one is listed with its
+live status and can be renamed or unpaired, and **Add platform** starts the
+same QR/paste flow used for the first pairing. Installs that embed the app
+with a host-managed transport hide "Add platform" — the host application
+owns identity there.
+
+### Identify your instance in push payloads
+
+The app registers its one browser push subscription with every paired
+instance, so any of them can notify the device. If you send push from your
+hub (for example via a custom `notify` on `withPushFallback` from
+`@raccoon/push`), set the optional `instance` field on the payload so
+notifications from different platforms stay distinguishable:
+
+```ts
+const payload: PushPayload = {
+  title: 'Atlas',
+  body: 'Draft is ready for review.',
+  data: { channel: 'assistant' },
+  instance: { name: 'alpha', instanceUrl: 'wss://example.com/', userId: 'alice' },
+};
+```
+
+The app titles the notification "Atlas · alpha", keeps a per-pairing
+collapse key (so two instances exposing same-named channels do not replace
+each other's notifications), and routes the tap to the matching
+conversation. `userId` is required inside `instance` for unambiguous
+routing — two pairings may point at the same instance URL as different
+users. Payloads that omit `instance` degrade gracefully: un-suffixed title,
+and a tap opens the app's conversation list.
 
 ## Path B — an existing OpenClaw agent
 
