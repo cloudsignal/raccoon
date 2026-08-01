@@ -140,6 +140,33 @@ describe('merged conversation list', () => {
     expect(screen.queryAllByTestId('pairing-badge')).toHaveLength(0);
   });
 
+  it('shows agent + instance in the chat header and the owning pairing\'s status dot', async () => {
+    const { tB } = await mountTwo();
+    // Make B/coordinator identifiable (and first) in the merged list.
+    act(() => {
+      tB.emit(msgAt('coordinator', 'u2', 'from B', '2026-01-01T00:00:02.000Z'));
+    });
+    await userEvent.setup().click(await screen.findByText('from B'));
+    // Title = agent label + muted `· <displayName>` suffix (displayName
+    // defaults to the pairing's instance name).
+    expect(await screen.findByText('· beta')).toBeTruthy();
+    // The online dot reflects the OWNING pairing (B). Both open at boot → dot.
+    expect(document.querySelector('.bg-online')).toBeTruthy();
+    // B drops → no dot, even though A is still open.
+    act(() => tB.setStatus('closed'));
+    await waitFor(() => expect(document.querySelector('.bg-online')).toBeNull());
+    // B recovers → dot returns.
+    act(() => tB.setStatus('open'));
+    await waitFor(() => expect(document.querySelector('.bg-online')).toBeTruthy());
+  });
+
+  it('omits the instance suffix from the chat header with a single pairing', async () => {
+    await mount();
+    await userEvent.setup().click(screen.getByText('Coordinator'));
+    await screen.findByRole('button', { name: /open settings/i }); // header mounted
+    expect(screen.queryByText(/·/)).toBeNull();
+  });
+
   it('shows connecting indicator when any pairing is not open', async () => {
     const { tB } = await mountTwo();
     // Both open after boot → indicator absent.

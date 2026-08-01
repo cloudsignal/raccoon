@@ -5,12 +5,14 @@ import { useChat } from '../transport/context.js';
 
 export function ChannelHeader(props: { convKey: ConvKey; onBack: () => void; onSettings: () => void }) {
   const { pairings } = useChat();
-  // Resolve the conversation's pairing for its connection status; the label
-  // stays derived from the BARE channel. (The `agent · instance` title and
-  // per-pairing accent styling land in Task 9.)
+  // Resolve the conversation's pairing for its connection status and instance
+  // suffix; the label stays derived from the BARE channel.
   const r = resolveConvKey(props.convKey, pairings.map((p) => p.pairingId));
   const pairing = pairings.find((p) => p.pairingId === r?.pairingId);
   const meta = channelMeta(r?.channel ?? props.convKey);
+  // The `· <displayName>` suffix appears only with multiple pairings — a
+  // single-install header keeps the original agent-only title.
+  const multi = pairings.length > 1;
   return (
     <header className="relative z-[2] shrink-0 border-b border-line bg-surface">
       <div className="h-[env(safe-area-inset-top)]" />
@@ -36,7 +38,10 @@ export function ChannelHeader(props: { convKey: ConvKey; onBack: () => void; onS
             ) : null}
           </div>
           <div className="flex min-w-0 flex-col">
-            <span className="text-sm font-semibold leading-tight text-ink">{meta.label}</span>
+            <span className={multi ? 'truncate text-sm font-semibold leading-tight text-ink' : 'text-sm font-semibold leading-tight text-ink'}>
+              {meta.label}
+              {multi ? <span className="text-ink-faint"> · {pairing?.displayName}</span> : null}
+            </span>
             <span className="truncate text-xs leading-4 text-ink-faint">{meta.blurb}</span>
           </div>
         </div>
