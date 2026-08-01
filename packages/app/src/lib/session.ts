@@ -175,7 +175,28 @@ export async function updatePairingMeta(
   await kvUpdate<unknown>(PAIRINGS_KEY, (current) => {
     const parsed = pairingsListSchema.safeParse(current);
     if (!parsed.success) return undefined;
-    result = parsed.data.map((e) => (e.pairingId === pairingId ? { ...e, ...patch } : e));
+    result = parsed.data.map((e) => {
+      if (e.pairingId !== pairingId) return e;
+      const next = { ...e };
+      // An empty/whitespace-only value means "clear the local override" (fall
+      // back to the UI default), NOT "store an empty string" — '' type-checks
+      // but fails the schema's min(1), and an invalid entry would make the
+      // all-or-nothing list parse in loadPairingsRaw() drop the WHOLE store.
+      for (const field of ['displayName', 'color'] as const) {
+        if (!(field in patch)) continue;
+        const value = patch[field];
+        if (value === undefined || value.trim() === '') delete next[field];
+        else next[field] = value;
+      }
+      return next;
+    });
+    // Belt-and-braces: never persist a list the schema rejects. A bad patch
+    // must fail this one call, not brick every stored pairing.
+    const validated = pairingsListSchema.safeParse(result);
+    if (!validated.success) {
+      result = parsed.data;
+      return undefined;
+    }
     return result;
   });
   return result;

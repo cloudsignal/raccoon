@@ -157,6 +157,24 @@ describe('pairings store', () => {
     expect(list[0]!.sessionToken).toBe('tokA');
   });
 
+  it('updatePairingMeta with an empty rename clears the override instead of storing an invalid value', async () => {
+    await savePairings([{ ...pairingA, displayName: 'Home', color: '#10b981' }]);
+    const list = await updatePairingMeta(pairingA.pairingId, { displayName: '' });
+    expect(list[0]!.displayName).toBeUndefined(); // override cleared, not stored as ''
+    expect(list[0]!.color).toBe('#10b981');       // untouched field preserved
+    // The store must remain loadable: an invalid write would fail the
+    // all-or-nothing list parse and make EVERY pairing disappear.
+    expect(await loadPairingsRaw()).toEqual(list);
+    expect((await loadPairingsRaw()).length).toBe(1);
+  });
+
+  it('updatePairingMeta with a no-match pairingId leaves the list loadable and unchanged', async () => {
+    await savePairings([pairingA, pairingB]);
+    const list = await updatePairingMeta('01NOSUCHPAIRINGIDANYWHERE0', { displayName: 'X' });
+    expect(list).toEqual([pairingA, pairingB]);
+    expect(await loadPairingsRaw()).toEqual([pairingA, pairingB]);
+  });
+
   it('hostIdentityKey matches the legacy identity-key format', () => {
     expect(hostIdentityKey({ instance: 'i', userId: 'u1', epoch: 'e1' }))
       .toBe(JSON.stringify({ i: 'i', u: 'u1', e: 'e1' }));
