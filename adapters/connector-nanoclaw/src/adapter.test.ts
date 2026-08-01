@@ -208,6 +208,15 @@ describe('createRaccoonChannelAdapter', () => {
     expect(send).toHaveBeenCalledTimes(4);
   });
 
+  it('starts and stops the admin server with the adapter', async () => {
+    const f = fakeEndpointFactory();
+    const adapter = createRaccoonChannelAdapter({ env: ENV, createEndpoint: f.create })!;
+    await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction: vi.fn() });
+    await adapter.teardown();
+    await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction: vi.fn() }); // rebind works — nothing leaked
+    await adapter.teardown();
+  });
+
   it('setTyping sends a typing start envelope', async () => {
     const f = fakeEndpointFactory();
     const adapter = createRaccoonChannelAdapter({ env: ENV, createEndpoint: f.create })!;

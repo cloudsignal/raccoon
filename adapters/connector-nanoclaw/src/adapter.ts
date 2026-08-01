@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { agentAddress, createEnvelope, userAddress, type AnyEnvelope } from '@raccoon/protocol';
 import { FileCredentialStore } from '@raccoon/transport-ws';
 import { parseRaccoonConfig } from './config.js';
+import { startAdminServer } from './admin-server.js';
 import { createRaccoonEndpoint, type RaccoonEndpoint } from './endpoint.js';
 import { buildNanoClawRunner, type HostCallbacks } from './runner.js';
 import { createTurnStore } from './turns.js';
@@ -40,6 +41,7 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
   const approvalValues = createApprovalValueStore();
   let host: HostCallbacks | null = null;
   let endpoint: RaccoonEndpoint | null = null;
+  let admin: { port: number; close(): Promise<void> } | null = null;
   let sessionStore: FileCredentialStore | null = null;
   let unsubscribeFlush: (() => void) | null = null;
   let connected = false;
@@ -114,6 +116,7 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
       mkdirSync(cfg.dataDir, { recursive: true });
       const store = new FileCredentialStore({ path: join(cfg.dataDir, 'sessions.json') });
       let ep: RaccoonEndpoint | null = null;
+      let adminSrv: { port: number; close(): Promise<void> } | null = null;
       try {
         ep = makeEndpoint({
           instance: cfg.instance,
@@ -131,8 +134,16 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
           turnDeadlineMs: cfg.turnTimeoutMs + BRIDGE_DEADLINE_MARGIN_MS,
         });
         await ep.start();
-        // admin server attaches here (Task 9 — inside this same boundary)
+        adminSrv = await startAdminServer({
+          port: cfg.adminPort,
+          host: cfg.adminHost, // '127.0.0.1' unless RACCOON_ADMIN_HOST is set — never cfg.host
+          secret: cfg.adminSecret,
+          // Closes over the boundary-local ep: the admin listener lives exactly
+          // as long as this endpoint and is closed first in teardown.
+          deps: () => (ep ? { pair: (u) => ep!.pair(u), revoke: (u) => ep!.revoke(u) } : null),
+        });
       } catch (err) {
+        try { await adminSrv?.close(); } catch { /* best-effort */ }
         try { await ep?.stop(); } catch { /* start may have left a partial hub */ }
         await store.close?.();
         throw err;
@@ -140,6 +151,7 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
       // Publish state only after every start succeeded.
       sessionStore = store;
       endpoint = ep;
+      admin = adminSrv;
       host = callbacks;
       unsubscribeFlush = ep.hub.onEnvelope((_env, userId) => { void flushPendingCards(userId); });
       connected = true;
@@ -158,13 +170,16 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
       const store = sessionStore;
       sessionStore = null;
       host = null;
+      // Admin closes FIRST (it depends on the endpoint), then the endpoint.
       // The adapter owns the store it created: close it even when ep.stop()
       // is a no-op (fakes) or throws. close() is idempotent — the real
       // endpoint's stop() also closes it (openclaw gateway #F4 precedent).
+      const adminHandle = admin;
+      admin = null;
       try {
-        await ep?.stop();
+        await adminHandle?.close();
       } finally {
-        await store?.close?.();
+        try { await ep?.stop(); } finally { await store?.close?.(); }
       }
     },
 
