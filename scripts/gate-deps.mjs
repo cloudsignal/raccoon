@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PKGS = [
   'packages/protocol', 'packages/transport-ws', 'packages/pairing', 'packages/push',
-  'packages/bridge', 'adapters/connector-openclaw', 'packages/app',
+  'packages/bridge', 'adapters/connector-openclaw', 'adapters/connector-nanoclaw', 'packages/app',
 ];
 const BUILTINS = new Set([...builtinModules, ...builtinModules.map((m) => `node:${m}`)]);
 

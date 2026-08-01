@@ -54,7 +54,7 @@ but malformed value throws at startup.
 | `RACCOON_HOST` | no | hub default bind | Bind host for the hub port. |
 | `RACCOON_ADMIN_PORT` | no | `RACCOON_PORT + 1` | Port for the admin pair/revoke listener. |
 | `RACCOON_ADMIN_HOST` | no | `127.0.0.1` | Bind host for the admin listener. Loopback by default, and it **never inherits `RACCOON_HOST`** — exposing the hub to `0.0.0.0` must not silently expose pair/revoke. |
-| `RACCOON_INSTANCE` | no | `nanoclaw` | Instance name shown to paired devices and stamped into wiring `platform_id`s. |
+| `RACCOON_INSTANCE` | no | `nanoclaw` | Instance name shown to paired devices and used as the `instance` field on the adapter's `messaging_groups` wiring. |
 | `RACCOON_DATA_DIR` | no | `./data/raccoon` | Directory for the pairing session store (`sessions.json`) and uploaded media blobs (`media/`). |
 | `RACCOON_TURN_TIMEOUT_MS` | no | `90000` | Park timeout for a chat turn, in milliseconds. Slower replies still arrive via the async fallback. |
 | `VAPID_PUBLIC_KEY` | no | — | Web-push key for offline notification. All three VAPID vars must be set together or push stays off. |
