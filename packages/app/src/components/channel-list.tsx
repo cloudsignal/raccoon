@@ -17,10 +17,21 @@ function previewText(last: ChatMessage): string {
 
 export function ChannelList(props: { onOpen: (key: ConvKey) => void }) {
   const { pairings, state } = useChat();
+  const multi = pairings.length > 1;
   // One row per (pairing, channel) conversation — state is keyed by ConvKey;
-  // labels/tones stay derived from the BARE channel.
-  const conversations = pairings.flatMap((p) =>
-    p.channels.map((channel) => ({ key: convKeyOf(p.pairingId, channel), channel, pairing: p })));
+  // labels/tones stay derived from the BARE channel. Merged across pairings,
+  // newest last-message first; conversations with no messages yet sort last,
+  // stable by channel name.
+  const conversations = pairings
+    .flatMap((p) => p.channels.map((channel) => ({ key: convKeyOf(p.pairingId, channel), channel, pairing: p })))
+    .sort((a, b) => {
+      const ta = state.messages[a.key]?.at(-1)?.ts;
+      const tb = state.messages[b.key]?.at(-1)?.ts;
+      if (ta && tb) return ta < tb ? 1 : ta > tb ? -1 : 0;
+      if (ta) return -1;
+      if (tb) return 1;
+      return a.channel < b.channel ? -1 : a.channel > b.channel ? 1 : 0;
+    });
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -40,12 +51,22 @@ export function ChannelList(props: { onOpen: (key: ConvKey) => void }) {
               type="button"
               onClick={() => props.onOpen(c.key)}
               className="flex w-full items-center gap-3 border-b border-line px-4 py-3 text-left active:bg-surface-dim"
-            >{/* per-pairing accent/labels land in Task 9 — visuals unchanged here */}
+            >
               <span
-                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-base font-semibold text-white"
+                className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-base font-semibold text-white"
                 style={{ background: TONES[meta.tone].avatar }}
               >
                 {meta.label.charAt(0)}
+                {/* Per-pairing accent cue — only when the merged list actually
+                    spans pairings; a single-pairing install looks as before. */}
+                {multi ? (
+                  <span
+                    data-testid="pairing-badge"
+                    aria-hidden
+                    className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-surface"
+                    style={{ backgroundColor: c.pairing.color }}
+                  />
+                ) : null}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[15px] font-semibold text-ink">{meta.label}</span>
