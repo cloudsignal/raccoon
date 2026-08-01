@@ -6,3 +6,4 @@ export * from './approvals.js';
 export * from './media.js';
 export * from './endpoint.js';
 export * from './runner.js';
+export * from './adapter.js';
