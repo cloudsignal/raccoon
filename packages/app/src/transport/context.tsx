@@ -37,6 +37,19 @@ export const PROCESSING_TIMEOUT_MS = 120_000;
 // "thinking" forever.
 export const TYPING_AUTO_CLEAR_MS = 75_000;
 const HISTORY_LIMIT = 50;
+// #ER-2: how long ONE delivery attempt may await its transport.send() before
+// the pairing's drain worker stops waiting and moves on. Must comfortably
+// exceed any legitimate send round-trip, yet free the worker BEFORE the
+// outbox lease-sweep horizon (outbox.SEND_LEASE_MS = 20s): a worker stuck on
+// a half-dead transport un-parks while its row's claim is still leased, so
+// the timeout itself never races the sweep's recovery of that same row.
+export const SEND_ATTEMPT_TIMEOUT_MS = 15_000;
+// Test seam (mirrors idb's __setBlockedTimeoutMsForTests): null restores the
+// default. Never used outside tests.
+let sendAttemptTimeoutMs = SEND_ATTEMPT_TIMEOUT_MS;
+export function __setSendAttemptTimeoutForTests(ms: number | null): void {
+  sendAttemptTimeoutMs = ms ?? SEND_ATTEMPT_TIMEOUT_MS;
+}
 // #R10: during interactive pairing, connect() can REJECT on a lost pair.confirmed
 // even though the transport recovers in the background and re-emits the grant.
 // If connect() rejected, wait this long for that recovery grant (or a terminal
@@ -299,13 +312,20 @@ export function TransportProvider(props: TransportProviderProps) {
   const runtimesRef = useRef(new Map<string, PairingRuntime>());
   const activeRef = useRef<ConvKey | null>(null);
   const stateRef = useRef<ChatState>(state);
-  // drainLockRef prevents concurrent drain() executions from double-sending the
-  // same outbox entry.  When a second drain() call arrives while a drain is in
-  // flight, we set drainPendingRef so the in-flight drain re-runs once more
-  // after it finishes — this guarantees entries enqueued during the first drain
-  // are not missed.
-  const drainLockRef = useRef(false);
-  const drainPendingRef = useRef(false);
+  // #ER-2: PER-PAIRING drain serialization. Each pairing's outbox rows drain
+  // through its own serialized worker (lock + pending, keyed by pairingId), so
+  // a slow or never-resolving send on pairing A's transport can never
+  // head-of-line block pairing B's queue — the old single global lock walked
+  // every pairing's rows sequentially and one hung await starved them all.
+  // Within one pairing the lock still prevents concurrent workers from
+  // double-sending the same entry, and the pending flag coalesces re-triggers
+  // that arrive while the worker runs (entries enqueued after its snapshot are
+  // picked up by one re-run) — the same guarantees the global lock gave, now
+  // per pairing. Entries are pruned when the runtime goes away (unpair /
+  // auth-error / cross-tab wipe / unmount); a worker mid-flight keeps its own
+  // state object, and attempt()'s claim CAS remains the authoritative
+  // double-send guard either way.
+  const drainStatesRef = useRef(new Map<string, { lock: boolean; pending: boolean }>());
   // R4-4: a stable, unique id for THIS tab/window instance, lazily generated
   // once. Stamped onto every row this tab claims via markSending() so
   // release/recovery can tell "a row I myself abandoned" (always safe to
@@ -682,7 +702,27 @@ export function TransportProvider(props: TransportProviderProps) {
       }
     }
     try {
-      await rt.transport.send(entry.env);
+      // #ER-2: never await a send unbounded — a transport whose send() hangs
+      // (half-dead socket, a host transport that never settles) would
+      // otherwise pin this pairing's drain worker forever. Race it against
+      // SEND_ATTEMPT_TIMEOUT_MS; on timeout STOP WAITING and move on WITHOUT
+      // marking the row failed: the send may still land. The row stays
+      // 'sending' under its lease — the claim token makes a late
+      // settle/failure write a no-op if the row was since re-claimed, and the
+      // existing lease-expiry sweep recovers a genuinely dead claim. This
+      // deliberately reuses the crash-recovery path: past the timeout, a hung
+      // send is indistinguishable from a crashed owner, and that path is
+      // already safe against both outcomes (late success settles via the
+      // server ack; a dead claim requeues at lease expiry).
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        // Map settle/reject into values so a late settlement AFTER the
+        // timeout won the race is consumed here (no unhandled rejection).
+        rt.transport.send(entry.env).then(() => 'sent' as const, (err: unknown) => ({ err })),
+        new Promise<'timeout'>((resolve) => { timeoutTimer = setTimeout(() => resolve('timeout'), sendAttemptTimeoutMs); }),
+      ]).finally(() => clearTimeout(timeoutTimer));
+      if (outcome === 'timeout') return;
+      if (outcome !== 'sent') throw outcome.err; // rejected in time: the normal failure path below
       // msg and approval.response both get a server ack (bridge.ts) and so both
       // wait for round-trip confirmation before settling. Without this (R2-5),
       // approval.response settled the instant the browser accepted the send
@@ -728,43 +768,52 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, []);
 
-  const drain = useCallback(async (onlyPairingId?: string) => {
-    // Serialise concurrent drain() calls.  If a drain is already in flight,
-    // set the pending flag and return — the in-flight drain will re-run once
-    // after finishing, picking up any entries that were enqueued after its
-    // initial listPending() snapshot. The lock stays GLOBAL — one drain
-    // walker — while rows route per pairing inside attempt().
-    if (drainLockRef.current) { drainPendingRef.current = true; return; }
-    drainLockRef.current = true;
+  /** ONE pairing's serialized drain worker (#ER-2): walks that pairing's
+   *  pending rows oldest-first (listPending() is createdAt-sorted, so
+   *  per-pairing ordering is preserved), re-running once for triggers
+   *  coalesced while it ran. */
+  const drainPairing = useCallback(async (pairingId: string) => {
+    let st = drainStatesRef.current.get(pairingId);
+    if (!st) { st = { lock: false, pending: false }; drainStatesRef.current.set(pairingId, st); }
+    // Serialise concurrent calls for THIS pairing. If its worker is already
+    // in flight, set the pending flag and return — the worker re-runs once
+    // after finishing, picking up entries enqueued after its initial
+    // listPending() snapshot.
+    if (st.lock) { st.pending = true; return; }
+    st.lock = true;
     try {
-      let filter = onlyPairingId;
       do {
-        drainPendingRef.current = false;
+        st.pending = false;
         const pending = await outbox.listPending();
         // R5-3/R6-3: attempt()'s scope-gated claim is the authoritative
         // guard — it can never transmit a foreign-pairing row. #R7-3: SKIP
-        // rows for pairings this provider doesn't hold, do NOT delete them.
-        // The outbox is shared per-origin, so such a row may belong to a
-        // DIFFERENT identity live in another tab; deleting it here destroyed
-        // that tab's queued data. Leaving it is harmless (it can never be
-        // claimed under a scope we don't hold); its own identity's tab drains
-        // it, and its own wipe clears it.
+        // rows outside this worker's scope, do NOT delete them. The outbox
+        // is shared per-origin, so a foreign row may belong to a DIFFERENT
+        // identity live in another tab; deleting it here destroyed that
+        // tab's queued data. Leaving it is harmless (it can never be claimed
+        // under a scope we don't hold): another held pairing's rows are its
+        // own worker's, and a row whose scope has no runtime here is simply
+        // never picked up (drain() only kicks workers for held runtimes) —
+        // its own identity's tab drains it, and its own wipe clears it.
         for (const entry of pending) {
-          if (!runtimesRef.current.has(entry.scope ?? '')) continue; // not ours — leave it for its owner
-          // A reconnect on pairing A drains only A's outbox rows; B's stay
-          // queued for B's own transport.
-          if (filter && entry.scope !== filter) continue;
+          if (entry.scope !== pairingId) continue; // not this worker's row
           await attempt(entry);
         }
-        // A coalesced re-run may have been triggered by ANY pairing's enqueue
-        // or reconnect — run it unfiltered (attempt()'s per-row status gate
-        // makes that safe over closed transports).
-        filter = undefined;
-      } while (drainPendingRef.current);
+      } while (st.pending);
     } finally {
-      drainLockRef.current = false;
+      st.lock = false;
     }
   }, [attempt]);
+
+  /** drain(pairingId) drives that ONE pairing's worker — a reconnect on
+   *  pairing A drains only A's rows; B's stay queued for B's own worker.
+   *  drain() with no argument kicks every pairing that has a runtime
+   *  (attempt()'s per-row status gate makes a kick over a closed transport a
+   *  claim-free no-op). */
+  const drain = useCallback(async (onlyPairingId?: string) => {
+    if (onlyPairingId !== undefined) { await drainPairing(onlyPairingId); return; }
+    await Promise.all([...runtimesRef.current.keys()].map((pid) => drainPairing(pid)));
+  }, [drainPairing]);
 
   // R5-4/#R6-5b: coalescing timer for re-running the EXPIRY sweep once a
   // still-valid lease it had to skip lapses. A one-shot boot sweep alone
@@ -934,6 +983,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // while this one is still the installed one.
       if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return false;
       runtimesRef.current.delete(pid);
+      drainStatesRef.current.delete(pid); // #ER-2: the re-install lazily creates fresh drain state
       const myBootGen = bootGenRef.current;
       const list = await loadPairingsRaw().catch((): PairedSession[] => []);
       // Unmount/storage-error teardown, or a concurrent install for the same
@@ -964,6 +1014,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // superseded this one (the TOCTOU the deferral pattern exists to avoid).
     if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return false;
     runtimesRef.current.delete(pid);
+    drainStatesRef.current.delete(pid); // #ER-2: no runtime, no drain worker state
     // Browser-level push teardown belongs to the LAST pairing only, and the
     // "last" determination is made HERE — at the point this runtime is
     // actually removed — so two concurrent terminal wipes (unpair or
@@ -1157,6 +1208,7 @@ export function TransportProvider(props: TransportProviderProps) {
         rt.transport = null;
       }
       runtimesRef.current.clear();
+      drainStatesRef.current.clear(); // #ER-2: per-pairing drain state goes with the runtimes
     };
     const clearTimers = (): void => {
       for (const { timer } of ackTimers.current.values()) clearTimeout(timer);
@@ -1272,6 +1324,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // in-memory slice.
         dispatch({ type: 'drop-pairing', pairingId: data.pairingId });
         runtimesRef.current.delete(data.pairingId);
+        drainStatesRef.current.delete(data.pairingId); // #ER-2: no runtime, no drain worker state
         refreshViews();
         if (activeRef.current && resolveConvKey(activeRef.current, [data.pairingId])) setActiveChannel(null);
         if (runtimesRef.current.size === 0) {
@@ -1550,12 +1603,13 @@ export function TransportProvider(props: TransportProviderProps) {
 
   const sendEnvelope = useCallback((pairingId: string, env: AnyEnvelope) => {
     // Enqueue to IDB first.  Once the write commits, if this pairing's
-    // transport is already open we call drain() rather than attempting this
-    // specific entry directly. Drain serialises attempts (one at a time, in
-    // order) so there is no risk of a concurrent drain + direct-attempt
-    // double-send.  The extra drain() call is cheap when the outbox is empty
-    // or the entry was already picked up by a concurrent drain triggered by
-    // the 'open' status event.
+    // transport is already open we call drain(pairingId) rather than
+    // attempting this specific entry directly. The pairing's drain worker
+    // serialises its attempts (one at a time, oldest-first — #ER-2) so there
+    // is no risk of a concurrent drain + direct-attempt double-send.  The
+    // extra drain() call is cheap when the outbox is empty or the entry was
+    // already picked up by a concurrent drain triggered by the 'open' status
+    // event.
     //
     // We read the runtime's statusNow — updated synchronously as the FIRST
     // line of the onStatus handler — so this .then() sees the actual current

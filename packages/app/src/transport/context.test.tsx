@@ -8,7 +8,7 @@ import { loadPairingsRaw, savePairings } from '../lib/session.js';
 import { __setPushEnvForTests, type PushEnv } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
-import { TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from './context.js';
+import { __setSendAttemptTimeoutForTests, TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from './context.js';
 
 // Unmount every rendered provider BEFORE resetting the DB — the boot effect's
 // cleanup clears its periodic lease sweep, BroadcastChannels, and timers, so a
@@ -1401,6 +1401,83 @@ describe('TransportProvider', () => {
       for (const e of tA.sent) {
         expect(e.channel.includes(P1)).toBe(false);
       }
+    });
+  });
+
+  describe('per-pairing drain isolation (#ER-2)', () => {
+    it('a hung send on pairing A does not block pairing B\'s outbound queue (no cross-pairing head-of-line blocking)', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB);
+      // Short timeout so A's parked worker un-parks harmlessly within the
+      // test's own lifetime — the assertions below must all hold BEFORE it
+      // fires (B flows because the workers are per-pairing, not because A
+      // timed out and released a shared lock).
+      __setSendAttemptTimeoutForTests(500);
+      try {
+        tA.send = () => new Promise(() => {}); // A's transport never settles a send
+        act(() => { api.sendMessage(CK, 'stuck'); });
+        // A's worker has claimed the row and is parked inside the hung send.
+        await waitFor(async () => {
+          expect((await outbox.listForChannel('coordinator', P1))[0]?.status).toBe('sending');
+        });
+        act(() => { api.sendMessage(CK2, 'flows'); });
+        // B must deliver promptly even though A's worker is parked.
+        await waitFor(() => expect(tB.sent.some((e) => e.kind === 'msg' && e.payload.text === 'flows')).toBe(true));
+        // A's row is still held by its own worker — claimed, not failed, and
+        // never transmitted.
+        const aRows = await outbox.listForChannel('coordinator', P1);
+        expect(aRows).toHaveLength(1);
+        expect(aRows[0]!.status).toBe('sending');
+        expect(tA.sent.filter((e) => e.kind === 'msg')).toHaveLength(0);
+      } finally {
+        __setSendAttemptTimeoutForTests(null);
+      }
+    });
+
+    it('a timed-out send frees the pairing\'s worker to serve the next row WITHOUT failing the timed-out one (SEND_ATTEMPT_TIMEOUT_MS)', async () => {
+      const transport = new FakeTransport();
+      await mountPaired(transport);
+      __setSendAttemptTimeoutForTests(50);
+      try {
+        const originalSend = transport.send.bind(transport);
+        let hangs = 1;
+        transport.send = (env) => {
+          if (hangs > 0) { hangs -= 1; return new Promise(() => {}); } // first send hangs forever
+          return originalSend(env);
+        };
+        act(() => { api.sendMessage(CK, 'first: hangs'); });
+        await waitFor(async () => {
+          expect((await outbox.listForChannel('coordinator', P1))[0]?.status).toBe('sending');
+        });
+        // The worker times out on the hung send and moves on — the SAME
+        // pairing's next row flows instead of queuing behind it forever.
+        act(() => { api.sendMessage(CK, 'second: flows'); });
+        await waitFor(() => expect(transport.sent.some((e) => e.kind === 'msg' && e.payload.text === 'second: flows')).toBe(true));
+        // The timed-out row was NOT marked failed: the send may still land, so
+        // it stays 'sending' under its lease — a late settle/failure write is
+        // claim-token-gated, and the lease-expiry sweep recovers it if the
+        // claim is genuinely dead (the crash-recovery path, reused
+        // deliberately).
+        const rows = await outbox.listForChannel('coordinator', P1);
+        const first = rows.find((r) => r.env.kind === 'msg' && r.env.payload.text === 'first: hangs');
+        expect(first?.status).toBe('sending');
+      } finally {
+        __setSendAttemptTimeoutForTests(null);
+      }
+    });
+
+    it('two sends on the same pairing arrive in order through its drain worker (per-pairing FIFO preserved)', async () => {
+      const transport = new FakeTransport();
+      await mountPaired(transport);
+      act(() => { transport.setStatus('closed'); transport.connected = false; }); // queue both
+      act(() => { api.sendMessage(CK, 'one'); });
+      await waitFor(async () => expect((await outbox.listForChannel('coordinator', P1)).length).toBe(1));
+      await new Promise((r) => setTimeout(r, 2)); // force the second ts to sort strictly after the first
+      act(() => { api.sendMessage(CK, 'two'); });
+      await waitFor(async () => expect((await outbox.listForChannel('coordinator', P1)).length).toBe(2));
+      await act(async () => { await transport.connect(); });
+      await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(2));
+      expect(transport.sent.filter((e) => e.kind === 'msg').map((e) => e.payload.text)).toEqual(['one', 'two']);
     });
   });
 
