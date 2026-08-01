@@ -122,6 +122,14 @@ same QR/paste flow used for the first pairing. Installs that embed the app
 with a host-managed transport hide "Add platform" — the host application
 owns identity there.
 
+Known v1 limitation: attachments are single-instance. The app has one upload
+origin — the instance that serves it — and uploads authenticate with the
+active conversation's pairing token, so sending files only works in
+conversations belonging to that pairing. In a secondary pairing's
+conversations uploads fail, and inbound attachments that use relative
+`/media/...` URLs resolve against the serving origin and will not load. Text
+messaging across pairings is unaffected.
+
 ### Identify your instance in push payloads
 
 The app registers its one browser push subscription with every paired
@@ -146,6 +154,16 @@ conversation. `userId` is required inside `instance` for unambiguous
 routing — two pairings may point at the same instance URL as different
 users. Payloads that omit `instance` degrade gracefully: un-suffixed title,
 and a tap opens the app's conversation list.
+
+Echo the pairing QR's `instanceUrl` **verbatim** in `instance.instanceUrl`:
+the client matches it byte-for-byte against the stored pairing when routing
+a tap, and any difference — even an added trailing slash — silently falls
+back to opening the merged conversation list instead of the conversation.
+
+Note that `instance` is self-declared by the pushing instance: it is a
+labeling and routing hint, not an authenticated identity, so an instance can
+mislabel its notifications — do not treat notification titles as trust
+signals.
 
 ## Path B — an existing OpenClaw agent
 

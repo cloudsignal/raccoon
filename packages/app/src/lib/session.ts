@@ -29,6 +29,12 @@ export type Session = z.infer<typeof sessionSchema>;
 // migration (lib/adopt.ts). The old loadSession/saveSession/clearSession
 // helpers are gone — the pairings list below is the durable store now.
 
+// SCHEMA-EVOLUTION RULE: the stored pairings list is parsed all-or-nothing at
+// boot (loadPairingsRaw — one entry failing the parse makes the WHOLE list
+// read as absent, []). Any FUTURE field added to this schema MUST therefore
+// be optional (or ship with a versioned migration): a new required field
+// would fail the parse for every list persisted before the change and
+// silently unpair every existing install.
 export const pairedSessionSchema = sessionSchema.extend({
   /** Local, stable scope key for ALL of this pairing's app-side state
    *  (chat-state ConvKeys, `lastread:` kv keys, outbox row scope, approvals

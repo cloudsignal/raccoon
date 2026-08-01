@@ -38,16 +38,26 @@ function PlatformRow(props: {
           className="h-2.5 w-2.5 shrink-0 rounded-full"
           style={{ backgroundColor: p.color }}
         />
-        <input
-          key={p.displayName}
-          defaultValue={p.displayName}
-          aria-label={`Rename ${p.displayName}`}
-          onBlur={(e) => commit(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') { e.preventDefault(); commit(e.currentTarget.value); e.currentTarget.blur(); }
-          }}
-          className="min-w-0 flex-1 rounded-[6px] border border-transparent bg-transparent px-1 text-sm font-medium text-ink outline-none focus:border-line"
-        />
+        {p.transportKind === 'host' ? (
+          // Rename patches the STORED pairings list; a host-managed synthetic
+          // pairing has no stored entry (updatePairingMeta finds nothing and
+          // the edit reverts), so render the name read-only — mirroring how
+          // the sheet hides "Add platform" for host-managed installs.
+          <span className="min-w-0 flex-1 truncate px-1 text-sm font-medium text-ink">
+            {p.displayName}
+          </span>
+        ) : (
+          <input
+            key={p.displayName}
+            defaultValue={p.displayName}
+            aria-label={`Rename ${p.displayName}`}
+            onBlur={(e) => commit(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); commit(e.currentTarget.value); e.currentTarget.blur(); }
+            }}
+            className="min-w-0 flex-1 rounded-[6px] border border-transparent bg-transparent px-1 text-sm font-medium text-ink outline-none focus:border-line"
+          />
+        )}
         <span className="shrink-0 text-xs text-ink-faint">{STATUS_TEXT[p.status]}</span>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2 pl-[18px]">

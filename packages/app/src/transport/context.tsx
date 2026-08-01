@@ -158,7 +158,17 @@ const defaultMakeTransport: MakeTransport = (opts) => new WsClientTransport(opts
  *  pairing that owns the ACTIVE conversation — uploads authenticate against
  *  the pairing being composed in — falling back to the first pairing when no
  *  conversation is open. Exported so the factory is unit-testable without
- *  mounting the provider. */
+ *  mounting the provider.
+ *
+ *  v1 LIMITATION — media is NOT multi-pairing aware. There is one upload
+ *  origin for the whole app: uploadFile/deleteUpload/leaseUploads resolve
+ *  against `provider.baseUrl ?? ''`, i.e. the origin serving the app, while
+ *  this provider presents the ACTIVE conversation's pairing token. So
+ *  attachments only work for the pairing whose instance serves the app: a
+ *  secondary pairing's uploads go to (and authenticate against) the wrong
+ *  instance and fail, and its inbound relative `/media/...` attachment URLs
+ *  resolve against the serving origin. Per-pairing media (baseUrl + token
+ *  selected per conversation) is future work. */
 export function buildDefaultUploadProvider(
   sessionRef: { readonly current: { sessionToken?: string } | null },
 ): UploadProvider {
@@ -801,8 +811,10 @@ export function TransportProvider(props: TransportProviderProps) {
   }, []);
 
   /**
-   * Per-pairing durable wipe, used on unpair, terminal auth-error, and the
-   * tombstoned-boot path: clears exactly ONE pairing's slice of every store.
+   * Per-pairing durable wipe, called only from wipePairing — the shared
+   * teardown tail for unpair() and the terminal auth-error path: clears
+   * exactly ONE pairing's slice of every store. (The tombstoned-boot path
+   * does NOT come through here — it runs only removePairingIfMatches.)
    *
    * outbox.clearScope() (not a raw store clear) is required here: it is
    * serialized against the outbox sweeps (single transaction — see the outbox

@@ -186,4 +186,15 @@ describe('SettingsSheet platforms', () => {
     expect(screen.getByText('u1 on alpha')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Add platform' })).toBeNull();
   });
+
+  it('shows a host-managed pairing name as plain text with no rename textbox', async () => {
+    // Rename patches the stored pairings list, but a host-managed session has
+    // no stored entry (updatePairingMeta finds nothing and the edit reverts) —
+    // so the row must render the name read-only instead of a silently
+    // no-opping input.
+    await mountSheet([{ ...pairingA, transportKind: 'host' }], () => new FakeTransport());
+    expect(screen.getByText('alpha')).toBeTruthy();
+    expect(screen.queryByLabelText('Rename alpha')).toBeNull();
+    expect(screen.queryByRole('textbox')).toBeNull();
+  });
 });
