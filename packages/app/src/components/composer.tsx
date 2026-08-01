@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Paperclip, SendHorizonal } from 'lucide-react';
 import { channelMeta } from '../config.js';
+import { resolveConvKey } from '../lib/conv-key.js';
 import { setUpdateHold } from '../lib/update-hold.js';
 import { deleteUpload, uploadFile, validateFiles } from '../lib/uploads.js';
 import { useChat } from '../transport/context.js';
@@ -14,7 +15,11 @@ const REJECT_LABEL: Record<string, string> = {
 };
 
 export function Composer(props: { channel: string }) {
-  const { sendMessage, status, uploadProvider } = useChat();
+  const { sendMessage, pairings, uploadProvider } = useChat();
+  // props.channel is a ConvKey (the state key). The label and offline notice
+  // derive from the resolved BARE channel + its pairing's connection status.
+  const resolved = resolveConvKey(props.channel, pairings.map((p) => p.pairingId));
+  const pairing = pairings.find((p) => p.pairingId === resolved?.pairingId);
   const [value, setValue] = useState('');
   const [pending, setPending] = useState<PendingAttachment[]>([]);
   const [dropActive, setDropActive] = useState(false);
@@ -32,7 +37,7 @@ export function Composer(props: { channel: string }) {
   const pendingRef = useRef<PendingAttachment[]>(pending);
   pendingRef.current = pending;
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const meta = channelMeta(props.channel);
+  const meta = channelMeta(resolved?.channel ?? props.channel);
 
   useEffect(() => {
     // Chips are user work in progress just like typed text — hold updates
@@ -162,7 +167,7 @@ export function Composer(props: { channel: string }) {
       onDragLeave={() => setDropActive(false)}
       onDrop={(e) => { e.preventDefault(); setDropActive(false); addFiles([...e.dataTransfer.files]); }}
     >
-      {status !== 'open' ? (
+      {pairing?.status !== 'open' ? (
         <p className="px-4 pb-1 text-center text-xs text-ink-faint">
           Offline — messages will send when the connection returns.
         </p>

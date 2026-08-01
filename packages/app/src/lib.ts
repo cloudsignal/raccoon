@@ -16,7 +16,7 @@
  *     sessionToken: 'host-managed',   // placeholder OK — not used by provider
  *     userId: 'user:abc123',          // REQUIRED — drives from: address on all sends
  *     instance: 'my-instance',        // REQUIRED
- *     channels: ['coordinator'],      // REQUIRED — drives the channel list UI
+ *     channels: ['coordinator'],      // REQUIRED — drives the conversation list UI
  *   };
  *
  *   function Shell() {
@@ -29,21 +29,36 @@
  *   }
  *
  * When `transportOverride` is supplied:
- * - The provider skips IDB session loading and the QR-pairing flow entirely.
+ * - The provider skips IDB pairing storage and the QR-pairing flow entirely.
  * - phase starts as 'loading' for one tick then becomes 'ready'.
+ * - The override session becomes the app's SINGLE synthetic pairing, exposed
+ *   as `ChatApi.pairings[0]` (the old `session`/`status` fields no longer
+ *   exist on ChatApi; per-pairing connection status lives on each
+ *   PairingView).
  * - The host is fully responsible for authentication and transport lifecycle
  *   (the provider does NOT call close() on an override transport on unmount).
- * - `pairWithPayload` is still present on the ChatApi but is meaningless for
- *   hosts that bypass pairing — do not call it.
+ * - `pairWithPayload` is rejected with an error message under an override —
+ *   the host owns identity.
  *
- * `sessionOverride` MUST accompany `transportOverride`.  Without it, `session`
- * in ChatApi is null, the channel list is empty, and all outbound messages
- * (sendMessage, respondApproval) silently no-op because userId is unavailable.
- * The override session is NOT persisted to IDB — the host owns identity.
+ * `sessionOverride` MUST accompany `transportOverride`.  Without it,
+ * `pairings` is empty, the conversation list is empty, and all outbound
+ * messages (sendMessage, respondApproval) silently no-op because no pairing
+ * identity is available.  The override session is NOT persisted to IDB — the
+ * host owns identity.
  *
- * For the pairing flow (still supported): supply `makeTransport` instead.
- * The factory receives `{url, session?, pairingToken?, device?}` from the
- * provider but may ignore opts and return a fully custom transport.
+ * Conversation addressing: ChatApi conversation methods (openChannel,
+ * sendMessage, respondApproval, retryMessage, loadOlder) take ConvKeys —
+ * `${pairingId}/${channel}` (build one as
+ * `pairings[0].pairingId + '/' + channel`, or via the exported convKeyOf).
+ * Envelopes on the wire keep the BARE channel; the pairingId never leaves the
+ * device.
+ *
+ * For the pairing flow (still supported): supply `makeTransport` to override
+ * the built-in WS factory (the registry's 'ws' slot) — the factory receives
+ * `{url, session?, pairingToken?, device?}` from the provider but may ignore
+ * opts and return a fully custom transport.  To support ADDITIONAL transport
+ * kinds selected by a pairing payload's `transport` field, register factories
+ * via the `transports` prop (a TransportRegistry).
  */
 
 // Core UI components
@@ -52,8 +67,13 @@ export { UpdateGate } from './components/update-gate.js';
 
 // Transport layer
 export { TransportProvider, useChat } from './transport/context.js';
-export type { ChatApi, TransportProviderProps, PushRegistrar } from './transport/context.js';
-export type { AppTransport, MakeTransport } from './transport/types.js';
+export type { ChatApi, PairingView, TransportProviderProps, PushRegistrar } from './transport/context.js';
+export type { AppTransport, MakeTransport, TransportRegistry } from './transport/types.js';
+
+// Conversation keys — `${pairingId}/${channel}`, the state key for every
+// per-conversation ChatApi call.
+export { convKeyOf, resolveConvKey } from './lib/conv-key.js';
+export type { ConvKey } from './lib/conv-key.js';
 
 // The push-registrar factory belongs on the public surface so a host wiring a
 // VAPID-over-HTTP registrar does not reach into internal modules.

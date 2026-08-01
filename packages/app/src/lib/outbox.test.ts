@@ -241,6 +241,16 @@ describe('outbox', () => {
     expect(await outbox.listPending()).toHaveLength(1);
   });
 
+  it('releaseOwnedSending with a scope filter releases only that scope\'s rows', async () => {
+    const a = await outbox.enqueue(msg('for A'), 'P1');
+    const b = await outbox.enqueue(msg('for B'), 'P2');
+    await outbox.markSending(a.id, 'tab1', 'P1');
+    await outbox.markSending(b.id, 'tab1', 'P2');
+    await outbox.releaseOwnedSending('tab1', 'P1');
+    expect((await outbox.getEntry(a.id))?.status).toBe('pending');
+    expect((await outbox.getEntry(b.id))?.status).toBe('sending'); // other pairing's in-flight row untouched
+  });
+
   it('markSending is a pending-only compare-and-set: only the first of two racing tabs claims the row (#R4-4)', async () => {
     const e = await outbox.enqueue(msg('x'), SCOPE);
     // Two tabs both saw the row as 'pending' in their own listPending()

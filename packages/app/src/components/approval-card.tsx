@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { channelMeta, TONES } from '../config.js';
+import { resolveConvKey } from '../lib/conv-key.js';
 import { formatTime } from '../lib/time.js';
 import { useChat } from '../transport/context.js';
 import type { ChatMessage } from '../state/messages.js';
@@ -11,12 +12,14 @@ function label(option: string): string {
 }
 
 export function ApprovalCard(props: { msg: ChatMessage }) {
-  const { respondApproval, retryMessage } = useChat();
+  const { respondApproval, retryMessage, pairings } = useChat();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(props.msg.approval?.description ?? '');
   const approval = props.msg.approval;
   if (!approval) return null;
   const tone = TONES[channelMeta(props.msg.sender).tone];
+  // msg.channel is a ConvKey; the badge shows the BARE channel name.
+  const bareChannel = resolveConvKey(props.msg.channel, pairings.map((p) => p.pairingId))?.channel ?? props.msg.channel;
   const responded = props.msg.respondedChoice;
   // R2-5: approval.response now round-trips through an ack like a plain msg, so
   // a dropped connection before the server received it surfaces as 'failed'
@@ -48,7 +51,7 @@ export function ApprovalCard(props: { msg: ChatMessage }) {
           {approval.title}
         </span>
         <span className="shrink-0 rounded-full bg-surface-dim px-2 py-[3px] font-mono text-[11px] text-ink-soft">
-          {props.msg.channel}
+          {bareChannel}
         </span>
       </div>
       {editing ? (

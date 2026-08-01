@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { createEnvelope, type Attachment, type Envelope } from '@raccoon/protocol';
 import { closeDbForTests } from '../lib/idb.js';
-import { saveSession } from '../lib/session.js';
+import { savePairings } from '../lib/session.js';
 import { formatTime } from '../lib/time.js';
 import { LONG_PRESS_MS } from '../lib/long-press.js';
 import { FakeTransport } from '../transport/fake.js';
@@ -34,6 +34,8 @@ afterEach(async () => {
 });
 
 const A_ID = '01ARZ3NDEKTSV4RRFFQ69G5FAV'; // 26 chars, ulid alphabet
+const P1 = '01BXPAIRINGIDFORTESTSAAAAA';
+const CK = `${P1}/coordinator`;
 const IMAGE: Attachment = { url: `/media/${A_ID}/photo.jpg`, mime: 'image/jpeg', name: 'photo.jpg', size: 51_200 };
 const PDF: Attachment = { url: `/media/${A_ID}/report.pdf`, mime: 'application/pdf', name: 'report.pdf', size: 34_500 };
 const BIG: Attachment = { url: `/media/${A_ID}/build.zip`, mime: 'application/zip', name: 'build.zip', size: 2_621_440 }; // 2.5 MB
@@ -54,10 +56,10 @@ const attachmentMsg = (over: {
 
 async function mountThread() {
   const transport = new FakeTransport();
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
-      <Thread channel="coordinator" />
+      <Thread channel={CK} />
     </TransportProvider>,
   );
   await waitFor(() => expect(transport.connected).toBe(true));
@@ -159,7 +161,7 @@ describe('MessageBubble attachments', () => {
 describe('channel-list preview for attachment-only messages', () => {
   async function mountApp() {
     const transport = new FakeTransport();
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator', 'echo'] });
+    await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator', 'echo'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
     render(
       <TransportProvider makeTransport={() => transport}>
         <App />

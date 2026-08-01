@@ -1,10 +1,16 @@
 import { ArrowLeft, Settings } from 'lucide-react';
 import { channelMeta, TONES } from '../config.js';
+import { resolveConvKey, type ConvKey } from '../lib/conv-key.js';
 import { useChat } from '../transport/context.js';
 
-export function ChannelHeader(props: { channel: string; onBack: () => void; onSettings: () => void }) {
-  const { status } = useChat();
-  const meta = channelMeta(props.channel);
+export function ChannelHeader(props: { convKey: ConvKey; onBack: () => void; onSettings: () => void }) {
+  const { pairings } = useChat();
+  // Resolve the conversation's pairing for its connection status; the label
+  // stays derived from the BARE channel. (The `agent · instance` title and
+  // per-pairing accent styling land in Task 9.)
+  const r = resolveConvKey(props.convKey, pairings.map((p) => p.pairingId));
+  const pairing = pairings.find((p) => p.pairingId === r?.pairingId);
+  const meta = channelMeta(r?.channel ?? props.convKey);
   return (
     <header className="relative z-[2] shrink-0 border-b border-line bg-surface">
       <div className="h-[env(safe-area-inset-top)]" />
@@ -25,7 +31,7 @@ export function ChannelHeader(props: { channel: string; onBack: () => void; onSe
             >
               {meta.label.charAt(0)}
             </div>
-            {status === 'open' ? (
+            {pairing?.status === 'open' ? (
               <span className="absolute -bottom-0.5 -right-0.5 box-border h-3 w-3 rounded-full border-2 border-surface bg-online" />
             ) : null}
           </div>

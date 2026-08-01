@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { createEnvelope, type Envelope } from '@raccoon/protocol';
 import { closeDbForTests } from '../lib/idb.js';
-import { saveSession } from '../lib/session.js';
+import { savePairings } from '../lib/session.js';
 import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider } from '../transport/context.js';
 import { LONG_PRESS_MS } from '../lib/long-press.js';
@@ -25,6 +25,9 @@ class FakePointerEvent extends MouseEvent {
 }
 (globalThis as unknown as { PointerEvent: typeof FakePointerEvent }).PointerEvent = FakePointerEvent;
 
+const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const CK = `${P1}/coordinator`;
+
 afterEach(async () => {
   vi.restoreAllMocks();
   await closeDbForTests();
@@ -39,10 +42,10 @@ const agentMsg = (): Envelope<'msg'> => createEnvelope('msg', {
 
 async function mount() {
   const transport = new FakeTransport();
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
-      <Thread channel="coordinator" />
+      <Thread channel={CK} />
     </TransportProvider>,
   );
   await waitFor(() => expect(transport.connected).toBe(true));

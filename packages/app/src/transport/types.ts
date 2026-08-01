@@ -14,6 +14,12 @@ export interface AppTransport extends Transport {
   onAuthError(h: (code: number) => void): () => void;
 }
 
+/** Per-kind transport factories, keyed by the pairing payload's `transport`
+ *  field ('ws' is built in; an embedding host registers additional kinds via
+ *  the provider's `transports` prop). A stored pairing whose kind has no
+ *  factory stays listed but offline. */
+export type TransportRegistry = Record<string, MakeTransport>;
+
 export type MakeTransport = (opts: {
   url: string;
   session?: string;

@@ -6,10 +6,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { act } from 'react';
 import { createEnvelope } from '@raccoon/protocol';
 import { closeDbForTests } from '../lib/idb.js';
-import { saveSession } from '../lib/session.js';
+import { savePairings } from '../lib/session.js';
 import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider, useChat } from '../transport/context.js';
 import { Thread } from './thread.js';
+
+const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const CK = `${P1}/coordinator`;
 
 afterEach(async () => { await closeDbForTests(); });
 
@@ -23,11 +26,11 @@ function Bind() {
 }
 
 async function mount(transport = new FakeTransport()) {
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
       <Bind />
-      <Thread channel="coordinator" />
+      <Thread channel={CK} />
     </TransportProvider>,
   );
   await waitFor(() => expect(send).toBeDefined());
@@ -49,7 +52,7 @@ describe('Thread', () => {
 
   it('shows pending tick then sent tick after ack', async () => {
     const transport = await mount();
-    act(() => { send('coordinator', 'outgoing'); });
+    act(() => { send(CK, 'outgoing'); });
     expect(await screen.findByText('outgoing')).toBeTruthy();
     expect(screen.getByTestId('tick-pending')).toBeTruthy();
     await waitFor(() => expect(transport.sent.filter((e) => e.kind === 'msg')).toHaveLength(1));

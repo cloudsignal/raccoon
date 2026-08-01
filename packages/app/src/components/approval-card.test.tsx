@@ -6,10 +6,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { act } from 'react';
 import { createEnvelope, type Envelope } from '@raccoon/protocol';
 import { closeDbForTests } from '../lib/idb.js';
-import { saveSession } from '../lib/session.js';
+import { savePairings } from '../lib/session.js';
 import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider } from '../transport/context.js';
 import { Thread } from './thread.js';
+
+const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const CK = `${P1}/coordinator`;
 
 afterEach(async () => { await closeDbForTests(); });
 
@@ -25,10 +28,10 @@ const approvalEnv = (): Envelope<'approval.request'> => createEnvelope('approval
 
 async function mount() {
   const transport = new FakeTransport();
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
-      <Thread channel="coordinator" />
+      <Thread channel={CK} />
     </TransportProvider>,
   );
   await waitFor(() => expect(transport.connected).toBe(true));
@@ -52,10 +55,10 @@ describe('ApprovalCard', () => {
     // making what the user reads differ from what will execute.
     const command = 'echo  two-spaces\n\trm -rf ./build\nnpm run dist';
     const transport = new FakeTransport();
-    await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+    await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
     render(
       <TransportProvider makeTransport={() => transport}>
-        <Thread channel="coordinator" />
+        <Thread channel={CK} />
       </TransportProvider>,
     );
     await waitFor(() => expect(transport.connected).toBe(true));

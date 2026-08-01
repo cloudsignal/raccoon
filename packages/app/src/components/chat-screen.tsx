@@ -29,9 +29,11 @@ export function ChatScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const open = (id: string): void => {
-    window.history.pushState(null, '', `?c=${encodeURIComponent(id)}`);
-    openChannel(id);
+  // `?c=` carries the encoded ConvKey; openChannel validates it against the
+  // live pairings, so a stale param (unknown pairing or channel) no-ops.
+  const open = (key: string): void => {
+    window.history.pushState(null, '', `?c=${encodeURIComponent(key)}`);
+    openChannel(key);
   };
 
   const back = (): void => {
@@ -47,7 +49,7 @@ export function ChatScreen() {
       <main className={`${activeChannel ? 'flex' : 'hidden md:flex'} min-w-0 flex-1 flex-col`}>
         {activeChannel ? (
           <>
-            <ChannelHeader channel={activeChannel} onBack={back} onSettings={() => setSettingsOpen(true)} />
+            <ChannelHeader convKey={activeChannel} onBack={back} onSettings={() => setSettingsOpen(true)} />
             <div className="wallpaper flex min-h-0 flex-1 flex-col">
               <Thread channel={activeChannel} />
               <Composer key={activeChannel} channel={activeChannel} />

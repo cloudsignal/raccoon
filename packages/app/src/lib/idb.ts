@@ -254,21 +254,6 @@ export function kvDeleteIf<T>(key: string, predicate: (value: T) => boolean): Pr
   });
 }
 
-/**
- * Clear every kv key EXCEPT `session` (#R8-4). Used by a wipe that has
- * already compare-and-cleared the session key itself — so it can drop read
- * markers / the push flag without risking deletion of a session a concurrent
- * re-pair may have written since.
- */
-export async function wipeKvExceptSession(): Promise<void> {
-  await withTransaction('kv', 'readwrite', async (s) => {
-    const keys = await promisifyRequest(s.getAllKeys() as IDBRequest<IDBValidKey[]>);
-    for (const k of keys) {
-      if (k !== 'session') await promisifyRequest(s.delete(k));
-    }
-  });
-}
-
 /** Delete every kv key that starts with `prefix`, in ONE transaction (a
  *  per-pairing wipe must not interleave with a concurrent re-pair's writes).
  *  Used by per-pairing unpair to clear `lastread:${pairingId}/…` markers. */
@@ -279,23 +264,6 @@ export async function wipeKvByPrefix(prefix: string): Promise<void> {
       if (typeof k === 'string' && k.startsWith(prefix)) await promisifyRequest(s.delete(k));
     }
   });
-}
-
-/**
- * Wipe the `kv` store (session, read markers, push-enabled flag). Used on
- * unpair / terminal auth-error so that pairing the device as a different user
- * cannot inherit the prior user's session or read state.
- *
- * Does NOT clear the outbox — that must go through `outbox.clearAll()`, which
- * is serialized against `outbox.demoteSending()` (a transport-status-driven
- * write that a plain `withStore('outbox', ...).clear()` call here could race:
- * demoteSending() snapshots then rewrites rows across several transactions, so
- * an unserialized clear can land between two of its writes and have a stale
- * row resurrected back into the store afterward). Callers should wipe BOTH
- * via `wipeAndReset()` in the app's transport layer, not this function alone.
- */
-export async function wipeLocal(): Promise<void> {
-  await withStore('kv', 'readwrite', (s) => { s.clear(); });
 }
 
 export async function closeDbForTests(): Promise<void> {

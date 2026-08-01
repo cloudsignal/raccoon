@@ -6,10 +6,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { act } from 'react';
 import { createEnvelope } from '@raccoon/protocol';
 import { closeDbForTests } from '../lib/idb.js';
-import { saveSession } from '../lib/session.js';
+import { savePairings } from '../lib/session.js';
 import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider } from '../transport/context.js';
 import { App } from '../app.js';
+
+const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
 afterEach(async () => {
   await closeDbForTests();
@@ -17,7 +19,7 @@ afterEach(async () => {
 });
 
 async function mount(transport = new FakeTransport()) {
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator', 'echo'] });
+  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator', 'echo'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
       <App />
@@ -37,7 +39,7 @@ describe('chat shell', () => {
   it('opens a channel, syncs ?c=, and requests history', async () => {
     const transport = await mount();
     await userEvent.setup().click(screen.getByText('Coordinator'));
-    await waitFor(() => expect(window.location.search).toBe('?c=coordinator'));
+    await waitFor(() => expect(window.location.search).toBe(`?c=${encodeURIComponent(`${P1}/coordinator`)}`));
     await waitFor(() => expect(transport.sent.some((e) => e.kind === 'history.request')).toBe(true));
   });
 

@@ -2,7 +2,7 @@ import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { closeDbForTests, kvGet, kvSet, wipeKvByPrefix } from './idb.js';
 import { loadPairings } from './adopt.js';
-import { loadPairingsRaw, saveSession, hostIdentityKey } from './session.js';
+import { hostIdentityKey } from './session.js';
 import * as outbox from './outbox.js';
 import { saveApproval, listApprovals } from './approvals.js';
 import { createEnvelope, userAddress, agentAddress } from '@raccoon/protocol';
@@ -36,7 +36,7 @@ describe('adoption migration', () => {
   });
 
   it('adopts a legacy session as pairing #1, rewriting lastread, outbox scope, and approvals keys', async () => {
-    await saveSession(legacy);
+    await kvSet('session', legacy); // seed the legacy kv singleton directly
     await kvSet('lastread:coordinator', '2026-08-01T00:00:00.000Z');
     const env = msgEnv('coordinator');
     await outbox.enqueue(env, legacyScope);
@@ -67,7 +67,7 @@ describe('adoption migration', () => {
   });
 
   it('is idempotent: a second load returns the same pairing (same pairingId)', async () => {
-    await saveSession(legacy);
+    await kvSet('session', legacy); // seed the legacy kv singleton directly
     const first = await loadPairings();
     const second = await loadPairings();
     expect(second).toEqual(first);
@@ -75,7 +75,7 @@ describe('adoption migration', () => {
 
   it('legacy session without epoch: adopts with a minted epoch, leaves unclaimable rows alone (#P1-F1 precedent)', async () => {
     const { epoch: _e, ...noEpoch } = legacy;
-    await kvSet('session', noEpoch); // bypass saveSession's epoch-minting
+    await kvSet('session', noEpoch); // a legacy session stored before epochs existed
     const env = msgEnv('coordinator');
     await outbox.enqueue(env, 'SOME-OLD-TOKEN-DERIVED-SCOPE');
     const list = await loadPairings();

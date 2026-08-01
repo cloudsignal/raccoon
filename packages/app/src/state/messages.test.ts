@@ -361,4 +361,33 @@ describe('multi-pairing key domain', () => {
     expect(state.unread[A]).toBe(0);
     expect(state.unread[B]).toBe(1);
   });
+
+  it('drop-pairing removes exactly one pairing\'s slice of every record, leaving the other pairing live', () => {
+    let state = emptyChatState;
+    state = chatReducer(state, {
+      type: 'history', convKey: A, agentId: 'coordinator',
+      messages: [{ id: 'a1', role: 'agent', text: 'from A', ts: '2026-08-01T00:00:01.000Z' }],
+      nextBefore: 'a0', active: false,
+    });
+    const envB = createEnvelope('msg', {
+      from: agentAddress('coordinator'), to: userAddress('u2'), channel: 'coordinator',
+      payload: { text: 'from B' },
+    });
+    state = chatReducer(state, { type: 'message', env: envB, convKey: B, active: false });
+    state = chatReducer(state, { type: 'typing', convKey: A, on: true });
+    state = chatReducer(state, { type: 'typing', convKey: B, on: true });
+
+    state = chatReducer(state, { type: 'drop-pairing', pairingId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' });
+
+    // Every A-keyed record entry is gone…
+    expect(state.messages[A]).toBeUndefined();
+    expect(state.typing[A]).toBeUndefined();
+    expect(state.unread[A]).toBeUndefined();
+    expect(state.nextBefore[A]).toBeUndefined();
+    expect(state.historyLoaded[A]).toBeUndefined();
+    // …and B's live state is untouched (a global reset would have wiped it).
+    expect(state.messages[B]!.map((m) => m.text)).toEqual(['from B']);
+    expect(state.typing[B]).toBe(true);
+    expect(state.unread[B]).toBe(1);
+  });
 });

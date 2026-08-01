@@ -7,14 +7,20 @@ import {
   type AnyEnvelope, type Attachment, type TransportStatus,
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
-import { kvGet, kvSet, probeStorageWritable, wipeKvExceptSession } from '../lib/idb.js';
+import { ulid } from 'ulid';
+import { kvGet, kvSet, probeStorageWritable, wipeKvByPrefix } from '../lib/idb.js';
 import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
-import { clearSessionIfMatches, loadSession, saveSession, type Session } from '../lib/session.js';
+import * as adopt from '../lib/adopt.js';
+import {
+  hostIdentityKey, removePairingIfMatches, updatePairingMeta, upsertPairing,
+  type PairedSession, type Session,
+} from '../lib/session.js';
+import { accentColor, convKeyOf, resolveConvKey, type ConvKey } from '../lib/conv-key.js';
 import { leaseUploads, type UploadProvider } from '../lib/uploads.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
-import type { AppTransport, MakeTransport } from './types.js';
+import type { AppTransport, MakeTransport, TransportRegistry } from './types.js';
 
 export const ACK_TIMEOUT_MS = 10_000;
 // #R7-1b: how long an approval may sit in 'processing' (server acked receipt
@@ -39,35 +45,57 @@ const HISTORY_LIMIT = 50;
 // not wait this out.
 const PAIR_RECOVERY_GRACE_MS = 8_000;
 
+/** One paired instance as the UI sees it. `pairingId` is the stable local
+ *  scope key for ALL of this pairing's state (ConvKeys, outbox rows, approval
+ *  keys, `lastread:` markers) — see lib/conv-key.ts and lib/session.ts. */
+export interface PairingView {
+  pairingId: string;
+  instance: string;
+  userId: string;
+  channels: string[];
+  displayName: string;          // pairing.displayName ?? pairing.instance
+  color: string;                // pairing.color ?? accentColor(pairingId)
+  status: TransportStatus;
+  transportKind: string;        // 'ws' | 'host' | a registered kind
+  url?: string;
+}
+
 export interface ChatApi {
   phase: 'loading' | 'setup' | 'ready' | 'storage-error';
-  status: TransportStatus;
-  session: Session | null;
+  /** One entry per paired instance (replaces the old single `status` +
+   *  `session`). A host override session appears as the single synthetic
+   *  pairing. */
+  pairings: PairingView[];
   state: ChatState;
-  activeChannel: string | null;
+  activeChannel: ConvKey | null;
   authError: string | null;
+  /** Appends a pairing (or refreshes a re-scanned one in place); never wipes
+   *  other pairings. (Task 6 finishes the full multi-pairing semantics.) */
   pairWithPayload(json: string): Promise<void>;
   /** #F6: re-probe durable storage from the 'storage-error' phase. On success,
    *  moves to 'setup' (pairing enabled); otherwise stays in 'storage-error'. */
   retryStorage(): Promise<void>;
-  openChannel(channel: string | null): void;
+  openChannel(key: ConvKey | null): void;
   /** Empty text is legal WITH attachments (image-only sends); blank
    *  no-attachment sends are rejected by the composer before this. */
-  sendMessage(channel: string, text: string, attachments?: Attachment[]): void;
-  respondApproval(channel: string, refId: string, choice: string, editedText?: string): void;
-  retryMessage(channel: string, id: string): void;
-  loadOlder(channel: string): void;
+  sendMessage(key: ConvKey, text: string, attachments?: Attachment[]): void;
+  respondApproval(key: ConvKey, refId: string, choice: string, editedText?: string): void;
+  retryMessage(key: ConvKey, id: string): void;
+  loadOlder(key: ConvKey): void;
   enablePush(): Promise<boolean>;
-  /** True when some push path is available: a VAPID key on the session or a
+  /** True when some push path is available: a VAPID key on some pairing or a
    *  host-supplied registrar override. Drives PushBanner eligibility. */
   canEnablePush: boolean;
   /** Auth seam for media uploads — uploadFile/deleteUpload/leaseUploads
    *  (lib/uploads.ts) take it as an argument. The default presents the LIVE
-   *  session token on every call (rejecting with a clear error when there is
-   *  none); an embedding host injects its own via the `uploadProvider` prop
-   *  (it may hold a rotating external token instead of a session token). */
+   *  token of the pairing that owns the ACTIVE conversation (falling back to
+   *  the first pairing), read at call time; an embedding host injects its own
+   *  via the `uploadProvider` prop. */
   uploadProvider: UploadProvider;
-  unpair(): Promise<void>;
+  /** Unpairs ONE pairing; the others keep running. (Task 6 hardens.) */
+  unpair(pairingId: string): Promise<void>;
+  /** Local display-name override; empty string clears it back to the default. */
+  renamePairing(pairingId: string, displayName: string): Promise<void>;
 }
 
 /** Host-supplied push registration flow. enable() performs the vendor
@@ -84,28 +112,11 @@ export interface PushRegistrar {
 const ChatContext = createContext<ChatApi | null>(null);
 
 /**
- * A COMPLETE session identity (#R6-3b/#R6-8b/#R7-3): instance + user + a
- * NON-SECRET session epoch, JSON-encoded (structured — no NUL bytes that
- * would make git treat this source as binary, and unambiguous vs a delimiter
- * join). url is excluded (host overrides allow a placeholder url; `instance`
- * is the meaningful discriminator). `epoch` (session.ts) is the session
- * generation, NOT the secret sessionToken — which for host-managed sessions
- * may be a STABLE token that can't tell a re-pair apart, and which must not be
- * broadcast in wipe messages. A fresh pairing mints a new epoch, so a stale
- * wipe no longer matches a re-paired session and a stale tab's outbox rows are
- * not claimable by the new one. Falls back to the token only for a
- * pre-migration session with no epoch.
- */
-function identityKey(s: { instance: string; userId: string; epoch: string }): string {
-  return JSON.stringify({ i: s.instance, u: s.userId, e: s.epoch });
-}
-
-/**
  * Ensure a session carries an epoch (#R8-5). The standard pairing/boot paths
- * always set one (minted at pairing, persisted + lazily migrated on load).
- * A HOST override may omit it — the documented host API permits a stable
- * placeholder sessionToken, so we must NEVER derive the key from the token
- * (that would make re-pairs share an identity AND broadcast a secret). Mint a
+ * always set one (minted at pairing, persisted on the stored pairing). A HOST
+ * override may omit it — the documented host API permits a stable placeholder
+ * sessionToken, so we must NEVER derive the identity from the token (that
+ * would make re-pairs share an identity AND broadcast a secret). Mint a
  * per-mount random epoch instead. A host that wants cross-tab wipe
  * coordination for its sessions supplies its own persisted `epoch`.
  */
@@ -116,10 +127,10 @@ function withEpoch(s: Session): ActiveSession {
 
 // #P1-F3 (adv-hardened): how long unpair() waits on a best-effort cleanup step
 // (host push disable / server unsubscribe / transport close) before moving on.
-// None of those are timeout-bounded on their own, and wipeAndReset() — which
-// retries the durable session clear — sits AFTER them; without this bound a
-// hung disable() could keep wipeAndReset from ever running, leaving a
-// reconnectable session if the hoisted clear itself failed.
+// None of those are timeout-bounded on their own, and the durable per-pairing
+// wipe — which retries the pairing removal — sits AFTER them; without this
+// bound a hung disable() could keep that wipe from ever running, leaving a
+// reconnectable pairing if the hoisted removal itself failed.
 const UNPAIR_CLEANUP_TIMEOUT_MS = 3_000;
 
 /** Run `fn` and resolve when it settles OR after `ms`, whichever is first —
@@ -138,11 +149,15 @@ function settleWithinCall(fn: () => unknown, ms: number): Promise<void> {
 
 const defaultMakeTransport: MakeTransport = (opts) => new WsClientTransport(opts) as AppTransport;
 
-/** Default upload auth for the standalone app: present the LIVE session's
- *  token, read from the ref at CALL time (not captured at build time), so a
- *  re-pair mid-composer never uploads with a stale token and a token that
- *  arrives after mount is picked up without rebuilding the provider.
- *  Exported so the factory is unit-testable without mounting the provider. */
+/** Default upload auth for the standalone app: present the LIVE token of the
+ *  relevant pairing, read from the ref at CALL time (not captured at build
+ *  time), so a re-pair mid-composer never uploads with a stale token and a
+ *  token that arrives after mount is picked up without rebuilding the
+ *  provider. The provider passes a ref-like whose `current` resolves the
+ *  pairing that owns the ACTIVE conversation — uploads authenticate against
+ *  the pairing being composed in — falling back to the first pairing when no
+ *  conversation is open. Exported so the factory is unit-testable without
+ *  mounting the provider. */
 export function buildDefaultUploadProvider(
   sessionRef: { readonly current: { sessionToken?: string } | null },
 ): UploadProvider {
@@ -160,56 +175,68 @@ export function buildDefaultUploadProvider(
 /**
  * Props for TransportProvider.
  *
- * For the standalone OSS app: omit both props — the default WS transport is used and
- * the session is loaded from IDB.
+ * For the standalone OSS app: omit both override props — pairings load from
+ * IDB and each is dialed by the factory registered for its transport kind
+ * (the built-in WS factory covers 'ws').
  *
- * For a host embedding (e.g. a host app): supply `transportOverride` with an
- * already-constructed, already-authenticated transport AND `sessionOverride` with the
- * authenticated session.  The provider wires the transport immediately (phase →
- * 'ready'), skips IDB, and sets the session synchronously so that `sendMessage`,
- * `respondApproval`, and `requestHistory` all see a valid `userId` from the very first
- * call.  The channel list (`session.channels`) is also driven by this prop.
+ * For a host embedding (e.g. a host application): supply `transportOverride`
+ * with an already-constructed, already-authenticated transport AND
+ * `sessionOverride` with the authenticated session.  The provider wires the
+ * transport immediately (phase → 'ready'), skips IDB pairing storage, and
+ * installs the session synchronously as the app's SINGLE synthetic pairing
+ * (`ChatApi.pairings[0]`) so that `sendMessage`, `respondApproval`, and
+ * history requests all see a valid `userId` from the very first call.  The
+ * conversation list (`pairings[0].channels`) is also driven by this prop.
  *
- * `sessionOverride` SHOULD accompany every `transportOverride`.  Omitting it leaves
- * `session` null: the channel list will be empty and outbound messages will silently
- * no-op because `userId` is unavailable.
+ * `sessionOverride` SHOULD accompany every `transportOverride`.  Omitting it
+ * leaves `pairings` empty: the conversation list will be empty and outbound
+ * messages will silently no-op because no pairing identity is available.
  *
- * `sessionToken` and `url` in the override session may be placeholder strings — they
- * are not used when the transport bypasses the built-in auth flow.  The host owns
- * authentication; the provider never reads or writes IDB when `transportOverride` is
- * set.
+ * `sessionToken` and `url` in the override session may be placeholder strings —
+ * they are not used when the transport bypasses the built-in auth flow.  The
+ * host owns authentication; the provider never writes IDB pairings when
+ * `transportOverride` is set.
  *
- * Alternatively, supply `makeTransport` to customise transport construction while
- * keeping the IDB session / pairing flow intact.  The factory may ignore the opts it
- * receives and return a fully custom transport.
+ * Alternatively, supply `makeTransport` to customise WS transport construction
+ * while keeping the IDB pairing flow intact (it fills the registry's 'ws'
+ * slot), and/or `transports` to register factories for additional transport
+ * kinds selected by the pairing payload's `transport` field.
  */
 export interface TransportProviderProps {
-  /** Drop-in replacement for the WS transport factory.  The factory may ignore opts. */
+  /** Drop-in replacement for the built-in WS transport factory — the
+   *  registry's 'ws' slot.  The factory may ignore opts. */
   makeTransport?: MakeTransport;
   /**
+   * Per-kind transport factories, merged over the built-in registry
+   * ({ ws: makeTransport ?? default }).  A stored pairing whose kind has no
+   * factory stays LISTED but offline (no transport, status 'closed') — its
+   * history remains readable and its sends queue in the outbox.
+   */
+  transports?: TransportRegistry;
+  /**
    * Pre-constructed, already-authenticated transport.  When supplied the provider
-   * skips IDB session loading and goes directly to phase='ready'.
+   * skips IDB pairing loading and goes directly to phase='ready'.
    * Cannot be combined with `makeTransport`.
    */
   transportOverride?: AppTransport;
   /**
    * Companion to `transportOverride`.  The authenticated session the host supplies
    * (userId, channels, instance are the meaningful fields; url/sessionToken may be
-   * placeholders).  When present the provider sets this as the active session
-   * synchronously — before the transport is wired and connected — so that all
-   * outbound calls have a valid userId from the very first tick.
+   * placeholders).  When present the provider installs it synchronously as the
+   * single synthetic pairing — before the transport is wired and connected — so
+   * that all outbound calls have a valid userId from the very first tick.
    * Not persisted to IDB (the host owns identity).
    */
   sessionOverride?: Session;
   /**
    * Host-supplied push registration flow (e.g. a vendor SDK). When present it
    * takes precedence over the built-in VAPID/envelope flow and makes push
-   * available even without session.vapidPublicKey.
+   * available even without a vapidPublicKey on any pairing.
    */
   pushRegistrarOverride?: PushRegistrar;
   /**
    * Host-supplied auth for media uploads. Mirrors `makeTransport`: optional,
-   * with the default built in-provider from the live session token. A host
+   * with the default built in-provider from the live pairing token. A host
    * whose transport authenticates out-of-band (no real sessionToken on the
    * override session) MUST supply one for uploads to work — the default
    * rejects when no token is present.
@@ -218,23 +245,49 @@ export interface TransportProviderProps {
   children: ReactNode;
 }
 
+/** Per-pairing runtime — one per stored pairing (plus the synthetic host
+ *  pairing in override mode). Keyed in runtimesRef by pairingId, which is
+ *  ALSO the outbox/approvals scope: `pairingId === scope`, always. */
+interface PairingRuntime {
+  pairing: PairedSession;               // latest stored snapshot
+  transport: AppTransport | null;       // null = no factory for this kind (offline pairing)
+  /** Synchronous status mirror (was the global statusNowRef): updated as the
+   *  FIRST line of the onStatus handler, before any setState, so async
+   *  continuations (e.g. outbox.enqueue().then) always see the actual current
+   *  transport status without waiting for a React render commit. */
+  statusNow: TransportStatus;
+  unsubs: Array<() => void>;
+  /** R4-3, per pairing: bumped synchronously on every identity transition of
+   *  THIS pairing (unpair, auth-error, cross-tab wipe, refresh re-pair).
+   *  Replaces the global sessionGenRef for send/enqueue fencing — per
+   *  pairing, so wiping pairing B can never drop pairing A's in-flight
+   *  enqueue. sendEnvelope captures it at call time and re-checks it once its
+   *  enqueue() write commits; deferred wipe state-updates compare against the
+   *  generation captured at their start, so a since-superseded wipe skips
+   *  applying its now-stale transition (the TOCTOU the deferral exists to
+   *  avoid). */
+  gen: number;
+  /** R4-3: the userId sendMessage/respondApproval are currently allowed to
+   *  send as through this pairing. Nulled SYNCHRONOUSLY at wipe-start (before
+   *  any await), set synchronously at establish — this is what actually
+   *  closes "identity usable until asynchronous cleanup completes":
+   *  sendMessage/respondApproval check THIS, so a call made from the instant
+   *  the wipe decision is made onward is rejected outright, before it ever
+   *  reaches outbox.enqueue(). */
+  validUserId: string | null;
+}
+
 export function TransportProvider(props: TransportProviderProps) {
-  const makeTransport = props.makeTransport ?? defaultMakeTransport;
   const [phase, setPhase] = useState<'loading' | 'setup' | 'ready' | 'storage-error'>('loading');
-  const [status, setStatus] = useState<TransportStatus>('closed');
-  const [session, setSession] = useState<ActiveSession | null>(null);
+  const [views, setViews] = useState<PairingView[]>([]);
   const [authError, setAuthError] = useState<string | null>(null);
   const [state, dispatch] = useReducer(chatReducer, emptyChatState);
+  const [activeChannel, setActiveChannel] = useState<ConvKey | null>(null);
 
-  const transportRef = useRef<AppTransport | null>(null);
-  const sessionRef = useRef<ActiveSession | null>(null);
-  const activeRef = useRef<string | null>(null);
+  /** All live pairing runtimes, keyed by pairingId (=== outbox scope). */
+  const runtimesRef = useRef(new Map<string, PairingRuntime>());
+  const activeRef = useRef<ConvKey | null>(null);
   const stateRef = useRef<ChatState>(state);
-  // statusNowRef is updated synchronously inside the onStatus handler (before any
-  // setState), so it always reflects the actual current transport status even
-  // before React has committed the corresponding state update.  All gating
-  // decisions in sendEnvelope / openChannel read from this ref.
-  const statusNowRef = useRef<TransportStatus>('closed');
   // drainLockRef prevents concurrent drain() executions from double-sending the
   // same outbox entry.  When a second drain() call arrives while a drain is in
   // flight, we set drainPendingRef so the in-flight drain re-runs once more
@@ -244,123 +297,150 @@ export function TransportProvider(props: TransportProviderProps) {
   const drainPendingRef = useRef(false);
   // R4-4: a stable, unique id for THIS tab/window instance, lazily generated
   // once. Stamped onto every row this tab claims via markSending() so
-  // demoteSending() can tell "a row I myself abandoned" (always safe to
+  // release/recovery can tell "a row I myself abandoned" (always safe to
   // requeue immediately) apart from "a row a DIFFERENT, possibly still-alive
   // tab is actively sending" (only safe to requeue once its lease expires) —
-  // see outbox.ts's demoteSending() for the full reasoning.
+  // see outbox.ts's releaseOwnedSending()/recoverExpiredSending().
   const tabIdRef = useRef<string | undefined>(undefined);
   if (!tabIdRef.current) tabIdRef.current = crypto.randomUUID();
   // R5-3: cross-tab identity coordination. IndexedDB rows are shared
-  // per-origin but every tab's in-memory identity (validUserIdRef,
-  // sessionRef) is its own — so a wipe/unpair in one tab left other
-  // still-open tabs running the wiped identity, free to keep enqueueing
-  // rows as it. Wipe paths post 'identity-wiped' here; every other tab
-  // tears itself down to setup on receipt (see the boot effect's listener).
-  // Feature-detected: absent BroadcastChannel (very old engines), the
-  // claim-time identity scoping in attempt()/markSending() still prevents
-  // any cross-identity transmission — this coordination just stops the
-  // stale tab from acting at all.
+  // per-origin but every tab's in-memory pairing identities (validUserId,
+  // runtimes) are its own — so a wipe/unpair in one tab left other
+  // still-open tabs running the wiped pairing identity, free to keep
+  // enqueueing rows as it. Wipe paths post 'identity-wiped' here; every other
+  // tab tears down ONLY the matching pairing runtime on receipt (see the boot
+  // effect's listener). Feature-detected: absent BroadcastChannel (very old
+  // engines), the claim-time scope check in attempt()/markSending() still
+  // prevents any cross-pairing transmission — this coordination just stops
+  // the stale tab from acting at all.
   const bcRef = useRef<BroadcastChannel | null>(null);
-  // R4-3: bumped SYNCHRONOUSLY (before any await) on every identity
-  // transition — wipe/unpair AND successful (re-)pairing — see unpair(),
-  // the auth-error handler, loadSession's success path, and
-  // pairWithPayload below. sendEnvelope captures this at call time and
-  // re-checks it once its enqueue() write commits: if it changed in
-  // between, the identity that queued the message is being (or has been)
-  // torn down, so the row is dropped instead of surviving into whatever
-  // session/transport is active by the time a drain() would otherwise pick
-  // it up. wipeLocal/clearAll alone were not enough — they race the SAME
-  // wipe's own async completion, not a synchronous signal available to code
-  // that runs mid-wipe. Deferred React-state updates that finalize a wipe
-  // (setSession(null) etc.) also compare against a generation captured at
-  // their start, so a since-superseded wipe (a newer wipe, or a newer
-  // successful pairing) skips applying its now-stale transition — the
-  // TOCTOU the original (pre-R4-3) deferral existed to avoid.
-  const sessionGenRef = useRef(0);
-  // #R6-4b: identity keys wiped by ANOTHER tab, recorded even while THIS tab
-  // is still loading its session from IDB (before it has any current
-  // identity to match against). The boot continuation checks the loaded
-  // identity against this set before installing it — so a stale IDB read
-  // that resolves AFTER a concurrent wipe cannot connect a just-wiped
-  // session. In-memory per tab; it only needs to guard this boot.
+  // #R6-4b: pairing identities (`${pairingId}::${epoch}`) wiped by ANOTHER tab,
+  // recorded even while THIS tab is still loading its pairings from IDB
+  // (before it has any runtimes to match against). The boot continuation
+  // checks every loaded pairing against this set before installing it — so a
+  // stale IDB read that resolves AFTER a concurrent wipe cannot connect a
+  // just-wiped pairing. In-memory per tab; it only needs to guard this boot.
   const wipeTombstonesRef = useRef<Set<string>>(new Set());
-  // R4-3: the userId sendMessage/respondApproval are currently allowed to
-  // send as. A DEDICATED ref, deliberately NOT sessionRef (which is
-  // resynced from `session` STATE on every render — synchronously nulling
-  // sessionRef.current mid-wipe would just get overwritten back to the
-  // stale value by that resync on the next incidental re-render, since
-  // `session` state itself hasn't caught up yet). Nulled synchronously at
-  // wipe-start, set synchronously at session-establish — this is what
-  // actually closes "identity usable until asynchronous cleanup completes":
-  // sendMessage/respondApproval check THIS, not sessionRef.current, so a
-  // call made from the instant the wipe decision is made onward is rejected
-  // outright, before it ever reaches outbox.enqueue().
-  const validUserIdRef = useRef<string | null>(null);
-  // #R6-3: the FULL identity scope (`<instanceUrl>::<user address>`) this
-  // tab is currently allowed to send as — stamped onto every outbox row at
-  // enqueue and required verbatim by the claim CAS. userId alone is not an
-  // identity: user ids are instance-local, so a stale row queued against
-  // instance A's u1 must never transmit through instance B's u1 session.
-  // Managed in lockstep with validUserIdRef at every identity transition.
-  const identityScopeRef = useRef<string | null>(null);
+  // Bumped on boot and on full teardown (storage-error, unmount) — the boot
+  // continuation's cancel checks compare against it, alongside the per-pairing
+  // runtime-existence checks that replace the old global sessionGenRef here.
+  const bootGenRef = useRef(0);
   const ackTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  // channel → auto-clear deadline for the typing indicator (TYPING_AUTO_CLEAR_MS).
-  const typingTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const [activeChannel, setActiveChannel] = useState<string | null>(null);
-  // Finding 1: track unsubscribe functions so we can clean them up before re-wiring
-  const unsubsRef = useRef<Array<() => void>>([]);
+  // ConvKey → auto-clear deadline for the typing indicator (TYPING_AUTO_CLEAR_MS).
+  const typingTimers = useRef(new Map<ConvKey, ReturnType<typeof setTimeout>>());
 
-  sessionRef.current = session;
   stateRef.current = state;
   activeRef.current = activeChannel;
 
+  /** Rebuild the PairingView list from the live runtimes. Called after every
+   *  runtime mutation (install, status change, meta update, teardown). */
+  const refreshViews = useCallback(() => {
+    setViews([...runtimesRef.current.values()].map((r) => ({
+      pairingId: r.pairing.pairingId,
+      instance: r.pairing.instance,
+      userId: r.pairing.userId,
+      channels: r.pairing.channels,
+      displayName: r.pairing.displayName ?? r.pairing.instance,
+      color: r.pairing.color ?? accentColor(r.pairing.pairingId),
+      status: r.statusNow,
+      transportKind: r.pairing.transportKind,
+      ...(r.pairing.url ? { url: r.pairing.url } : {}),
+    })));
+  }, []);
+
+  // Effective registry: built-in ws (overridable via the legacy makeTransport
+  // prop) + host-registered kinds. A stored pairing whose kind has no factory
+  // stays LISTED but offline (transport null, status 'closed') — its history
+  // remains readable and sends queue in its outbox.
+  const registry = useMemo<TransportRegistry>(() => ({
+    ws: props.makeTransport ?? defaultMakeTransport,
+    ...props.transports,
+  }), [props.makeTransport, props.transports]);
+
+  // Ref-like session source for the default upload provider: resolves the
+  // pairing that owns the ACTIVE conversation at CALL time (uploads
+  // authenticate against the pairing being composed in), falling back to the
+  // first runtime when no conversation is open. Stable for the component's
+  // lifetime — the getter reads live refs.
+  const activePairingSessionRef = useMemo(() => ({
+    get current(): { sessionToken?: string } | null {
+      const key = activeRef.current;
+      const r = key ? resolveConvKey(key, runtimesRef.current.keys()) : null;
+      const rt = r
+        ? runtimesRef.current.get(r.pairingId)
+        : runtimesRef.current.values().next().value as PairingRuntime | undefined;
+      return rt ? rt.pairing : null;
+    },
+  }), []);
+
   // makeTransport pattern: the injected prop wins, else the built-in default.
-  // The default closes over sessionRef (stable for the component's lifetime)
-  // and reads the token per call, so no session dependency is needed here.
   const uploadProvider = useMemo<UploadProvider>(
-    () => props.uploadProvider ?? buildDefaultUploadProvider(sessionRef),
-    [props.uploadProvider],
+    () => props.uploadProvider ?? buildDefaultUploadProvider(activePairingSessionRef),
+    [props.uploadProvider, activePairingSessionRef],
   );
   // Read at CALL time by the outbox lease paths (the enqueue-commit .then and
-  // the drain-time renewal in attempt()) — mirrors sessionRef/statusNowRef so
+  // the drain-time renewal in attempt()) — mirrors the statusNow discipline so
   // an async continuation never captures a stale provider across a re-render.
   const uploadProviderRef = useRef<UploadProvider>(uploadProvider);
   uploadProviderRef.current = uploadProvider;
 
-  const isActive = useCallback((channel: string) => activeRef.current === channel && document.visibilityState === 'visible', []);
+  const isActive = useCallback((key: ConvKey) => activeRef.current === key && document.visibilityState === 'visible', []);
 
-  const clearTypingTimer = useCallback((channel: string) => {
-    const timer = typingTimers.current.get(channel);
-    if (timer) { clearTimeout(timer); typingTimers.current.delete(channel); }
+  const clearTypingTimer = useCallback((key: ConvKey) => {
+    const timer = typingTimers.current.get(key);
+    if (timer) { clearTimeout(timer); typingTimers.current.delete(key); }
   }, []);
 
-  const handleEnvelope = useCallback((env: AnyEnvelope) => {
+  /** Cancel every typing timer belonging to one pairing (its ConvKeys are
+   *  prefixed by the pairingId). Used by the per-pairing wipes so pairing B's
+   *  live indicator deadlines survive pairing A's teardown. */
+  const clearPairingTypingTimers = useCallback((pairingId: string) => {
+    const prefix = `${pairingId}/`;
+    for (const [key, timer] of typingTimers.current) {
+      if (key.startsWith(prefix)) { clearTimeout(timer); typingTimers.current.delete(key); }
+    }
+  }, []);
+
+  /**
+   * Boundary stamping: envelope handling is a FACTORY closed over the source
+   * pairingId — the wire never carries a pairingId, so the transport a message
+   * arrived on is what names its pairing. Every dispatch keys state by the
+   * ConvKey built here; envelope channels stay bare.
+   */
+  const makeEnvelopeHandler = useCallback((pairingId: string) => (env: AnyEnvelope) => {
     if (env.kind === 'msg') {
-      clearTypingTimer(env.channel); // the reply is the definitive 'stop'
-      dispatch({ type: 'message', env, convKey: env.channel, active: isActive(env.channel) });
-      if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
+      const ck = convKeyOf(pairingId, env.channel);
+      clearTypingTimer(ck); // the reply is the definitive 'stop'
+      dispatch({ type: 'message', env, convKey: ck, active: isActive(ck) });
+      if (isActive(ck)) void kvSet(`lastread:${ck}`, env.ts);
     } else if (env.kind === 'typing') {
+      const ck = convKeyOf(pairingId, env.channel);
       const on = env.payload.state === 'start';
-      clearTypingTimer(env.channel);
+      clearTypingTimer(ck);
       if (on) {
         // Arm the self-heal deadline (see TYPING_AUTO_CLEAR_MS).
-        typingTimers.current.set(env.channel, setTimeout(() => {
-          typingTimers.current.delete(env.channel);
-          dispatch({ type: 'typing', convKey: env.channel, on: false });
+        typingTimers.current.set(ck, setTimeout(() => {
+          typingTimers.current.delete(ck);
+          dispatch({ type: 'typing', convKey: ck, on: false });
         }, TYPING_AUTO_CLEAR_MS));
       }
-      dispatch({ type: 'typing', convKey: env.channel, on });
+      dispatch({ type: 'typing', convKey: ck, on });
     }
     else if (env.kind === 'approval.request') {
-      clearTypingTimer(env.channel);
-      dispatch({ type: 'approval', env, convKey: env.channel, active: isActive(env.channel) });
-      if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
-      // #R8-1: persist the request under this identity scope so a reload can
-      // re-render the interactive card (server history keeps it only as text).
-      const scope = identityScopeRef.current;
-      if (scope) void approvals.saveApproval(scope, env).catch(() => { /* durability best-effort */ });
+      const ck = convKeyOf(pairingId, env.channel);
+      clearTypingTimer(ck);
+      dispatch({ type: 'approval', env, convKey: ck, active: isActive(ck) });
+      if (isActive(ck)) void kvSet(`lastread:${ck}`, env.ts);
+      // #R8-1: persist the request under this pairing's scope (the pairingId)
+      // so a reload can re-render the interactive card (server history keeps
+      // it only as text). Guarded by the runtime still existing — a request
+      // racing this pairing's teardown is dropped, not persisted post-wipe.
+      if (runtimesRef.current.has(pairingId)) {
+        void approvals.saveApproval(pairingId, env).catch(() => { /* durability best-effort */ });
+      }
     }
     else if (env.kind === 'ack') {
+      const ck = convKeyOf(pairingId, env.channel);
       // The server responded for this envelope — stop the local no-ack
       // timeout regardless of which status it carries.
       const refId = env.payload.refId;
@@ -394,7 +474,7 @@ export function TransportProvider(props: TransportProviderProps) {
               // then regress a delivered row and show a false retry. Via 'ack'
               // status 'failed', advanceDelivery keeps a real 'delivered'
               // (higher rank) while still advancing pending/sent → failed.
-              if (applied) dispatch({ type: 'ack', convKey: env.channel, refId, status: 'failed' });
+              if (applied) dispatch({ type: 'ack', convKey: ck, refId, status: 'failed' });
             });
           }, PROCESSING_TIMEOUT_MS);
           ackTimers.current.set(refId, processingTimer);
@@ -417,35 +497,42 @@ export function TransportProvider(props: TransportProviderProps) {
         // response record → double-response). For a plain msg it just settles.
         void outbox.settleResponseAndPruneApproval(refId);
       }
-      dispatch({ type: 'ack', convKey: env.channel, refId, status: env.payload.status });
+      dispatch({ type: 'ack', convKey: ck, refId, status: env.payload.status });
     } else if (env.kind === 'history.page') {
       const channel = env.payload.channel;
-      // #P1-E3: capture the identity BEFORE any await. This handler performs
-      // several awaits (kvGet, listApprovals, listForChannel); a wipe/re-pair
-      // landing across any of them flips identityScopeRef SYNCHRONOUSLY. Every
-      // continuation re-checks and bails if the identity changed, so identity
-      // A's history/approvals/responses can never be dispatched into identity
-      // B's (or a reset) UI.
-      const fenceScope = identityScopeRef.current;
-      // #R10: bail immediately if there is NO identity. Otherwise a history.page
-      // arriving after a wipe (fenceScope===null) passes the `!==` fence
-      // (null!==null is false) and dispatches history into a reset state. There
-      // is no legitimate case for rendering history with no identity.
-      if (!fenceScope) return;
-      void kvGet<string>(`lastread:${channel}`).then((lastRead) => {
-        if (identityScopeRef.current !== fenceScope) return; // identity changed across the await
+      const ck = convKeyOf(pairingId, channel);
+      // #P1-E3: capture the pairing-identity fence BEFORE any await. This
+      // handler performs several awaits (kvGet, listApprovals, listForChannel);
+      // a wipe/re-pair of THIS pairing landing across any of them bumps its
+      // runtime gen SYNCHRONOUSLY (or deletes the runtime). Every continuation
+      // re-checks and bails if the pairing identity changed, so pairing A's
+      // history/approvals/responses can never be dispatched into a
+      // re-paired/reset UI.
+      const rt = runtimesRef.current.get(pairingId);
+      // #R10: bail immediately if there is NO live pairing identity. A
+      // history.page arriving after a wipe must not dispatch history into a
+      // reset state — there is no legitimate case for rendering history with
+      // no identity.
+      if (!rt || rt.validUserId === null) return;
+      const fenceGen = rt.gen;
+      const fenced = () => {
+        const now = runtimesRef.current.get(pairingId);
+        return now !== undefined && now === rt && now.gen === fenceGen;
+      };
+      void kvGet<string>(`lastread:${ck}`).then((lastRead) => {
+        if (!fenced()) return; // pairing identity changed across the await
         dispatch({
           type: 'history',
-          convKey: channel,
+          convKey: ck,
           agentId: channel,
           messages: env.payload.messages,
           nextBefore: env.payload.nextBefore,
           lastRead,
-          active: isActive(channel),
+          active: isActive(ck),
         });
         // #R8-1 / #R7-2 / #P1-E1: a reload loses the interactive approval CARD
         // (history reconstructs the request only as text) and this device's
-        // local response state. Rebuild both from durable, IDENTITY-SCOPED
+        // local response state. Rebuild both from durable, PAIRING-SCOPED
         // stores:
         //  1. Re-render the approval cards from the approvals store (scoped by
         //     key), REPLACING the history text rows — so there is a card for
@@ -456,7 +543,7 @@ export function TransportProvider(props: TransportProviderProps) {
         //     A still-'pending'/'sending' response omitted here would leave the
         //     card looking UNANSWERED, letting the user submit a second,
         //     competing response for the same refId.
-        // (fenceScope is non-null — the handler bailed at entry otherwise.)
+        // (Both stores keep BARE channel fields; the scope is the pairingId.)
         // #P1-E1 (adv-hardened): read BOTH stores first, then dispatch the card
         // and its response state in the SAME tick with no await between them.
         // Dispatching reconcile-approvals and then awaiting the outbox read
@@ -466,10 +553,10 @@ export function TransportProvider(props: TransportProviderProps) {
         // React batches two synchronous dispatches, so the card is never
         // painted answerable while a non-settled response exists.
         void Promise.all([
-          approvals.listApprovals(fenceScope, channel),
-          outbox.listForChannel(channel, fenceScope),
+          approvals.listApprovals(pairingId, channel),
+          outbox.listForChannel(channel, pairingId),
         ]).then(([stored, rows]) => {
-          if (identityScopeRef.current !== fenceScope) return; // fence after the awaits
+          if (!fenced()) return; // fence after the awaits
           const responses = rows
             .filter((r) => r.env.kind === 'approval.response')
             .map((r) => {
@@ -487,33 +574,29 @@ export function TransportProvider(props: TransportProviderProps) {
             });
           // Same-tick, no await between: the card exists AND is marked answered
           // in one React commit.
-          if (stored.length > 0) dispatch({ type: 'reconcile-approvals', convKey: channel, approvals: stored.map((a) => a.env) });
-          if (responses.length > 0) dispatch({ type: 'reconcile-responses', convKey: channel, responses });
+          if (stored.length > 0) dispatch({ type: 'reconcile-approvals', convKey: ck, approvals: stored.map((a) => a.env) });
+          if (responses.length > 0) dispatch({ type: 'reconcile-responses', convKey: ck, responses });
         });
       });
     }
   }, [isActive, clearTypingTimer]);
 
   const attempt = useCallback(async (entry: outbox.OutboxEntry) => {
-    const transport = transportRef.current;
-    if (!transport) return;
-    // R5-3/R6-3: the identity scope this tab is CURRENTLY allowed to send
-    // as. Rows are shared per-origin across tabs, so a row written by a
-    // stale tab (a since-wiped identity, or the same userId against a
-    // DIFFERENT instance) can appear in this tab's listPending() snapshot.
-    // The claim below requires this exact scope inside the same atomic
-    // transaction — such a row is never claimed, and therefore never
-    // transmitted, by this tab.
-    const scope = identityScopeRef.current;
-    if (!scope) return;
+    // Per-pairing routing: the row's scope IS its pairingId. A row for a
+    // pairing we don't hold, or whose transport is closed, is skipped — its
+    // own pairing drains it on reconnect. The explicit status gate replaces
+    // the old caller-side "never drain over a closed transport" check, which
+    // was global and cannot be per-pairing.
+    const rt = runtimesRef.current.get(entry.scope ?? '');
+    if (!rt || !rt.transport || rt.statusNow !== 'open') return;
     // R4-3: drain() iterates a SNAPSHOT of listPending() taken at its start.
-    // If a wipe (unpair/auth-error) clears the outbox WHILE that snapshot is
-    // still being processed, a later entry in it no longer has a row —
-    // markSending() returns null. transportRef.current, meanwhile, may
-    // already point at a DIFFERENT identity's freshly-wired transport (a
-    // re-pair can complete in the same window). Without this check, a stale
-    // entry was sent through whatever transport happened to be active,
-    // reaching the wrong user's session with the wrong user's content.
+    // If a wipe (unpair/auth-error) clears this pairing's rows WHILE that
+    // snapshot is still being processed, a later entry in it no longer has a
+    // row — markSending() returns null. A re-pair, meanwhile, may already
+    // have installed a DIFFERENT identity's freshly-wired transport for the
+    // same pairingId. Without this claim, a stale entry was sent through
+    // whatever transport happened to be active, reaching the wrong user's
+    // session with the wrong user's content.
     //
     // R4-4: markSending() is a pending-only compare-and-set. Two tabs can
     // both see the same row as 'pending' in their own listPending()
@@ -524,13 +607,19 @@ export function TransportProvider(props: TransportProviderProps) {
     // both tabs unconditionally flipped the row to 'sending' and both
     // transmitted it.
     //
+    // R5-3/R6-3: the claim requires the row's persisted scope (the pairingId
+    // it was enqueued under) verbatim, inside the same atomic transaction —
+    // a row written by a stale tab under a since-wiped pairing identity is
+    // never claimed, and therefore never transmitted, by this tab.
+    //
     // R5-5: the returned token names THIS claim specifically. The failure
     // paths below (ack timer, send rejection) present it, so if this tab is
     // background-throttled past its lease and the row is re-claimed
     // elsewhere, their delayed writes no-op instead of clobbering the newer
     // owner's in-flight send.
-    const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, scope);
+    const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, entry.scope!);
     if (!claimToken) return;
+    const ck = convKeyOf(entry.scope!, entry.channel);
     if (entry.env.kind === 'msg') {
       const attachments = entry.env.payload.attachments;
       if (attachments && attachments.length > 0) {
@@ -549,7 +638,7 @@ export function TransportProvider(props: TransportProviderProps) {
           const applied = await outbox.markFailed(entry.id, 'attachments-expired', claimToken);
           // Monotonic 'ack' route (see the ACK_TIMEOUT note below): a genuine
           // 'delivered' from an earlier attempt still outranks this.
-          if (applied) dispatch({ type: 'ack', convKey: entry.channel, refId: entry.id, status: 'failed', reason: 'attachments-expired' });
+          if (applied) dispatch({ type: 'ack', convKey: ck, refId: entry.id, status: 'failed', reason: 'attachments-expired' });
           return;
         }
         // { ok: false } = network/token trouble reaching the lease endpoint —
@@ -557,7 +646,7 @@ export function TransportProvider(props: TransportProviderProps) {
       }
     }
     try {
-      await transport.send(entry.env);
+      await rt.transport.send(entry.env);
       // msg and approval.response both get a server ack (bridge.ts) and so both
       // wait for round-trip confirmation before settling. Without this (R2-5),
       // approval.response settled the instant the browser accepted the send
@@ -578,7 +667,7 @@ export function TransportProvider(props: TransportProviderProps) {
             // arrived while this timer's markFailed CAS was pending must not be
             // regressed to 'failed'. advanceDelivery keeps the higher-rank
             // delivered/read; matches m.id (msg) or m.responseEnvId (approval).
-            if (applied) dispatch({ type: 'ack', convKey: entry.channel, refId: entry.id, status: 'failed' });
+            if (applied) dispatch({ type: 'ack', convKey: ck, refId: entry.id, status: 'failed' });
           });
         }, ACK_TIMEOUT_MS);
         ackTimers.current.set(entry.id, timer);
@@ -598,34 +687,43 @@ export function TransportProvider(props: TransportProviderProps) {
       const status = await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed', claimToken);
       if (status === 'failed') {
         // #R10: monotonic 'ack' route (see the ACK_TIMEOUT note above).
-        dispatch({ type: 'ack', convKey: entry.channel, refId: entry.id, status: 'failed' });
+        dispatch({ type: 'ack', convKey: ck, refId: entry.id, status: 'failed' });
       }
     }
   }, []);
 
-  const drain = useCallback(async () => {
+  const drain = useCallback(async (onlyPairingId?: string) => {
     // Serialise concurrent drain() calls.  If a drain is already in flight,
     // set the pending flag and return — the in-flight drain will re-run once
     // after finishing, picking up any entries that were enqueued after its
-    // initial listPending() snapshot.
+    // initial listPending() snapshot. The lock stays GLOBAL — one drain
+    // walker — while rows route per pairing inside attempt().
     if (drainLockRef.current) { drainPendingRef.current = true; return; }
     drainLockRef.current = true;
     try {
+      let filter = onlyPairingId;
       do {
         drainPendingRef.current = false;
         const pending = await outbox.listPending();
         // R5-3/R6-3: attempt()'s scope-gated claim is the authoritative
-        // guard — it can never transmit a foreign-identity row. #R7-3: SKIP
-        // such rows, do NOT delete them. The outbox is shared per-origin, so
-        // a foreign-scope row may belong to a DIFFERENT identity that is live
-        // in another tab; deleting it here destroyed that tab's queued data.
-        // Leaving it is harmless (it can never be claimed under this scope);
-        // its own identity's tab drains it, and its own wipe clears it.
-        const scope = identityScopeRef.current;
+        // guard — it can never transmit a foreign-pairing row. #R7-3: SKIP
+        // rows for pairings this provider doesn't hold, do NOT delete them.
+        // The outbox is shared per-origin, so such a row may belong to a
+        // DIFFERENT identity live in another tab; deleting it here destroyed
+        // that tab's queued data. Leaving it is harmless (it can never be
+        // claimed under a scope we don't hold); its own identity's tab drains
+        // it, and its own wipe clears it.
         for (const entry of pending) {
-          if (scope && entry.scope !== scope) continue; // not ours — leave it for its owner
+          if (!runtimesRef.current.has(entry.scope ?? '')) continue; // not ours — leave it for its owner
+          // A reconnect on pairing A drains only A's outbox rows; B's stay
+          // queued for B's own transport.
+          if (filter && entry.scope !== filter) continue;
           await attempt(entry);
         }
+        // A coalesced re-run may have been triggered by ANY pairing's enqueue
+        // or reconnect — run it unfiltered (attempt()'s per-row status gate
+        // makes that safe over closed transports).
+        filter = undefined;
       } while (drainPendingRef.current);
     } finally {
       drainLockRef.current = false;
@@ -640,6 +738,8 @@ export function TransportProvider(props: TransportProviderProps) {
   // coarse periodic safety sweep — call recoverExpiredSending, which honors
   // every row's lease, so an old timer firing late can NOT reclaim a newer
   // live claim (the R6-5b bug in the old owner-unconditional demoteSending).
+  // The sweep machinery stays GLOBAL: it is lease-gated and scope-agnostic,
+  // and attempt()'s per-pairing claim keeps it safe across pairing wipes.
   const leaseSweepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const leaseSweepDueRef = useRef<number>(Infinity);
   const sweepLeasesRef = useRef<() => void>(() => {});
@@ -659,62 +759,20 @@ export function TransportProvider(props: TransportProviderProps) {
   }, []);
   const sweepLeases = useCallback((): Promise<void> => {
     return outbox.recoverExpiredSending().then((nextExpiry) => {
-      // Anything requeued only actually retransmits via drain — but never
-      // drain over a closed transport (it would burn retry attempts).
-      if (statusNowRef.current === 'open') void drain();
+      // Anything requeued only actually retransmits via drain — unfiltered,
+      // since a recovered row can belong to any pairing; attempt()'s per-row
+      // status gate keeps this safe over pairings whose transports are closed
+      // (it returns before claiming, so no retry attempts are burned).
+      void drain();
       if (nextExpiry !== null) scheduleSweepAt(nextExpiry + 100);
     });
   }, [drain, scheduleSweepAt]);
   sweepLeasesRef.current = sweepLeases;
 
-  // Full local-identity wipe, used on unpair and on a terminal auth-error: cancel
-  // pending ack timers, clear the kv store (session, read markers, push flag) AND the
-  // outbox, and reset in-memory chat state. Without the outbox + state wipe, a
-  // subsequent pairing as a different user would drain the prior user's queued
-  // messages through the new session and briefly render their history.
-  //
-  // outbox.clearScope() (not a raw store clear) is required here: it is
-  // serialized against the outbox sweeps (single transaction — see the outbox
-  // module comment), so a concurrent demoteSending/sweep write can't land
-  // after the clear and resurrect a row.
-  //
-  // #R7-3: clears ONLY the wiped identity's rows (`wipedScope`), not the whole
-  // shared per-origin outbox — another tab logged in as a different identity
-  // keeps its queued rows. `wipedScope` is captured by the caller BEFORE it
-  // nulls identityScopeRef.
-  const wipeAndReset = useCallback(async (wiped: ActiveSession | null) => {
-    for (const timer of ackTimers.current.values()) clearTimeout(timer);
-    ackTimers.current.clear();
-    for (const timer of typingTimers.current.values()) clearTimeout(timer);
-    typingTimers.current.clear();
-    // #R6-5b: cancel any scheduled lease sweep — it must not survive a
-    // wipe/re-pair and fire against a fresh identity.
-    if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
-    leaseSweepDueRef.current = Infinity;
-    // #R8-4: the SESSION is cleared by an atomic compare-and-clear (only if it
-    // still matches the wiped identity), NOT a blanket wipeLocal() after async
-    // work — an older unpair racing a newer tab's re-pair would otherwise
-    // erase the newer session. Read markers / push flag are then cleared
-    // WITHOUT touching the session key (wipeKvExceptSession), so a session a
-    // concurrent re-pair wrote in the meantime is never collateral. The
-    // outbox clear is already identity-scoped (#R7-3).
-    const wipedScope = wiped ? identityKey(wiped) : null;
-    await Promise.all([
-      wipedScope ? clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))) : Promise.resolve(false),
-      wipeKvExceptSession(),
-      wipedScope ? outbox.clearScope(wipedScope) : Promise.resolve(),
-      // #R8-1: drop this identity's durable approval requests too, so a
-      // re-pair as a different user cannot re-render the prior user's cards.
-      wipedScope ? approvals.clearApprovalsForScope(wipedScope) : Promise.resolve(),
-    ]);
-    dispatch({ type: 'reset' });
-  }, []);
-
-  // Finding 2: requestHistory must be declared before wireTransport so the onStatus
-  // handler inside wireTransport can reference it without use-before-declare issues.
-  const requestHistory = useCallback((channel: string, before?: string) => {
-    const userId = sessionRef.current?.userId;
-    const transport = transportRef.current;
+  const requestHistory = useCallback((pairingId: string, channel: string, before?: string) => {
+    const rt = runtimesRef.current.get(pairingId);
+    const userId = rt?.validUserId;
+    const transport = rt?.transport;
     if (!userId || !transport) return;
     void transport.send(createEnvelope('history.request', {
       from: userAddress(userId), to: agentAddress(channel), channel,
@@ -722,118 +780,167 @@ export function TransportProvider(props: TransportProviderProps) {
     })).catch(() => { /* retried on next open */ });
   }, []);
 
-  const wireTransport = useCallback((transport: AppTransport) => {
-    // Finding 1: tear down any existing subscriptions before re-wiring
-    for (const unsub of unsubsRef.current) unsub();
-    unsubsRef.current = [];
+  /**
+   * Per-pairing durable wipe, used on unpair, terminal auth-error, and the
+   * tombstoned-boot path: clears exactly ONE pairing's slice of every store.
+   *
+   * outbox.clearScope() (not a raw store clear) is required here: it is
+   * serialized against the outbox sweeps (single transaction — see the outbox
+   * module comment), so a concurrent release/sweep write can't land after the
+   * clear and resurrect a row. #R7-3: it clears ONLY the wiped pairing's rows
+   * (scope === pairingId) — other pairings (and other tabs' identities) keep
+   * their queued rows. Without the outbox + chat-state wipe, a re-pair as a
+   * different user could drain the prior user's queued messages through the
+   * new session and briefly render their history.
+   *
+   * #R8-4: the pairing-list removal is an atomic epoch-gated compare-and-remove
+   * (removePairingIfMatches) — an older unpair racing a newer re-pair (fresh
+   * epoch, same pairingId) must not erase the newer stored pairing.
+   *
+   * Ack timers are deliberately LEFT armed: they are refId-keyed across
+   * pairings, and their outbox writes are row/claim-gated, so once this scope's
+   * rows are cleared they settle as no-ops — clearing ALL of them (the old
+   * global wipe) would now cancel other pairings' live timers.
+   */
+  const wipePairingDurable = useCallback(async (pairingId: string, epoch: string) => {
+    clearPairingTypingTimers(pairingId);
+    await Promise.all([
+      removePairingIfMatches(pairingId, epoch).catch(() => { /* best-effort retry of the hoisted removal */ }),
+      outbox.clearScope(pairingId),
+      // #R8-1: drop this pairing's durable approval requests too, so a
+      // re-pair as a different user cannot re-render the prior user's cards.
+      approvals.clearApprovalsForScope(pairingId),
+      wipeKvByPrefix(`lastread:${pairingId}/`),
+    ]);
+    // One pairing's slice only — a global 'reset' would wipe other pairings'
+    // live conversations.
+    dispatch({ type: 'drop-pairing', pairingId });
+  }, [clearPairingTypingTimers]);
 
-    transportRef.current = transport;
-    const u1 = transport.onEnvelope(handleEnvelope);
+  /** Open-time catch-up for ONE pairing: re-drive its processing rows, drain
+   *  its queued sends, and re-request history for its channels + its already-
+   *  loaded conversations (+ the active one if it belongs to this pairing). */
+  const catchUpOnOpen = useCallback((rt: PairingRuntime) => {
+    const pid = rt.pairing.pairingId;
+    // #R6-2b: re-drive any 'processing' approval rows first — a terminal
+    // ack lost to the disconnect otherwise leaves them stuck. Moving them
+    // to 'pending' then draining re-sends the same envelope, which the
+    // bridge answers with the real outcome (dedup-safe). drain() runs
+    // after, covering both the recovered rows and normal pending ones.
+    void outbox.recoverProcessing(pid).then(() => drain(pid));
+    void drain(pid);
+    // Catch up history on every (re)connect — per pairing: request EVERY
+    // channel THIS pairing exposes, plus its already-loaded conversations and
+    // the active one when it belongs to this pairing. Seeding from the
+    // pairing's channels is what hydrates the conversation-list preview
+    // (last message + unread) on a fresh launch — without it the list stays
+    // blank until the user opens each chat, because state.messages is only
+    // populated by a history fetch. The reducer merges by id, so re-fetching
+    // the latest page is idempotent (already-shown messages are deduped).
+    const channels = new Set<string>(rt.pairing.channels);
+    for (const ck of Object.keys(stateRef.current.historyLoaded)) {
+      if (!stateRef.current.historyLoaded[ck]) continue;
+      const r = resolveConvKey(ck, [pid]);
+      if (r) channels.add(r.channel);
+    }
+    const active = activeRef.current ? resolveConvKey(activeRef.current, [pid]) : null;
+    if (active) channels.add(active.channel);
+    for (const c of channels) requestHistory(pid, c);
+  }, [drain, requestHistory]);
+
+  const wirePairing = useCallback((rt: PairingRuntime, transport: AppTransport) => {
+    // Tear down any existing subscriptions before re-wiring.
+    for (const u of rt.unsubs) u();
+    rt.unsubs = [];
+    rt.transport = transport;
+    const pid = rt.pairing.pairingId;
+    const u1 = transport.onEnvelope(makeEnvelopeHandler(pid));
     const u2 = transport.onStatus((s) => {
-      // Update statusNowRef synchronously FIRST so that any async callbacks
+      // Update statusNow synchronously FIRST so that any async callbacks
       // that resolve immediately after this point (e.g. outbox.enqueue().then)
       // see the current status without waiting for a React render commit.
-      statusNowRef.current = s;
-      setStatus(s);
-      if (s === 'open') {
-        // #R6-2b: re-drive any 'processing' approval rows first — a terminal
-        // ack lost to the disconnect otherwise leaves them stuck. Moving them
-        // to 'pending' then draining re-sends the same envelope, which the
-        // bridge answers with the real outcome (dedup-safe). drain() runs
-        // after, covering both the recovered rows and normal pending ones.
-        void outbox.recoverProcessing(identityScopeRef.current).then(() => drain());
-        void drain();
-        // Catch up history on every (re)connect: request EVERY channel in the
-        // session, plus the active one and any already-loaded channels. Seeding
-        // from the session's channels is what hydrates the channel-list preview
-        // (last message + unread) on a fresh launch — without it the list stays
-        // blank until the user opens each chat, because state.messages is only
-        // populated by a history fetch. The reducer merges by id, so re-fetching
-        // the latest page is idempotent (already-shown messages are deduped).
-        const active = activeRef.current;
-        const channels = new Set<string>([
-          ...(sessionRef.current?.channels ?? []),
-          ...Object.keys(stateRef.current.historyLoaded).filter((c) => stateRef.current.historyLoaded[c]),
-        ]);
-        if (active) channels.add(active);
-        for (const c of channels) requestHistory(c);
-      }
+      rt.statusNow = s;
+      refreshViews();
+      if (s === 'open') catchUpOnOpen(rt);
       // #R6-5b: on close, reclaim THIS tab's own in-flight rows immediately
-      // (owner-scoped, lease-independent) — its transport is gone, so it
-      // cannot finish them; they must be pending for the reconnect drain.
-      // NOT the expiry sweep (which is lease-based and owner-agnostic).
-      if (s === 'closed') void outbox.releaseOwnedSending(tabIdRef.current!);
+      // (owner-scoped, lease-independent) — this pairing's transport is gone,
+      // so it cannot finish them; they must be pending for the reconnect
+      // drain. NOT the expiry sweep (which is lease-based and owner-agnostic).
+      // Scope-filtered (multi-pairing): only THIS pairing's in-flight rows
+      // lost their transport — another pairing's actively-in-flight row must
+      // not be requeued (that would double-send it when its own drain retries).
+      if (s === 'closed') void outbox.releaseOwnedSending(tabIdRef.current!, pid);
     });
-    const isOverride = !!props.transportOverride;
+    const isOverride = transport === props.transportOverride;
     const u3 = transport.onAuthError(() => {
       if (isOverride) {
         // In override mode the host owns auth recovery — the transport's own
         // retry budget handles the first attempt.  Never terminal-unpair here;
         // just surface the error string and leave phase as 'ready'.
         setAuthError('Authentication error. The host is attempting to reconnect.');
-      } else {
-        // R4-3: bump AND null validUserIdRef synchronously, FIRST, before
-        // anything else — see their declaration comments. This handler fires
-        // from a transport event, entirely async-independent from any
-        // in-flight sendEnvelope()/sendMessage() call, so both must happen
-        // before the push-unsubscribe await below to close the window as
-        // early as possible: sendMessage/respondApproval check
-        // validUserIdRef and no-op when it's null, so this alone rejects any
-        // send attempt from this instant onward — "leaves A's identity
-        // usable until asynchronous cleanup completes" is exactly the gap
-        // this closes. myGen is captured for the deferred state updates below.
-        sessionGenRef.current += 1;
-        const myGen = sessionGenRef.current;
-        const wiped = sessionRef.current;
-        validUserIdRef.current = null;
-        identityScopeRef.current = null;
-        // R5-3: tell every OTHER open tab this identity is gone, so none of
-        // them keeps enqueueing/acting as it (their in-memory refs are their
-        // own — the IDB wipe below alone would never reach them). Scoped to
-        // the exact identity (#R6-8) so a delayed event can't log out an
-        // unrelated newer session.
-        if (wiped) bcRef.current?.postMessage({ type: 'identity-wiped', key: identityKey(wiped) });
-        // Default (standalone) path: terminal unpair. Fully wipe local identity
-        // state (session, read markers, push flag, queued outbox) and reset chat
-        // state so a re-pair as a different user cannot inherit it, then drop back
-        // to setup so the user can scan a new QR code.
-        //
-        // The transport is already closed here, so there is no live connection
-        // to ask the server to drop the subscription (unlike unpair(), which
-        // runs before closing). Still invalidate the browser-level subscription:
-        // that tells the push service to stop routing to this endpoint AT ALL,
-        // so even a stale server-side row for the now-revoked user can no
-        // longer deliver here (a later send to it just 404/410s, which the
-        // store already prunes on).
-        void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
-
-        // The REACT-STATE side of the transition (setSession/setPhase/etc.)
-        // still defers until the wipe settles — but now guarded by the
-        // generation captured above, not by "is this the only in-flight
-        // wipe": if a newer wipe OR a newer successful pairing has already
-        // bumped sessionGenRef past myGen by the time this resolves, skip —
-        // applying it now would clobber a state transition that has already
-        // superseded this one (the original TOCTOU this deferral pattern was
-        // written to avoid: "a re-pair racing the async wipe could have its
-        // freshly-saved session cleared").
-        void wipeAndReset(wiped).finally(() => {
-          if (sessionGenRef.current !== myGen) return;
-          setSession(null);
-          // R2-10: unpair() already clears this; the auth-error path did not,
-          // so a stale activeChannel (and the URL's ?c= param, via ChatScreen)
-          // could reopen a channel from the PRIOR user's session after a fresh
-          // pairing, since openChannel() does not validate channel membership.
-          setActiveChannel(null);
-          setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
-          setPhase('setup');
-        });
+        return;
       }
+      // Default (standalone) path: terminal unpair of THIS pairing only.
+      // (Interim implementation — Task 6 hardens ordering/timeout behavior.)
+      // Guard: only act while this runtime is still the installed one.
+      if (runtimesRef.current.get(pid) !== rt) return;
+      // R4-3: bump AND null validUserId synchronously, FIRST, before
+      // anything else — see PairingRuntime's field comments. This handler
+      // fires from a transport event, entirely async-independent from any
+      // in-flight sendEnvelope()/sendMessage() call, so both must happen
+      // before the push-unsubscribe below to close the window as early as
+      // possible: sendMessage/respondApproval check validUserId and no-op
+      // when it's null, so this alone rejects any send attempt through this
+      // pairing from this instant onward — "leaves A's identity usable until
+      // asynchronous cleanup completes" is exactly the gap this closes.
+      // myGen is captured for the deferred state updates below.
+      rt.gen += 1;
+      const myGen = rt.gen;
+      const wiped = rt.pairing;
+      rt.validUserId = null;
+      // R5-3: tell every OTHER open tab this pairing identity is gone, so
+      // none of them keeps enqueueing/acting as it (their in-memory runtimes
+      // are their own — the IDB wipe below alone would never reach them).
+      // Scoped to the exact pairing identity (#R6-8: pairingId + epoch) so a
+      // delayed event can't log out an unrelated newer pairing.
+      bcRef.current?.postMessage({ type: 'identity-wiped', pairingId: pid, epoch: wiped.epoch });
+      // The transport is already closed here, so there is no live connection
+      // to ask the server to drop the subscription (unlike unpair(), which
+      // runs before closing). Still invalidate the browser-level subscription:
+      // that tells the push service to stop routing to this endpoint AT ALL,
+      // so even a stale server-side row for the now-revoked user can no
+      // longer deliver here (a later send to it just 404/410s, which the
+      // store already prunes on).
+      void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
+      for (const u of rt.unsubs) u();
+      rt.unsubs = [];
+      void rt.transport?.close();
+      rt.transport = null;
+      // The REACT-STATE side of the transition still defers until the wipe
+      // settles — but guarded by the generation captured above, not by "is
+      // this the only in-flight wipe": if a newer wipe OR a newer successful
+      // re-pair has already bumped this runtime's gen (or replaced the
+      // runtime) by the time this resolves, skip — applying it now would
+      // clobber a state transition that has already superseded this one (the
+      // original R4-3 TOCTOU this deferral pattern was written to avoid).
+      void wipePairingDurable(pid, wiped.epoch).finally(() => {
+        if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return;
+        runtimesRef.current.delete(pid);
+        refreshViews();
+        // R2-10: clear a stale active conversation belonging to this pairing
+        // (and the URL's ?c= param, via ChatScreen) so it cannot reopen under
+        // a fresh pairing.
+        if (activeRef.current && resolveConvKey(activeRef.current, [pid])) setActiveChannel(null);
+        setAuthError('This device was unpaired. Scan a new QR code to reconnect.');
+        setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
+      });
     });
-    // Finding 1: store all three unsubscribe functions
-    unsubsRef.current = [u1, u2, u3];
-  }, [drain, handleEnvelope, requestHistory, wipeAndReset, sweepLeases]);
+    rt.unsubs = [u1, u2, u3];
+  }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairingDurable, props.transportOverride]);
 
   useEffect(() => {
+    bootGenRef.current += 1;
+    const bootGen = bootGenRef.current;
     // #R6-5: recovery-sweep coordination. Boot-time and close-time sweeps
     // cannot cover a claim made AFTER they ran by a tab that then crashes —
     // on a stable connection nothing would ever sweep again, leaving that
@@ -865,18 +972,34 @@ export function TransportProvider(props: TransportProviderProps) {
       if (leaseSweepTimerRef.current) { clearTimeout(leaseSweepTimerRef.current); leaseSweepTimerRef.current = null; }
       leaseSweepDueRef.current = Infinity;
     };
+    const teardownRuntimes = (): void => {
+      for (const rt of runtimesRef.current.values()) {
+        for (const u of rt.unsubs) u();
+        rt.unsubs = [];
+        // Do NOT close an override transport — the host owns its lifecycle.
+        if (rt.transport && rt.transport !== props.transportOverride) void rt.transport.close();
+        rt.transport = null;
+      }
+      runtimesRef.current.clear();
+    };
+    const clearTimers = (): void => {
+      for (const timer of ackTimers.current.values()) clearTimeout(timer);
+      ackTimers.current.clear();
+      for (const timer of typingTimers.current.values()) clearTimeout(timer);
+      typingTimers.current.clear();
+    };
 
     // Host-embedding fast path: a pre-constructed, already-authenticated transport
-    // was injected — skip IDB session loading and go straight to ready.
+    // was injected — skip IDB pairing loading and go straight to ready.
     if (props.transportOverride) {
-      // Set the session synchronously on the ref FIRST so that the very first
-      // wireTransport → onStatus('open') → drain/requestHistory path sees a valid
-      // userId.  The corresponding setSession call queues a React state update
-      // (delivered asynchronously) but sessionRef.current is authoritative for all
-      // imperative code paths (sendMessage, respondApproval, requestHistory).
+      // Install the synthetic host pairing synchronously FIRST so that the very
+      // first wirePairing → onStatus('open') → drain/requestHistory path sees a
+      // valid userId. The runtime map is authoritative for all imperative code
+      // paths (sendMessage, respondApproval, requestHistory).
+      let hostRt: PairingRuntime | null = null;
       if (props.sessionOverride) {
         // #R8-5: guarantee a non-secret epoch (host may omit it) so the
-        // identity key never derives from the secret sessionToken.
+        // pairing identity never derives from the secret sessionToken.
         // #P1-F2: a host override intentionally never persists (see the
         // provider-never-writes-IDB guarantee), so a MISSING epoch is minted
         // fresh EVERY mount → the identity key changes each mount → durable
@@ -888,86 +1011,91 @@ export function TransportProvider(props: TransportProviderProps) {
           console.warn('[raccoon] sessionOverride has no epoch: a fresh one is minted per mount, stranding durable outbox rows across remounts. Supply a stable non-secret epoch.');
         }
         const overrideSession = withEpoch(props.sessionOverride);
-        sessionGenRef.current += 1;
-        sessionRef.current = overrideSession;
-        validUserIdRef.current = overrideSession.userId;
-        identityScopeRef.current = identityKey(overrideSession);
-        setSession(overrideSession);
+        // pairingId === the legacy identity key, so a host install's existing
+        // outbox/approvals scope bytes in IDB are unchanged and its rows stay
+        // claimable with no migration.
+        const pid = hostIdentityKey(overrideSession);
+        const pairing: PairedSession = { ...overrideSession, pairingId: pid, transportKind: 'host' };
+        hostRt = { pairing, transport: null, statusNow: 'closed', unsubs: [], gen: 1, validUserId: pairing.userId };
+        runtimesRef.current.set(pid, hostRt);
+        refreshViews();
       }
+      // (If sessionOverride is absent — documented as a broken-but-legal host
+      // config — there is no runtime; sends no-op exactly as before.)
       const override = props.transportOverride;
       let overrideCancelled = false;
       // R3-8: requeue any 'sending' rows stranded by a crash/reload mid-send in a
-      // prior session — demoteSending() otherwise only runs off the transport's
+      // prior session — releaseOwnedSending otherwise only runs off the transport's
       // 'closed' event, which a killed tab never gets to fire. Must complete
-      // BEFORE wireTransport so the first drain() this boot (triggered by the
+      // BEFORE wirePairing so the first drain() this boot (triggered by the
       // 'open' status event) is guaranteed to see the requeued rows as 'pending',
       // not race against them still being 'sending'. Via sweepLeases (#R5-4)
       // so a skipped still-leased foreign row gets re-checked when it lapses.
       void sweepLeases().finally(() => {
-        // R4-10: if the provider unmounted while demoteSending() was in
-        // flight, the cleanup below already ran and will never run again —
-        // wiring now would leave zombie subscriptions bound to this dead
-        // component instance, and connect() a host-owned transport nobody
-        // asked for.
+        // R4-10: if the provider unmounted while the sweep was in flight, the
+        // cleanup below already ran and will never run again — wiring now
+        // would leave zombie subscriptions bound to this dead component
+        // instance, and connect() a host-owned transport nobody asked for.
         if (overrideCancelled) return;
-        wireTransport(override);
+        if (hostRt) wirePairing(hostRt, override);
         setPhase('ready');
         void override.connect().catch(() => { /* reconnect loop handles it */ });
       });
       return () => {
         overrideCancelled = true;
+        bootGenRef.current += 1;
         stopSweepCoordination();
-        for (const unsub of unsubsRef.current) unsub();
-        unsubsRef.current = [];
-        for (const timer of ackTimers.current.values()) clearTimeout(timer);
-        ackTimers.current.clear();
-        for (const timer of typingTimers.current.values()) clearTimeout(timer);
-        typingTimers.current.clear();
-        // Do NOT close the override transport — the host owns its lifecycle.
-        transportRef.current = null;
+        teardownRuntimes();
+        clearTimers();
       };
     }
 
     let cancelled = false;
-    // R5-3: listen for another tab's wipe/unpair and tear this tab down too.
-    // Without this, a tab left open across another tab's unpair kept its
-    // in-memory identity live indefinitely — still able to enqueue outbox
-    // rows (and show chat UI) as a user whose local state was already wiped.
+    // R5-3: listen for another tab's wipe/unpair and tear down the matching
+    // pairing runtime in this tab too. Without this, a tab left open across
+    // another tab's unpair kept that pairing's in-memory identity live
+    // indefinitely — still able to enqueue outbox rows (and show chat UI) as
+    // a user whose local state was already wiped.
     if (typeof BroadcastChannel !== 'undefined') {
       const bc = new BroadcastChannel('raccoon-identity');
       bcRef.current = bc;
       bc.addEventListener('message', (ev) => {
-        const data = (ev as MessageEvent).data as { type?: string; key?: string } | undefined;
-        if (cancelled || data?.type !== 'identity-wiped' || typeof data.key !== 'string') return;
+        const data = (ev as MessageEvent).data as { type?: string; pairingId?: string; epoch?: string } | undefined;
+        if (cancelled || data?.type !== 'identity-wiped' || typeof data.pairingId !== 'string' || typeof data.epoch !== 'string') return;
         // #R6-4b: record the tombstone ALWAYS — even while this tab is still
-        // loading and has no current identity to match — so the boot
-        // continuation can refuse to install this exact identity if its IDB
-        // read resolves after the wipe.
-        wipeTombstonesRef.current.add(data.key);
-        // #R6-8b: only tear down when the wiped identity IS this tab's CURRENT
-        // one (complete key: instance+user+session epoch). A delayed or
-        // unrelated event — another instance, another user, or a since
-        // re-paired session (new epoch) for the same user@instance — must not
-        // log the newer session out.
-        const current = sessionRef.current;
-        if (!current || identityKey(current) !== data.key) return;
+        // loading its pairings and has no runtimes to match against — so the
+        // boot continuation can refuse to install this exact pairing if its
+        // IDB read resolves after the wipe.
+        wipeTombstonesRef.current.add(`${data.pairingId}::${data.epoch}`);
+        // #R6-8b: only tear down when the wiped pairing IS one this tab
+        // currently holds at the SAME epoch. A delayed or unrelated event —
+        // another pairing, or a since-refreshed pairing (new epoch) for the
+        // same pairingId — must not log the newer pairing out.
+        const rt = runtimesRef.current.get(data.pairingId);
+        if (!rt || rt.pairing.epoch !== data.epoch) return;
         // Same synchronous-first discipline as the auth-error handler: kill
-        // the identity before any async work, so in-flight sendMessage /
-        // sendEnvelope calls are rejected from this instant on.
-        sessionGenRef.current += 1;
-        validUserIdRef.current = null;
-        identityScopeRef.current = null;
-        for (const timer of ackTimers.current.values()) clearTimeout(timer);
-        ackTimers.current.clear();
-        for (const unsub of unsubsRef.current) unsub();
-        unsubsRef.current = [];
-        void transportRef.current?.close();
-        transportRef.current = null;
-        dispatch({ type: 'reset' });
-        setSession(null);
-        setActiveChannel(null);
-        setAuthError('This device was unpaired in another tab. Scan a new QR code to reconnect.');
-        setPhase('setup');
+        // the pairing identity before any async work, so in-flight
+        // sendMessage / sendEnvelope calls are rejected from this instant on.
+        rt.gen += 1;
+        rt.validUserId = null;
+        for (const u of rt.unsubs) u();
+        rt.unsubs = [];
+        void rt.transport?.close();
+        rt.transport = null;
+        clearPairingTypingTimers(data.pairingId);
+        // The wiping tab owns the durable clears; this tab only drops its
+        // in-memory slice. Ack timers stay armed — their row/claim-gated
+        // writes no-op once the wiping tab's clearScope commits (cancelling
+        // ALL of them, as the old single-identity wipe did, would now cancel
+        // other pairings' live timers).
+        dispatch({ type: 'drop-pairing', pairingId: data.pairingId });
+        runtimesRef.current.delete(data.pairingId);
+        refreshViews();
+        if (activeRef.current && resolveConvKey(activeRef.current, [data.pairingId])) setActiveChannel(null);
+        if (runtimesRef.current.size === 0) {
+          setAuthError('This device was unpaired in another tab. Scan a new QR code to reconnect.');
+          setPhase('setup');
+        }
       });
     }
     // #F6: gate boot on a durable-storage write-probe. If storage is unusable
@@ -981,83 +1109,79 @@ export function TransportProvider(props: TransportProviderProps) {
         setPhase('storage-error');
         return;
       }
-      return loadSession().then(async (loaded) => {
-      if (cancelled) return;
-      if (!loaded) { setPhase('setup'); return; }
-      // loadSession guarantees an epoch (persisted at pairing, lazily migrated
-      // on load); withEpoch is a passthrough here that also satisfies the
-      // epoch-required identityKey type.
-      const session = withEpoch(loaded);
-      // #R6-4b: a wipe for this exact identity may have arrived from another
-      // tab WHILE this IDB read was in flight (the load snapshotted before
-      // the other tab's clear committed, or raced it). Installing it now
-      // would connect a just-unpaired session. Treat it as wiped: drop the
-      // stale stored session and go to setup instead.
-      // #R7-3: compare-and-clear — only delete the stored session if it STILL
-      // matches the tombstoned identity. If the user re-paired in the interim
-      // (a newer session was saved), an unconditional clearSession() would
-      // delete that valid new session; clearSessionIfMatches leaves it.
-      if (wipeTombstonesRef.current.has(identityKey(session))) {
-        await clearSessionIfMatches(identityKey(session), (s) => identityKey(withEpoch(s))).catch(() => { /* best-effort */ });
-        setPhase('setup');
-        return;
-      }
-      // Update the ref immediately so callbacks (sendMessage etc.) can use the
-      // session before the setSession re-render fires through the scheduler.
-      // Bumps sessionGenRef too (a real identity transition — see its
-      // declaration comment), so a since-superseded wipe's deferred state
-      // update correctly detects it should no longer apply.
-      sessionGenRef.current += 1;
-      const bootGen = sessionGenRef.current;
-      sessionRef.current = session;
-      validUserIdRef.current = session.userId;
-      identityScopeRef.current = identityKey(session);
-      setSession(session);
-      // R3-8: see the matching comment in the transportOverride branch above —
-      // must complete before wireTransport so the boot drain() can't miss rows
-      // stranded in 'sending' by a crash/reload in the previous session.
-      // Via sweepLeases (#R5-4) so a skipped still-leased foreign row gets
-      // re-checked when its lease lapses instead of stranding forever.
-      await sweepLeases();
-      // R4-10: re-check after the await above — if the provider unmounted
-      // while demoteSending() was in flight, the cleanup below already ran
-      // (transportRef was still null/stale at that point, so it had nothing
-      // to close) and will never run again. Without this check, wiring and
-      // connecting a transport here would leak it forever: nothing would
-      // ever call close() on it.
-      // #R6-4: the generation check catches what `cancelled` cannot — a
-      // cross-tab identity-wiped (or any other identity transition) landing
-      // during that await on a still-mounted provider. Wiring + connecting
-      // the captured `loaded` session here would resurrect an identity that
-      // was just torn down.
-      if (cancelled || sessionGenRef.current !== bootGen) return;
-      // #A3: this default boot path DIALS the WS transport from session.url, so
-      // it needs one. A WS-paired session always has it; a host-managed session
-      // (url now optional) never reaches here — it boots via sessionOverride +
-      // transportOverride. Guard the widened type: no url ⇒ nothing to dial.
-      if (!session.url) { setPhase('setup'); return; }
-      const transport = makeTransport({ url: session.url, session: session.sessionToken, device: 'raccoon-app' });
-      wireTransport(transport);
-      setPhase('ready');
-      try { await transport.connect(); } catch { /* reconnect loop handles it */ }
+      // loadPairings runs the one-time legacy-session adoption when needed;
+      // every returned pairing carries a pairingId + epoch.
+      return adopt.loadPairings().then(async (list) => {
+        if (cancelled) return;
+        // #R6-4b per pairing: drop any pairing tombstoned by another tab's
+        // wipe while our IDB read was in flight. #R7-3: the removal is an
+        // epoch-gated compare-and-remove — if the user re-paired in the
+        // interim (fresh epoch), the newer stored pairing is left alone.
+        const live: PairedSession[] = [];
+        for (const p of list) {
+          if (wipeTombstonesRef.current.has(`${p.pairingId}::${p.epoch}`)) {
+            await removePairingIfMatches(p.pairingId, p.epoch).catch(() => { /* best-effort */ });
+          } else {
+            live.push(p);
+          }
+        }
+        if (live.length === 0) { setPhase('setup'); return; }
+        // Install every runtime synchronously so callbacks (sendMessage etc.)
+        // can use the pairings before React commits the views update.
+        for (const p of live) {
+          runtimesRef.current.set(p.pairingId, {
+            pairing: p, transport: null, statusNow: 'closed', unsubs: [], gen: 1, validUserId: p.userId,
+          });
+        }
+        refreshViews();
+        // R3-8: must complete before wiring so the boot drain() (triggered by
+        // the first 'open' status event) can't miss rows stranded in
+        // 'sending' by a crash/reload in a previous session. Via sweepLeases
+        // (#R5-4) so a skipped still-leased foreign row gets re-checked when
+        // its lease lapses instead of stranding forever.
+        await sweepLeases();
+        // R4-10: re-check after the await above — if the provider unmounted
+        // while the sweep was in flight, the cleanup below already ran and
+        // will never run again; wiring and connecting transports here would
+        // leak them forever. #R6-4: the per-runtime existence check below
+        // catches what `cancelled` cannot — a cross-tab identity-wiped for a
+        // pairing landing during that await on a still-mounted provider.
+        if (cancelled || bootGenRef.current !== bootGen) return;
+        for (const p of live) {
+          const rt = runtimesRef.current.get(p.pairingId);
+          if (rt !== undefined && rt.pairing === p) {
+            const make = registry[p.transportKind];
+            // #A3: this default boot path DIALS the transport from the stored
+            // url, so it needs one — and a factory registered for the
+            // pairing's kind. No url or unknown kind ⇒ listed but offline.
+            if (!make || !p.url) continue;
+            const transport = make({ url: p.url, session: p.sessionToken, device: 'raccoon-app' });
+            wirePairing(rt, transport);
+            void transport.connect().catch(() => { /* per-pairing reconnect loop handles it */ });
+          }
+          // else: torn down during the sweep await (#R6-4) — do not resurrect.
+        }
+        if (runtimesRef.current.size === 0) { setPhase('setup'); return; }
+        setPhase('ready');
       });
     }).catch((err) => {
-      // #F6: the storage probe or the session load rejected (blocked/failed IDB
-      // open). Enter the retryable 'storage-error' state — never a permanent
-      // 'loading' spinner, and never 'setup' (whose pairing could not be saved).
+      // #F6: the storage probe or the pairings load rejected (blocked/failed
+      // IDB open). Enter the retryable 'storage-error' state — never a
+      // permanent 'loading' spinner, and never 'setup' (whose pairing could
+      // not be saved).
       if (cancelled) return;
       console.error('[raccoon] storage unavailable at boot:', err);
-      // #F6(r3): the failure may have landed AFTER the loaded-session refs were
-      // installed (e.g. a throw in sweepLeases/wireTransport). Clear the
-      // in-memory identity so the storage-error screen — and a later retry →
-      // setup — never carries a stale, unusable identity.
-      sessionGenRef.current += 1;
-      sessionRef.current = null;
-      validUserIdRef.current = null;
-      identityScopeRef.current = null;
-      void transportRef.current?.close();
-      transportRef.current = null;
-      setSession(null);
+      // #F6(r3): the failure may have landed AFTER runtimes were installed
+      // (e.g. a throw in sweepLeases/wirePairing). Clear the in-memory
+      // identities so the storage-error screen — and a later retry → setup —
+      // never carries a stale, unusable pairing.
+      bootGenRef.current += 1;
+      for (const rt of runtimesRef.current.values()) {
+        rt.gen += 1;
+        rt.validUserId = null;
+      }
+      teardownRuntimes();
+      refreshViews();
       setActiveChannel(null);
       dispatch({ type: 'reset' });
       setAuthError('Local storage is unavailable on this device. Retry once it’s available.');
@@ -1065,50 +1189,65 @@ export function TransportProvider(props: TransportProviderProps) {
     });
     return () => {
       cancelled = true;
+      bootGenRef.current += 1;
       bcRef.current?.close();
       bcRef.current = null;
       stopSweepCoordination();
-      // Finding 1: clean up all subscriptions on unmount
-      for (const unsub of unsubsRef.current) unsub();
-      unsubsRef.current = [];
-      // Finding 1: clear all pending ack timers on unmount
-      for (const timer of ackTimers.current.values()) clearTimeout(timer);
-      ackTimers.current.clear();
-      void transportRef.current?.close();
-      transportRef.current = null;
+      teardownRuntimes();
+      clearTimers();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const pairWithPayload = useCallback(async (json: string) => {
+    // In override mode the HOST owns identity — the provider must not start
+    // writing IDB pairings under it.
+    if (props.transportOverride) {
+      setAuthError('Pairing is managed by the host application.');
+      return;
+    }
     const payload = parsePairingPayload(json);
     setAuthError(null);
+    // The payload's transport kind selects the factory. 'ws' is built in;
+    // other kinds come from the host's `transports` registry prop.
+    const kind = payload.transport ?? 'ws';
+    const make = registry[kind];
+    if (!make) {
+      setAuthError('No transport is available for this platform type.');
+      return;
+    }
     // #P1-B: DURABLE client adoption BEFORE the server confirms. onAdoptGrant is
     // called by the transport on the pair.grant and AWAITED before it sends
     // pair.confirm — the save (durable IDB commit) therefore happens BEFORE the
     // server promotes the session. If the save throws, the transport aborts the
     // confirm (the provisional server session TTL-reaps), so we never end up
     // with a valid server session and no durable client copy, and 'ready' is
-    // unreachable without that commit. The session is stashed for the ready path.
-    let adoptedSession: Session | null = null;
-    const transport = makeTransport({
+    // unreachable without that commit. The stored pairing is stashed for the
+    // ready path.
+    let adopted: PairedSession | null = null;
+    const transport = make({
       url: payload.instanceUrl,
       pairingToken: payload.token,
       device: 'raccoon-app',
       onAdoptGrant: async (g) => {
-        const s: Session = {
+        const candidate: PairedSession = {
           url: payload.instanceUrl,
           sessionToken: g.payload.sessionToken,
           userId: g.payload.userId,
           instance: g.payload.instance,
           channels: g.payload.channels,
           vapidPublicKey: g.payload.vapidPublicKey,
-          // #R7-3: fresh NON-SECRET epoch so a re-pair is distinguishable from a
-          // prior session (identityKey uses it, not the secret token).
+          // #R7-3: fresh NON-SECRET epoch so a re-pair is distinguishable from
+          // a prior pairing (the wipe broadcasts use it, never the token).
           epoch: crypto.randomUUID(),
+          pairingId: ulid(),
+          transportKind: kind,
         };
-        await saveSession(s); // throws => transport does NOT confirm; pairing fails safely
-        adoptedSession = s;
+        // upsertPairing dup-guards on (url, userId): a re-scan of the same
+        // instance as the same user REFRESHES the stored entry in place and
+        // returns it with the PRIOR pairingId — all scoped state (history
+        // keys, outbox rows, approvals) stays attached to it.
+        adopted = await upsertPairing(candidate); // throws => transport does NOT confirm; pairing fails safely
       },
     });
     // #A2: interactive pairing requires the transport to support pair.grant. A
@@ -1118,11 +1257,38 @@ export function TransportProvider(props: TransportProviderProps) {
       setAuthError('This transport does not support interactive pairing.');
       return;
     }
-    // Resolves once the hub ACKs (onGrant fires on pair.confirmed OR on a
-    // recovery-resume). By then the session was already durably saved in
-    // onAdoptGrant, so we hand back THAT persisted session.
-    const paired = new Promise<Session>((resolve) => {
-      transport.onGrant!(() => { if (adoptedSession) resolve(adoptedSession); });
+    // Resolves once the server ACKs (onGrant fires on pair.confirmed OR on a
+    // recovery-resume). By then the pairing was already durably saved in
+    // onAdoptGrant, so we hand back THAT persisted entry. The runtime is
+    // installed SYNCHRONOUSLY inside the grant callback — before the
+    // transport emits its post-grant 'open' status — so the freshly wired
+    // onStatus handler catches that emission and runs the open catch-up.
+    const paired = new Promise<PairedSession>((resolve) => {
+      transport.onGrant!(() => {
+        const stored = adopted;
+        if (!stored) return;
+        const prior = runtimesRef.current.get(stored.pairingId);
+        if (prior?.transport === transport) { resolve(stored); return; } // recovery re-grant: already installed
+        if (prior) {
+          // A refreshed pairing (same url+userId re-scanned): tear down its
+          // old transport first, with the synchronous-kill discipline (R4-3),
+          // so nothing keeps sending through the superseded connection.
+          prior.gen += 1;
+          prior.validUserId = null;
+          for (const u of prior.unsubs) u();
+          prior.unsubs = [];
+          void prior.transport?.close();
+          prior.transport = null;
+        }
+        const rt: PairingRuntime = {
+          pairing: stored, transport: null, statusNow: 'closed', unsubs: [],
+          gen: (prior?.gen ?? 0) + 1, validUserId: stored.userId,
+        };
+        runtimesRef.current.set(stored.pairingId, rt);
+        wirePairing(rt, transport);
+        refreshViews();
+        resolve(stored);
+      });
     });
     // Fail fast on a terminal auth rejection (bad/expired token) instead of
     // waiting out the recovery grace below. The .catch keeps a post-pairing
@@ -1133,18 +1299,15 @@ export function TransportProvider(props: TransportProviderProps) {
       transport.onAuthError((code) => { sawAuthError = true; reject(new Error(`pairing rejected (code ${code})`)); });
     });
     authFailed.catch(() => { /* handled via the race / swallowed post-pair */ });
-    // Finding 3: wire the transport BEFORE connect so the initial 'open' status
-    // emission during connect() is captured rather than missed.
-    wireTransport(transport);
     // #R10: connect() can REJECT on a lost pair.confirmed even though the
     // transport recovers in the background and RE-EMITS the grant. So do NOT let
     // a connect() rejection abort pairing — wait for `paired` (initial OR
     // recovered) or a terminal auth error. Only if connect() failed AND no
     // grant/auth-error arrives within the recovery window is the pairing dead.
     const connected = await transport.connect().then(() => true, () => false);
-    let next: Session;
+    let stored: PairedSession;
     try {
-      next = connected
+      stored = connected
         ? await Promise.race([paired, authFailed])
         : await Promise.race([
             paired,
@@ -1159,45 +1322,50 @@ export function TransportProvider(props: TransportProviderProps) {
       void transport.close();
       return;
     }
-    // `next` is ALREADY durably persisted (onAdoptGrant). Go ready — there is no
-    // unawaited save here: the durable commit strictly preceded confirmation.
-    // Set the ref synchronously (see loadSession's matching comment) and bump
-    // sessionGenRef (a real identity transition).
-    sessionGenRef.current += 1;
-    const nextSession = withEpoch(next); // already carries a non-secret epoch; passthrough
-    sessionRef.current = nextSession;
-    validUserIdRef.current = nextSession.userId;
-    identityScopeRef.current = identityKey(nextSession);
-    setSession(nextSession);
+    // `stored` is ALREADY durably persisted (onAdoptGrant) and its runtime
+    // installed by the grant callback. If the transport's 'open' status fired
+    // BEFORE the grant installed the runtime (wire-after-grant), sync the
+    // mirror and run the open catch-up now.
+    const rt = runtimesRef.current.get(stored.pairingId);
+    if (rt && rt.transport === transport && rt.statusNow !== 'open') {
+      rt.statusNow = 'open';
+      refreshViews();
+      catchUpOnOpen(rt);
+    }
+    // Go ready WITHOUT touching the other runtimes — pairing appends.
     setPhase('ready');
-  }, [makeTransport, wireTransport]);
+  }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen]);
 
-  const sendEnvelope = useCallback((env: AnyEnvelope) => {
-    // Enqueue to IDB first.  Once the write commits, if the transport is already
-    // open we call drain() rather than attempting this specific entry directly.
-    // Drain serialises attempts (one at a time, in order) so there is no risk of
-    // a concurrent drain + direct-attempt double-send.  The extra drain() call
-    // is cheap when the outbox is empty or the entry was already picked up by a
-    // concurrent drain triggered by the 'open' status event.
+  const sendEnvelope = useCallback((pairingId: string, env: AnyEnvelope) => {
+    // Enqueue to IDB first.  Once the write commits, if this pairing's
+    // transport is already open we call drain() rather than attempting this
+    // specific entry directly. Drain serialises attempts (one at a time, in
+    // order) so there is no risk of a concurrent drain + direct-attempt
+    // double-send.  The extra drain() call is cheap when the outbox is empty
+    // or the entry was already picked up by a concurrent drain triggered by
+    // the 'open' status event.
     //
-    // We read statusNowRef — updated synchronously as the FIRST line of the
-    // onStatus handler — instead of statusRef (React state), which may not have
-    // been committed to the ref yet when this .then() runs.  This closes the
-    // race where: the 'open' event fires → drain() runs before the enqueue IDB
-    // tx has committed (entry not listed) → enqueue tx commits → .then fires
-    // but sees stale 'closed' in statusRef → entry is orphaned until the next
+    // We read the runtime's statusNow — updated synchronously as the FIRST
+    // line of the onStatus handler — so this .then() sees the actual current
+    // status without waiting for a React render commit.  This closes the
+    // race where: the 'open' event fires → drain() runs before the enqueue
+    // IDB tx has committed (entry not listed) → enqueue tx commits → .then
+    // fires but sees a stale 'closed' → entry is orphaned until the next
     // reconnect.
     //
-    // R4-3: capture the session generation now; if a wipe/unpair bumps it
-    // before this enqueue's IDB write commits, the row was written under an
-    // identity that is being (or has been) torn down — settle it away
-    // instead of ever letting drain() see it as pending, so it can never be
-    // sent through a different session's transport.
-    const gen = sessionGenRef.current;
-    const scope = identityScopeRef.current;
-    if (!scope) return; // no identity: sendMessage/respondApproval already gate, this is belt-and-braces
-    void outbox.enqueue(env, scope).then(() => {
-      if (sessionGenRef.current !== gen) { void outbox.settle(env.id); return; }
+    // R4-3, per pairing: capture this PAIRING's generation now; if a
+    // wipe/unpair of THIS pairing bumps it before the enqueue's IDB write
+    // commits, the row was written under an identity that is being (or has
+    // been) torn down — settle it away instead of ever letting drain() see
+    // it as pending, so it can never be sent through a different session's
+    // transport. Wiping pairing B can never drop pairing A's in-flight
+    // enqueue: the fences are independent.
+    const rt = runtimesRef.current.get(pairingId);
+    if (!rt || rt.validUserId === null) return; // no identity: callers already gate, this is belt-and-braces
+    const gen = rt.gen;
+    void outbox.enqueue(env, pairingId).then(() => {
+      const now = runtimesRef.current.get(pairingId);
+      if (!now || now.gen !== gen) { void outbox.settle(env.id); return; } // R4-3, per pairing
       if (env.kind === 'msg' && env.payload.attachments?.length) {
         // LEASE, not permanent: keeps the bytes alive for the outbox's retry
         // window (renewable); the SERVER performs the permanent reference
@@ -1209,73 +1377,88 @@ export function TransportProvider(props: TransportProviderProps) {
         // before every delivery attempt (see attempt()).
         void leaseUploads(env.payload.attachments.map((a) => a.url), env.id, uploadProviderRef.current);
       }
-      if (statusNowRef.current === 'open') void drain();
+      if (now.statusNow === 'open') void drain(pairingId);
     });
   }, [drain]);
 
-  const sendMessage = useCallback((channel: string, text: string, attachments?: Attachment[]) => {
-    // R4-3: validUserIdRef, not sessionRef — see its declaration comment.
-    // Nulled synchronously the instant a wipe/unpair decision is made, so a
-    // send attempt from that point onward is rejected outright.
-    const userId = validUserIdRef.current;
+  const sendMessage = useCallback((key: ConvKey, text: string, attachments?: Attachment[]) => {
+    const r = resolveConvKey(key, runtimesRef.current.keys());
+    if (!r) return;
+    const rt = runtimesRef.current.get(r.pairingId);
+    // R4-3: validUserId, not the stored pairing snapshot — nulled
+    // synchronously the instant a wipe/unpair decision is made for THIS
+    // pairing, so a send attempt from that point onward is rejected outright.
+    const userId = rt?.validUserId;
     if (!userId) return;
+    // The wire never carries a pairingId: the envelope gets the BARE channel.
     const env = createEnvelope('msg', {
-      from: userAddress(userId), to: agentAddress(channel), channel,
+      from: userAddress(userId), to: agentAddress(r.channel), channel: r.channel,
       payload: { text, ...(attachments?.length ? { attachments } : {}) },
     });
     dispatch({
       type: 'optimistic',
       msg: {
-        id: env.id, channel, role: 'user', sender: 'you', kind: 'text', text, ts: env.ts, delivery: 'pending',
+        id: env.id, channel: key, role: 'user', sender: 'you', kind: 'text', text, ts: env.ts, delivery: 'pending',
         ...(attachments?.length ? { attachments } : {}),
       },
     });
-    sendEnvelope(env);
+    sendEnvelope(r.pairingId, env);
   }, [sendEnvelope]);
 
-  const respondApproval = useCallback((channel: string, refId: string, choice: string, editedText?: string) => {
+  const respondApproval = useCallback((key: ConvKey, refId: string, choice: string, editedText?: string) => {
+    const r = resolveConvKey(key, runtimesRef.current.keys());
+    if (!r) return;
+    const rt = runtimesRef.current.get(r.pairingId);
     // R4-3: see sendMessage's matching comment.
-    const userId = validUserIdRef.current;
+    const userId = rt?.validUserId;
     if (!userId) return;
     const env = createEnvelope('approval.response', {
-      from: userAddress(userId), to: agentAddress(channel), channel,
+      from: userAddress(userId), to: agentAddress(r.channel), channel: r.channel,
       payload: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
     });
-    dispatch({ type: 'responded', convKey: channel, refId, choice, responseId: env.id, ...(editedText !== undefined ? { editedText } : {}) });
-    sendEnvelope(env);
+    dispatch({ type: 'responded', convKey: key, refId, choice, responseId: env.id, ...(editedText !== undefined ? { editedText } : {}) });
+    sendEnvelope(r.pairingId, env);
   }, [sendEnvelope]);
 
-  const openChannel = useCallback((channel: string | null) => {
-    // R2-10: validate membership against the CURRENT session's channel list.
-    // Without this, a stale `?c=<channel>` URL param (ChatScreen reads it on
-    // mount/popstate) could reopen a channel left over from a PRIOR user's
-    // session after a fresh pairing on the same device/browser tab.
-    // NOTE for host embeddings (transportOverride/sessionOverride): this makes
-    // openChannel a silent no-op for any channel not in sessionOverride.channels.
-    // Populate that list before the user can call openChannel, or every open
-    // call will be silently dropped.
-    if (channel && sessionRef.current && !sessionRef.current.channels.includes(channel)) return;
-    setActiveChannel(channel);
-    if (!channel) return;
-    dispatch({ type: 'read-channel', convKey: channel });
-    void kvSet(`lastread:${channel}`, new Date().toISOString());
-    // Finding 2: only request history when the transport is open; if closed, the
-    // onStatus handler will catch up when the transport reconnects.
-    if (!stateRef.current.historyLoaded[channel] && statusNowRef.current === 'open') requestHistory(channel);
+  const openChannel = useCallback((key: ConvKey | null) => {
+    if (key) {
+      const r = resolveConvKey(key, runtimesRef.current.keys());
+      // R2-10, per pairing: validate membership against that pairing's channel
+      // list. A stale `?c=` URL param (ChatScreen reads it on mount/popstate)
+      // naming an unknown pairing, or a channel outside that pairing's list,
+      // is a no-op — it cannot reopen a conversation left over from a PRIOR
+      // pairing on the same device/browser tab.
+      // NOTE for host embeddings (transportOverride/sessionOverride): this
+      // makes openChannel a silent no-op for any conversation outside
+      // sessionOverride.channels. Populate that list before the user can call
+      // openChannel, or every open call will be silently dropped.
+      if (!r || !runtimesRef.current.get(r.pairingId)!.pairing.channels.includes(r.channel)) return;
+    }
+    setActiveChannel(key);
+    if (!key) return;
+    dispatch({ type: 'read-channel', convKey: key });
+    void kvSet(`lastread:${key}`, new Date().toISOString());
+    // Only request history when this pairing's transport is open; if closed,
+    // the onStatus handler catches up when it reconnects.
+    const r = resolveConvKey(key, runtimesRef.current.keys())!;
+    const rt = runtimesRef.current.get(r.pairingId)!;
+    if (!stateRef.current.historyLoaded[key] && rt.statusNow === 'open') requestHistory(r.pairingId, r.channel);
   }, [requestHistory]);
 
-  const loadOlder = useCallback((channel: string) => {
-    const before = stateRef.current.nextBefore[channel];
-    if (before) requestHistory(channel, before);
+  const loadOlder = useCallback((key: ConvKey) => {
+    const before = stateRef.current.nextBefore[key];
+    if (!before) return;
+    const r = resolveConvKey(key, runtimesRef.current.keys());
+    if (r) requestHistory(r.pairingId, r.channel, before);
   }, [requestHistory]);
 
-  const retryMessage = useCallback((channel: string, id: string) => {
+  const retryMessage = useCallback((key: ConvKey, id: string) => {
     void outbox.retry(id).then(async (applied) => {
       // #R6-7: retry() is a failed-only CAS — if the row is gone or another
       // tab holds a live claim on it, do nothing (no phantom 'pending' UI,
       // no drain that could double-send).
       if (!applied) return;
-      dispatch({ type: 'delivery', convKey: channel, id, delivery: 'pending' });
+      dispatch({ type: 'delivery', convKey: key, id, delivery: 'pending' });
       await drain();
     });
   }, [drain]);
@@ -1295,33 +1478,40 @@ export function TransportProvider(props: TransportProviderProps) {
       if (ok) await kvSet('push-enabled', true);
       return ok;
     }
-    const current = sessionRef.current;
-    const transport = transportRef.current;
-    if (!current?.vapidPublicKey || !transport) return false;
+    // Built-in VAPID flow: register against the first pairing that advertises
+    // a key and has a live transport. (Per-pairing push routing is Task 7.)
+    const rt = [...runtimesRef.current.values()].find((r) => r.pairing.vapidPublicKey && r.transport);
+    if (!rt || !rt.transport) return false;
     const env = browserPushEnv();
     if (!env) return false;
+    const transport = rt.transport;
     const ok = await enablePushFlow({
       env,
-      vapidPublicKey: current.vapidPublicKey,
-      userId: current.userId,
+      vapidPublicKey: rt.pairing.vapidPublicKey!,
+      userId: rt.pairing.userId,
       send: (e) => transport.send(e),
     });
     if (ok) await kvSet('push-enabled', true);
     return ok;
   }, [props.pushRegistrarOverride]);
 
-  const unpair = useCallback(async () => {
-    // R4-3: bump FIRST, synchronously, before any await — see sessionGenRef's
-    // declaration comment. Any sendEnvelope() call whose enqueue() commits
-    // after this point (no matter how the wipe's own async work interleaves)
-    // observes the new generation and drops its row instead of leaving it to
-    // be picked up by a later drain() under a different identity.
-    sessionGenRef.current += 1;
-    const myGen = sessionGenRef.current;
-    // R5-3/#R6-8: tell every OTHER open tab this exact identity is gone —
-    // see the auth-error handler's matching comment.
-    const wiped = sessionRef.current;
-    if (wiped) bcRef.current?.postMessage({ type: 'identity-wiped', key: identityKey(wiped) });
+  const unpair = useCallback(async (pairingId: string) => {
+    // Per-pairing unpair — the other pairings keep running. (Interim
+    // implementation; Task 6 hardens ordering/timeout behavior.)
+    const rt = runtimesRef.current.get(pairingId);
+    if (!rt) return;
+    // R4-3: bump FIRST, synchronously, before any await — see the
+    // PairingRuntime.gen comment. Any sendEnvelope() call whose enqueue()
+    // commits after this point (no matter how the wipe's own async work
+    // interleaves) observes the new generation and drops its row instead of
+    // leaving it to be picked up by a later drain() under a different
+    // identity.
+    rt.gen += 1;
+    const myGen = rt.gen;
+    const wiped = rt.pairing;
+    // R5-3/#R6-8: tell every OTHER open tab this exact pairing identity is
+    // gone — see the auth-error handler's matching comment.
+    bcRef.current?.postMessage({ type: 'identity-wiped', pairingId, epoch: wiped.epoch });
     // Tear down THIS device's push registration before closing the transport
     // (still need the connection + userId for the server-side unsubscribe).
     // Without this, only local app state was ever wiped: the server-side
@@ -1330,28 +1520,27 @@ export function TransportProvider(props: TransportProviderProps) {
     // notifications (message bodies included) after pairing as someone else,
     // until the next 404/410-based prune (or indefinitely, if that never
     // happened). Best-effort: unpair proceeds regardless of outcome.
+    // (Per-pairing push bookkeeping is Task 7 — this is the current-behavior
+    // equivalent scoped to this pairing's transport.)
     //
-    // Captured into locals BEFORE nulling validUserIdRef below — every
-    // further use in this function reads these locals, never the ref, so
+    // Captured into locals BEFORE nulling validUserId below — every further
+    // use in this function reads these locals, never the runtime field, so
     // nulling it immediately (rather than only at the very end) closes the
     // window where a concurrent sendMessage()/respondApproval() call would
-    // still see this (now-terminating) identity as valid.
-    const userId = sessionRef.current?.userId;
-    const transport = transportRef.current;
-    validUserIdRef.current = null;
-    identityScopeRef.current = null;
-    // #P1-F3: invalidate the DURABLE session FIRST — before the un-timeout-
+    // still see this (now-terminating) pairing identity as valid.
+    const userId = wiped.userId;
+    const transport = rt.transport;
+    rt.validUserId = null;
+    // #P1-F3: invalidate the DURABLE pairing FIRST — before the un-timeout-
     // bounded push-disable / transport-close awaits below. Previously the only
-    // durable clear was clearSessionIfMatches inside wipeAndReset() at the very
-    // end, so a hung host push disable() (or the user closing the tab) during
-    // those awaits left the session row in IDB and the "unpaired" device
-    // silently reconnected on next boot. Compare-and-clear (only if it still
-    // matches the wiped identity) so a concurrent re-pair's newer session is
-    // not erased; wipeAndReset's own clearSessionIfMatches then no-ops.
-    const wipedScope = wiped ? identityKey(wiped) : null;
-    if (wipedScope) await clearSessionIfMatches(wipedScope, (s) => identityKey(withEpoch(s))).catch(() => { /* best-effort; wipeAndReset re-runs it (now always reached — see the bounded awaits below) */ });
+    // durable clear sat at the very end, so a hung host push disable() (or the
+    // user closing the tab) during those awaits left the pairing row in IDB
+    // and the "unpaired" device silently reconnected on next boot.
+    // Compare-and-remove (epoch-gated) so a concurrent re-pair's newer entry
+    // is not erased; wipePairingDurable's own removal then no-ops.
+    await removePairingIfMatches(pairingId, wiped.epoch).catch(() => { /* best-effort; wipePairingDurable re-runs it (now always reached — see the bounded awaits below) */ });
     // #P1-F3 (adv): bound each best-effort cleanup so a hung host disable() /
-    // server unsubscribe cannot prevent wipeAndReset() from running its durable
+    // server unsubscribe cannot prevent the durable wipe from running its
     // clear retry. The cleanup keeps running detached; we just stop waiting.
     if (props.pushRegistrarOverride) {
       await settleWithinCall(() => props.pushRegistrarOverride!.disable?.(), UNPAIR_CLEANUP_TIMEOUT_MS);
@@ -1361,29 +1550,46 @@ export function TransportProvider(props: TransportProviderProps) {
         await settleWithinCall(() => unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
       }
     }
-
     // Detach status/envelope listeners BEFORE closing, so this deliberate close
     // never fires our onStatus('closed') handler and never schedules a
-    // demoteSending() call in the first place (defense in depth on top of the
-    // clearAll()/demoteSending() serialization in wipeAndReset()).
-    for (const unsub of unsubsRef.current) unsub();
-    unsubsRef.current = [];
-    await settleWithinCall(() => transportRef.current?.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
-    transportRef.current = null;
-    await wipeAndReset(wiped);
+    // releaseOwnedSending() call in the first place (defense in depth on top
+    // of the clearScope()/release serialization in the outbox module).
+    for (const u of rt.unsubs) u();
+    rt.unsubs = [];
+    if (rt.transport && rt.transport !== props.transportOverride) {
+      await settleWithinCall(() => rt.transport?.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
+    }
+    rt.transport = null;
+    await wipePairingDurable(pairingId, wiped.epoch);
     // Guarded the same way as the auth-error path: skip if a newer wipe or a
-    // newer successful pairing has already superseded this one.
-    if (sessionGenRef.current !== myGen) return;
-    setSession(null);
-    setActiveChannel(null);
-    setPhase('setup');
-  }, [wipeAndReset, props.pushRegistrarOverride]);
+    // newer successful re-pair has already superseded this one (R4-3).
+    if (runtimesRef.current.get(pairingId) !== rt || rt.gen !== myGen) return;
+    runtimesRef.current.delete(pairingId);
+    refreshViews();
+    if (activeRef.current && resolveConvKey(activeRef.current, [pairingId])) setActiveChannel(null);
+    setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
+  }, [wipePairingDurable, refreshViews, props.pushRegistrarOverride, props.transportOverride]);
 
-  const canEnablePush = !!session?.vapidPublicKey || !!props.pushRegistrarOverride;
+  const renamePairing = useCallback(async (pairingId: string, displayName: string) => {
+    // updatePairingMeta validates before write and treats an empty value as
+    // "clear the local override" — see lib/session.ts.
+    const list = await updatePairingMeta(pairingId, { displayName });
+    const rt = runtimesRef.current.get(pairingId);
+    const updated = list.find((p) => p.pairingId === pairingId);
+    if (rt && updated) {
+      rt.pairing = updated;
+      refreshViews();
+    }
+  }, [refreshViews]);
+
+  // Push availability: a host registrar, or a VAPID key on ANY pairing. Reads
+  // the runtimes map keyed off `views`, which updates in lockstep with it.
+  const canEnablePush = !!props.pushRegistrarOverride
+    || views.some((v) => !!runtimesRef.current.get(v.pairingId)?.pairing.vapidPublicKey);
 
   const retryStorage = useCallback(async () => {
     // #F6: re-probe durable storage from the storage-error state. On success,
-    // enable pairing (setup); a prior stored session is not auto-restored — the
+    // enable pairing (setup); prior stored pairings are not auto-restored — the
     // user re-pairs, which #P1-B persists durably (or fails safely). On failure,
     // stay in storage-error with an updated message.
     const writable = await probeStorageWritable();
@@ -1392,18 +1598,18 @@ export function TransportProvider(props: TransportProviderProps) {
   }, []);
 
   const api = useMemo<ChatApi>(() => ({
-    phase, status, session, state, activeChannel, authError,
-    pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, uploadProvider, unpair,
+    phase, pairings: views, state, activeChannel, authError,
+    pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing,
     // sendMessage, respondApproval, retryMessage are only wired once the
-    // session is loaded and the transport is connected (phase === 'ready').
+    // pairings are loaded and the transports are connected (phase === 'ready').
     // Before ready they are undefined at runtime (the `as` cast is intentional —
     // callers that need to guard can check phase === 'ready' or use ?.() syntax,
     // and tests can rely on waitFor(() => expect(chat.sendMessage).toBeDefined())
-    // to block until the session is available).
+    // to block until the pairings are available).
     sendMessage: (phase === 'ready' ? sendMessage : undefined) as ChatApi['sendMessage'],
     respondApproval: (phase === 'ready' ? respondApproval : undefined) as ChatApi['respondApproval'],
     retryMessage: (phase === 'ready' ? retryMessage : undefined) as ChatApi['retryMessage'],
-  }), [phase, status, session, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair]);
+  }), [phase, views, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing]);
 
   return <ChatContext.Provider value={api}>{props.children}</ChatContext.Provider>;
 }

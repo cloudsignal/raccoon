@@ -443,13 +443,18 @@ export async function recoverProcessing(scope: string | null): Promise<void> {
  * two (the old demoteSending) let a stale expiry-sweep timer, calling with
  * this tab's id, unconditionally reclaim a NEWER live claim this tab had made
  * since — requeuing and thus duplicating an active send.
+ *
+ * With `scope`, releases only that pairing's rows — a single pairing's
+ * transport closing must not requeue another pairing's actively-in-flight row
+ * (which would double-send it when its own drain retries).
  */
-export async function releaseOwnedSending(myTabId: string): Promise<void> {
+export async function releaseOwnedSending(myTabId: string, scope?: string): Promise<void> {
   const touched = await withTransaction('outbox', 'readwrite', async (s) => {
     const all = await promisifyRequest(s.getAll() as IDBRequest<OutboxEntry[]>);
     const channels: string[] = [];
     for (const entry of all) {
       if (entry.status !== 'sending' || entry.ownerId !== myTabId) continue;
+      if (scope !== undefined && entry.scope !== scope) continue;
       await promisifyRequest(s.put({ ...entry, status: 'pending', ownerId: undefined, claimToken: undefined, leaseExpiresAt: undefined }));
       channels.push(entry.channel);
     }

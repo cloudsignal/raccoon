@@ -7,12 +7,15 @@ import type { Attachment, Envelope } from '@raccoon/protocol';
 import { closeDbForTests } from '../lib/idb.js';
 import { isUpdateHeld } from '../lib/update-hold.js';
 import * as outbox from '../lib/outbox.js';
-import { saveSession } from '../lib/session.js';
+import { savePairings } from '../lib/session.js';
 import { deleteUpload, leaseUploads, MAX_FILE_BYTES, uploadFile } from '../lib/uploads.js';
 import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider } from '../transport/context.js';
 import { Composer } from './composer.js';
 import { Thread } from './thread.js';
+
+const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const CK = `${P1}/coordinator`;
 
 // Network-touching functions are mocked (opts-object signature preserved);
 // validateFiles / MAX_* stay REAL — the admission logic is under test.
@@ -54,11 +57,11 @@ afterEach(async () => {
 
 async function mount(opts: { thread?: boolean } = {}) {
   const transport = new FakeTransport();
-  await saveSession({ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'] });
+  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
-      {opts.thread ? <Thread channel="coordinator" /> : null}
-      <Composer channel="coordinator" />
+      {opts.thread ? <Thread channel={CK} /> : null}
+      <Composer channel={CK} />
     </TransportProvider>,
   );
   await waitFor(() => expect(transport.connected).toBe(true));

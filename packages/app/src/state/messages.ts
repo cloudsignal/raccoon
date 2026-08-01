@@ -88,6 +88,11 @@ export type ChatAction =
   // may carry in-memory response state on a reconnect).
   | { type: 'reconcile-approvals'; convKey: ConvKey; approvals: Envelope<'approval.request'>[] }
   | { type: 'read-channel'; convKey: ConvKey }
+  // Per-pairing wipe (unpair / auth error / cross-tab wipe): drops every record
+  // entry whose ConvKey belongs to `pairingId`. A global 'reset' would wipe the
+  // OTHER pairings' live conversations too — this removes exactly one pairing's
+  // slice of the state.
+  | { type: 'drop-pairing'; pairingId: string }
   | { type: 'reset' };
 
 // 'failed' (#R6-2): the server received the envelope but the turn it drives
@@ -330,5 +335,22 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
     case 'read-channel':
       return { ...state, unread: { ...state.unread, [action.convKey]: 0 } };
+    case 'drop-pairing': {
+      const prefix = `${action.pairingId}/`;
+      const strip = <T,>(rec: Record<ConvKey, T>): Record<ConvKey, T> => {
+        const next: Record<ConvKey, T> = {};
+        for (const k of Object.keys(rec)) {
+          if (!k.startsWith(prefix)) next[k] = rec[k]!;
+        }
+        return next;
+      };
+      return {
+        messages: strip(state.messages),
+        typing: strip(state.typing),
+        unread: strip(state.unread),
+        nextBefore: strip(state.nextBefore),
+        historyLoaded: strip(state.historyLoaded),
+      };
+    }
   }
 }

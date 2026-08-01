@@ -2,7 +2,7 @@ import { useChat } from '../transport/context.js';
 import { RACCOON_BUILD_ID } from '../build-id.js';
 
 export function SettingsSheet(props: { open: boolean; onClose: () => void }) {
-  const { session, unpair } = useChat();
+  const { pairings, unpair } = useChat();
   if (!props.open) return null;
   return (
     <div className="fixed inset-0 z-10 flex items-end justify-center bg-ink/40 md:items-center" onClick={props.onClose}>
@@ -12,12 +12,14 @@ export function SettingsSheet(props: { open: boolean; onClose: () => void }) {
       >
         <h2 className="text-base font-semibold text-ink">Settings</h2>
         <p className="mt-1 text-sm text-ink-faint">
-          Paired as {session?.userId} on {session?.instance}
+          Paired as {pairings.map((p) => `${p.userId} on ${p.instance}`).join(', ')}
         </p>
         <div id="settings-extra" className="mt-4" />
+        {/* The full per-pairing Platforms UI lands in Task 10; until then the
+            button unpairs the first pairing. */}
         <button
           type="button"
-          onClick={() => void unpair()}
+          onClick={() => { if (pairings[0]) void unpair(pairings[0].pairingId); }}
           className="mt-4 h-11 w-full rounded-[10px] border border-line text-sm font-medium text-ink"
         >
           Unpair this device
