@@ -269,6 +269,18 @@ export async function wipeKvExceptSession(): Promise<void> {
   });
 }
 
+/** Delete every kv key that starts with `prefix`, in ONE transaction (a
+ *  per-pairing wipe must not interleave with a concurrent re-pair's writes).
+ *  Used by per-pairing unpair to clear `lastread:${pairingId}/…` markers. */
+export async function wipeKvByPrefix(prefix: string): Promise<void> {
+  await withTransaction('kv', 'readwrite', async (s) => {
+    const keys = await promisifyRequest(s.getAllKeys() as IDBRequest<IDBValidKey[]>);
+    for (const k of keys) {
+      if (typeof k === 'string' && k.startsWith(prefix)) await promisifyRequest(s.delete(k));
+    }
+  });
+}
+
 /**
  * Wipe the `kv` store (session, read markers, push-enabled flag). Used on
  * unpair / terminal auth-error so that pairing the device as a different user
