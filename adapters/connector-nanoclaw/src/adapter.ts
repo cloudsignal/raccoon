@@ -62,12 +62,30 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
   }
 
   async function flushPendingCards(userId: string): Promise<void> {
+    // Capture the endpoint once: teardown() nulls the closure variable
+    // synchronously, and a flush parked on an await must not re-read it and
+    // dereference null on the next iteration (the call site is void'd, so
+    // that TypeError would surface as an unhandled rejection).
+    const ep = endpoint;
     const queue = pendingCards.get(userId);
-    if (!queue || queue.length === 0 || !endpoint) return;
+    if (!queue || queue.length === 0 || !ep) return;
     pendingCards.delete(userId);
-    for (const env of queue) {
-      const live = await endpoint.sendAgentEnvelope(userId, env);
-      if (!live) bufferCard(userId, env); // still offline — keep it
+    try {
+      for (const env of queue) {
+        const live = await ep.sendAgentEnvelope(userId, env);
+        if (!live) {
+          // Torn down mid-flush: teardown already cleared pendingCards —
+          // re-buffering would resurrect the map. Drop with a log instead.
+          if (endpoint !== ep) {
+            console.error(`raccoon: dropping buffered card ${env.id} for ${userId} — adapter torn down mid-flush`);
+            continue;
+          }
+          bufferCard(userId, env); // still offline — keep it
+        }
+      }
+    } catch (err) {
+      // Never let a flush rejection escape the void'd call site unhandled.
+      console.error(`raccoon: pending-card flush failed for ${userId}:`, err);
     }
   }
 
@@ -153,7 +171,13 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
     isConnected: () => connected,
 
     async deliver(platformId, _threadId, message: OutboundMessage) {
-      if (!endpoint) return undefined;
+      // Capture once and use the local throughout: teardown() nulls the
+      // closure variable synchronously, and deliver awaits (media.save, sends)
+      // between uses — a mid-flight teardown must not make deliver throw at
+      // the host (a throw routes into their retry path and ends 'failed').
+      // A send after stop() resolving false is fine; a throw is not.
+      const ep = endpoint;
+      if (!ep) return undefined;
       const ids = fromPlatformId(platformId);
       if (!ids) {
         console.error(`raccoon deliver: malformed platformId "${platformId}"`);
@@ -167,7 +191,7 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
         approvalValues.remember(card.questionId, card.options);
         turns.settle(platformId, ''); // the card IS the answer; end the parked turn silently
         const env = buildApprovalEnvelope(channel, userId, card);
-        const live = await endpoint.sendAgentEnvelope(userId, env);
+        const live = await ep.sendAgentEnvelope(userId, env);
         // Offline: push degrades cards to plain text — buffer the raw envelope
         // and replay it when the user's socket comes back (flushPendingCards).
         if (!live) bufferCard(userId, env);
@@ -180,7 +204,7 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
       if (files.length > 0) {
         turns.settle(platformId, '');
         await deliverFilesAsAttachments(
-          { media: endpoint.hub.media, send: (u, e) => endpoint!.sendAgentEnvelope(u, e) },
+          { media: ep.hub.media, send: (u, e) => ep.sendAgentEnvelope(u, e) },
           channel,
           userId,
           files,
@@ -200,7 +224,7 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
         channel,
         payload: { text },
       });
-      const live = await endpoint.sendAgentEnvelope(userId, env);
+      const live = await ep.sendAgentEnvelope(userId, env);
       if (!live) console.error(`raccoon deliver: no live socket for ${userId}; message is in history (push may deliver)`);
       return env.id;
     },

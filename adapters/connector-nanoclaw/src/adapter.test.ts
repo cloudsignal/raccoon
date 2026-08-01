@@ -176,6 +176,38 @@ describe('createRaccoonChannelAdapter', () => {
     await adapter.teardown();
   });
 
+  it('teardown during an in-flight flush neither throws nor resurrects the buffer', async () => {
+    const f = fakeEndpointFactory();
+    const adapter = createRaccoonChannelAdapter({ env: ENV, createEndpoint: f.create })!;
+    await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction: vi.fn() });
+    const send = f.endpoint.sendAgentEnvelope as ReturnType<typeof vi.fn>;
+
+    // Buffer TWO cards offline — the F1 TypeError needed a second loop
+    // iteration re-reading the (nulled) endpoint after the first await.
+    send.mockResolvedValueOnce(false);
+    await adapter.deliver('assistant:u1', null, { kind: 'chat', content: CARD_CONTENT });
+    send.mockResolvedValueOnce(false);
+    await adapter.deliver('assistant:u1', null, { kind: 'chat', content: { ...CARD_CONTENT, questionId: 'q-10' } });
+
+    // Park the flush's first re-send on a controllable gate.
+    let release!: (live: boolean) => void;
+    send.mockImplementationOnce(() => new Promise<boolean>((r) => { release = r; }));
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => rejections.push(err);
+    process.on('unhandledRejection', onRejection);
+    try {
+      f.fireInbound('u1'); // starts the flush; it parks awaiting the gate
+      await adapter.teardown(); // nulls endpoint + clears the buffer while flush is parked
+      release(false); // resolves false post-teardown — must drop, not TypeError or re-buffer
+      await new Promise((r) => setTimeout(r, 10));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+    // 2 deliver sends + 2 flush sends against the captured endpoint — no more.
+    expect(send).toHaveBeenCalledTimes(4);
+  });
+
   it('setTyping sends a typing start envelope', async () => {
     const f = fakeEndpointFactory();
     const adapter = createRaccoonChannelAdapter({ env: ENV, createEndpoint: f.create })!;
