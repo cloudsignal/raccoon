@@ -46,6 +46,7 @@
     "@raccoon/transport-ws": "0.1.0",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.470.0",
+    "ulid": "^2.4.0",
     "zod": "^4.3.5"
   },
   "devDependencies": {
