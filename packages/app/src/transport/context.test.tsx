@@ -127,7 +127,8 @@ describe('TransportProvider', () => {
         from: 'system', to: 'user:u1', channel: 'pairing',
         payload: { sessionToken: 's1', userId: 'u1', instance: 'echo', channels: ['coordinator'] },
       }));
-      await pairing;
+      // Success is REPORTED: the caller (PairPanel's onDone) relies on it.
+      expect(await pairing).toBe(true);
     });
     await waitFor(() => expect(api.phase).toBe('ready'));
     expect(api.pairings[0]?.userId).toBe('u1');
@@ -179,7 +180,8 @@ describe('TransportProvider', () => {
     );
     await waitFor(() => expect(api.phase).toBe('setup'));
     await act(async () => {
-      await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }));
+      // Failure resolves false (never throws) — the reason lands in authError.
+      expect(await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }))).toBe(false);
     });
     expect(api.authError).toContain('No transport is available');
     expect(api.phase).toBe('setup');

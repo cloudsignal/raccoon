@@ -17,8 +17,15 @@ export function PairPanel(props: { onDone?: () => void }) {
     setBusy(true);
     setError(null);
     try {
-      await pairWithPayload(payload.trim());
-      props.onDone?.();
+      const paired = await pairWithPayload(payload.trim());
+      if (paired) {
+        props.onDone?.();
+        return;
+      }
+      // Resolved-but-failed (rejected token, no factory, host-managed): the
+      // provider surfaced the reason via authError, rendered above. Keep the
+      // panel open and re-enable the form for another attempt.
+      setBusy(false);
     } catch {
       setError('Could not read that pairing code. Ask your agent host for a fresh QR.');
       setBusy(false);

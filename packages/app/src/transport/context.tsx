@@ -70,8 +70,9 @@ export interface ChatApi {
   activeChannel: ConvKey | null;
   authError: string | null;
   /** Appends a pairing (or refreshes a re-scanned one in place); never wipes
-   *  other pairings. */
-  pairWithPayload(json: string): Promise<void>;
+   *  other pairings. Resolves false when pairing failed — the reason is
+   *  surfaced via authError. Throws only on a malformed payload. */
+  pairWithPayload(json: string): Promise<boolean>;
   /** #F6: re-probe durable storage from the 'storage-error' phase. On success,
    *  moves to 'setup' (pairing enabled); otherwise stays in 'storage-error'. */
   retryStorage(): Promise<void>;
@@ -1298,7 +1299,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // writing IDB pairings under it.
     if (props.transportOverride) {
       setAuthError('Pairing is managed by the host application.');
-      return;
+      return false;
     }
     const payload = parsePairingPayload(json);
     setAuthError(null);
@@ -1308,7 +1309,7 @@ export function TransportProvider(props: TransportProviderProps) {
     const make = registry[kind];
     if (!make) {
       setAuthError('No transport is available for this platform type.');
-      return;
+      return false;
     }
     // #P1-B: DURABLE client adoption BEFORE the server confirms. onAdoptGrant is
     // called by the transport on the pair.grant and AWAITED before it sends
@@ -1349,7 +1350,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // it's driven by sessionOverride, not pairWithPayload.
     if (!transport.onGrant) {
       setAuthError('This transport does not support interactive pairing.');
-      return;
+      return false;
     }
     // Resolves once the server ACKs (onGrant fires on pair.confirmed OR on a
     // recovery-resume). By then the pairing was already durably saved in
@@ -1422,7 +1423,7 @@ export function TransportProvider(props: TransportProviderProps) {
         ? 'Pairing was rejected. Ask for a fresh QR code and try again.'
         : 'Could not finish pairing — the server was unreachable or the session could not be saved. Try a fresh QR code.');
       void transport.close();
-      return;
+      return false;
     }
     // `stored` is ALREADY durably persisted (onAdoptGrant) and its runtime
     // installed by the grant callback. If the transport's 'open' status fired
@@ -1450,6 +1451,7 @@ export function TransportProvider(props: TransportProviderProps) {
     }
     // Go ready WITHOUT touching the other runtimes — pairing appends.
     setPhase('ready');
+    return true;
   }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen, enablePushFlowForRuntime]);
 
   const sendEnvelope = useCallback((pairingId: string, env: AnyEnvelope) => {

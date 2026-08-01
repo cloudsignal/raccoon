@@ -37,8 +37,8 @@
  *   PairingView).
  * - The host is fully responsible for authentication and transport lifecycle
  *   (the provider does NOT call close() on an override transport on unmount).
- * - `pairWithPayload` is rejected with an error message under an override —
- *   the host owns identity.
+ * - `pairWithPayload` resolves `false` with an error message (authError)
+ *   under an override — the host owns identity.
  *
  * `sessionOverride` MUST accompany `transportOverride`.  Without it,
  * `pairings` is empty, the conversation list is empty, and all outbound

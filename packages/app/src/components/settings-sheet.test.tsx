@@ -144,6 +144,37 @@ describe('SettingsSheet platforms', () => {
     expect(screen.getByRole('button', { name: 'Add platform' })).toBeTruthy();
   });
 
+  it('keeps PairPanel open and surfaces the error when pairing is rejected', async () => {
+    const tA = new FakeTransport();
+    const tNew = new FakeTransport();
+    await mountSheet([pairingA], (opts) => {
+      if (opts.url === 'ws://a/') return tA;
+      tNew.onAdoptGrant = opts.onAdoptGrant;
+      return tNew;
+    });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Add platform' }));
+    await user.click(await screen.findByRole('button', { name: /enter code manually/i }));
+    await user.type(
+      screen.getByPlaceholderText(/paste the pairing code/i),
+      JSON.stringify({ v: 1, instanceUrl: 'ws://new/', transport: 'ws', token: 'expired' })
+        .replaceAll('{', '{{').replaceAll('[', '[['),
+    );
+    await user.click(screen.getByRole('button', { name: /^pair$/i }));
+    // Server rejects the token (terminal auth failure, not a parse error).
+    act(() => tNew.authFail(4401));
+    // The panel STAYS open with the rejection surfaced — no silent close.
+    expect(await screen.findByText(/pairing was rejected/i)).toBeTruthy();
+    expect(screen.getByPlaceholderText(/paste the pairing code/i)).toBeTruthy();
+    expect(screen.getAllByTestId('platform-row')).toHaveLength(1);
+    // Still in panel mode: the Add platform button has not returned.
+    expect(screen.queryByRole('button', { name: 'Add platform' })).toBeNull();
+    // The user can retry: the Pair button is re-enabled after the failure.
+    await waitFor(() => expect(
+      (screen.getByRole('button', { name: /^pair$/i }) as HTMLButtonElement).disabled,
+    ).toBe(false));
+  });
+
   it('hides Add platform when the single pairing is host-managed (transportKind "host")', async () => {
     // A stored pairing whose kind has no registered factory stays listed but
     // offline — exactly the host-managed shape the sheet must not offer
