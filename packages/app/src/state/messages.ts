@@ -1,4 +1,5 @@
 import { parseAddress, type Attachment, type Envelope, type HistoryMessage } from '@raccoon/protocol';
+import type { ConvKey } from '../lib/conv-key.js';
 
 // 'stalled' (#P1-A): the server started the turn but it exceeded the deadline
 // and is still running with an UNKNOWN outcome. Terminal for the send state
@@ -7,7 +8,9 @@ export type Delivery = 'pending' | 'sent' | 'delivered' | 'read' | 'failed' | 's
 
 export interface ChatMessage {
   id: string;
-  channel: string;
+  /** The conversation key this message renders under; a bare channel
+   *  pre-multi-pairing, `pairingId/channel` after. */
+  channel: ConvKey;
   role: 'user' | 'agent';
   sender: string;
   kind: 'text' | 'approval';
@@ -37,12 +40,15 @@ export interface ChatMessage {
   respondedEditedText?: string;
 }
 
+/** Keyed by ConvKey (`pairingId/channel`) — see lib/conv-key.ts. The reducer
+ *  treats keys as opaque; collision safety between pairings comes from the
+ *  key domain. */
 export interface ChatState {
-  messages: Record<string, ChatMessage[]>;
-  typing: Record<string, boolean>;
-  unread: Record<string, number>;
-  nextBefore: Record<string, string | undefined>;
-  historyLoaded: Record<string, boolean>;
+  messages: Record<ConvKey, ChatMessage[]>;
+  typing: Record<ConvKey, boolean>;
+  unread: Record<ConvKey, number>;
+  nextBefore: Record<ConvKey, string | undefined>;
+  historyLoaded: Record<ConvKey, boolean>;
 }
 
 export const emptyChatState: ChatState = {
@@ -54,30 +60,34 @@ export const emptyChatState: ChatState = {
 };
 
 export type ChatAction =
-  | { type: 'history'; channel: string; agentId: string; messages: HistoryMessage[]; nextBefore?: string; lastRead?: string; active?: boolean }
-  | { type: 'message'; env: Envelope<'msg'>; active: boolean }
-  | { type: 'approval'; env: Envelope<'approval.request'>; active: boolean }
+  // `agentId` stays the bare channel — it feeds the sender label, not the key.
+  | { type: 'history'; convKey: ConvKey; agentId: string; messages: HistoryMessage[]; nextBefore?: string; lastRead?: string; active?: boolean }
+  // `convKey` — not env.channel — is the state key for env-carrying actions:
+  // two pairings can expose the same channel name, so the envelope alone
+  // cannot address a conversation. env.channel remains the sender-label fallback.
+  | { type: 'message'; env: Envelope<'msg'>; convKey: ConvKey; active: boolean }
+  | { type: 'approval'; env: Envelope<'approval.request'>; convKey: ConvKey; active: boolean }
   | { type: 'optimistic'; msg: ChatMessage }
-  | { type: 'delivery'; channel: string; id: string; delivery: Delivery }
+  | { type: 'delivery'; convKey: ConvKey; id: string; delivery: Delivery }
   // `reason` rides along with a locally-decided terminal 'failed' (e.g. the
   // drain-time attachment-lease check) — applied only if the delivery
   // actually lands on 'failed' (the monotonic gate still wins).
-  | { type: 'ack'; channel: string; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' | 'stalled'; reason?: string }
-  | { type: 'typing'; channel: string; on: boolean }
-  | { type: 'responded'; channel: string; refId: string; choice: string; responseId: string; editedText?: string }
+  | { type: 'ack'; convKey: ConvKey; refId: string; status: 'received' | 'delivered' | 'read' | 'failed' | 'stalled'; reason?: string }
+  | { type: 'typing'; convKey: ConvKey; on: boolean }
+  | { type: 'responded'; convKey: ConvKey; refId: string; choice: string; responseId: string; editedText?: string }
   // #R7-2: rehydrate responded/failed state onto approval messages from
   // DURABLE outbox rows after a reload (in-memory respondedChoice/responseEnvId
   // are lost; server history carries the approval REQUEST but not the local
   // response state), so a failed response still shows its retry card.
-  | { type: 'reconcile-responses'; channel: string; responses: Array<{ refId: string; choice: string; responseId: string; editedText?: string; delivery: Delivery }> }
+  | { type: 'reconcile-responses'; convKey: ConvKey; responses: Array<{ refId: string; choice: string; responseId: string; editedText?: string; delivery: Delivery }> }
   // #R8-1: re-render approval CARDS from the durable, identity-scoped
   // approvals store after a reload. Server history reconstructs an
   // approval.request only as a text row, so without this the interactive
   // card (and its retry affordance) is lost. REPLACES a same-id history text
   // row with the card; never clobbers an already-live approval card (which
   // may carry in-memory response state on a reconnect).
-  | { type: 'reconcile-approvals'; channel: string; approvals: Envelope<'approval.request'>[] }
-  | { type: 'read-channel'; channel: string }
+  | { type: 'reconcile-approvals'; convKey: ConvKey; approvals: Envelope<'approval.request'>[] }
+  | { type: 'read-channel'; convKey: ConvKey }
   | { type: 'reset' };
 
 // 'failed' (#R6-2): the server received the envelope but the turn it drives
@@ -119,8 +129,8 @@ function upsert(list: ChatMessage[], msg: ChatMessage): ChatMessage[] {
   return [...list, msg].sort(byTs);
 }
 
-function patch(state: ChatState, channel: string, list: ChatMessage[]): ChatState {
-  return { ...state, messages: { ...state.messages, [channel]: list } };
+function patch(state: ChatState, key: ConvKey, list: ChatMessage[]): ChatState {
+  return { ...state, messages: { ...state.messages, [key]: list } };
 }
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -128,7 +138,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'reset':
       return emptyChatState;
     case 'history': {
-      const existing = state.messages[action.channel] ?? [];
+      const key = action.convKey;
+      const existing = state.messages[key] ?? [];
       const seen = new Set(existing.map((m) => m.id));
       const incoming: ChatMessage[] = [];
       for (const h of action.messages) {
@@ -136,7 +147,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         seen.add(h.id);
         incoming.push({
           id: h.id,
-          channel: action.channel,
+          channel: key,
           role: h.role,
           sender: h.role === 'agent' ? action.agentId : 'you',
           kind: 'text' as const,
@@ -147,105 +158,107 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         });
       }
       const merged = [...existing, ...incoming].sort(byTs);
-      const firstLoad = !state.historyLoaded[action.channel];
+      const firstLoad = !state.historyLoaded[key];
       let unread: number;
       if (firstLoad) {
         unread = action.lastRead
           ? merged.filter((m) => m.role === 'agent' && m.ts > action.lastRead!).length
-          : state.unread[action.channel] ?? 0;
+          : state.unread[key] ?? 0;
       } else if (action.active) {
         // The user is viewing this channel; catch-up messages are seen, not unread.
-        unread = state.unread[action.channel] ?? 0;
+        unread = state.unread[key] ?? 0;
       } else {
         // Background catch-up (#10): count newly-arrived agent messages missed while
         // disconnected toward the unread badge.
         const missed = incoming.filter(
           (m) => m.role === 'agent' && (!action.lastRead || m.ts > action.lastRead!),
         ).length;
-        unread = (state.unread[action.channel] ?? 0) + missed;
+        unread = (state.unread[key] ?? 0) + missed;
       }
       return {
-        ...patch(state, action.channel, merged),
-        unread: { ...state.unread, [action.channel]: unread },
-        nextBefore: { ...state.nextBefore, [action.channel]: action.nextBefore },
-        historyLoaded: { ...state.historyLoaded, [action.channel]: true },
+        ...patch(state, key, merged),
+        unread: { ...state.unread, [key]: unread },
+        nextBefore: { ...state.nextBefore, [key]: action.nextBefore },
+        historyLoaded: { ...state.historyLoaded, [key]: true },
       };
     }
     case 'message': {
       const from = parseAddress(action.env.from);
       const isAgent = from.type === 'agent';
-      const channel = action.env.channel;
+      const key = action.convKey;
       const msg: ChatMessage = {
         id: action.env.id,
-        channel,
+        channel: key,
         role: isAgent ? 'agent' : 'user',
-        sender: isAgent ? (from.id ?? channel) : 'you',
+        // Sender label stays env-derived — the bare channel, not the ConvKey.
+        sender: isAgent ? (from.id ?? action.env.channel) : 'you',
         kind: 'text',
         text: action.env.payload.text,
         ...(action.env.payload.attachments?.length ? { attachments: action.env.payload.attachments } : {}),
         ts: action.env.ts,
         ...(isAgent ? {} : { delivery: 'sent' as const }),
       };
-      const list = upsert(state.messages[channel] ?? [], msg);
-      if (list === state.messages[channel]) {
+      const list = upsert(state.messages[key] ?? [], msg);
+      if (list === state.messages[key]) {
         // Dedupe no-op (same id redelivered) — the reply DID arrive, so a
         // live typing indicator must still clear; nothing else changes (in
         // particular the unread badge must not double-count).
-        if (isAgent && state.typing[channel]) {
-          return { ...state, typing: { ...state.typing, [channel]: false } };
+        if (isAgent && state.typing[key]) {
+          return { ...state, typing: { ...state.typing, [key]: false } };
         }
         return state;
       }
       const bump = isAgent && !action.active;
       return {
-        ...patch(state, channel, list),
-        typing: isAgent ? { ...state.typing, [channel]: false } : state.typing,
-        unread: bump ? { ...state.unread, [channel]: (state.unread[channel] ?? 0) + 1 } : state.unread,
+        ...patch(state, key, list),
+        typing: isAgent ? { ...state.typing, [key]: false } : state.typing,
+        unread: bump ? { ...state.unread, [key]: (state.unread[key] ?? 0) + 1 } : state.unread,
       };
     }
     case 'approval': {
       const from = parseAddress(action.env.from);
-      const channel = action.env.channel;
+      const key = action.convKey;
       const msg: ChatMessage = {
         id: action.env.id,
-        channel,
+        channel: key,
         role: 'agent',
-        sender: from.id ?? channel,
+        // Sender label stays env-derived — the bare channel, not the ConvKey.
+        sender: from.id ?? action.env.channel,
         kind: 'approval',
         text: action.env.payload.description,
         approval: { ...action.env.payload },
         ts: action.env.ts,
       };
-      const list = upsert(state.messages[channel] ?? [], msg);
-      if (list === state.messages[channel]) {
+      const list = upsert(state.messages[key] ?? [], msg);
+      if (list === state.messages[key]) {
         // Same dedupe-no-op rescue as 'message' above.
-        if (state.typing[channel]) {
-          return { ...state, typing: { ...state.typing, [channel]: false } };
+        if (state.typing[key]) {
+          return { ...state, typing: { ...state.typing, [key]: false } };
         }
         return state;
       }
       const bump = !action.active;
       return {
-        ...patch(state, channel, list),
-        typing: { ...state.typing, [channel]: false },
-        unread: bump ? { ...state.unread, [channel]: (state.unread[channel] ?? 0) + 1 } : state.unread,
+        ...patch(state, key, list),
+        typing: { ...state.typing, [key]: false },
+        unread: bump ? { ...state.unread, [key]: (state.unread[key] ?? 0) + 1 } : state.unread,
       };
     }
     case 'optimistic':
       return patch(state, action.msg.channel, upsert(state.messages[action.msg.channel] ?? [], action.msg));
     case 'delivery': {
-      const list = (state.messages[action.channel] ?? []).map((m) => {
+      const list = (state.messages[action.convKey] ?? []).map((m) => {
         // An explicit delivery override (the retry reset) supersedes any
         // recorded failure reason.
         if (m.id === action.id) return { ...m, delivery: action.delivery, failureReason: undefined };
         if (m.responseEnvId === action.id) return { ...m, respondedDelivery: action.delivery };
         return m;
       });
-      return patch(state, action.channel, list);
+      return patch(state, action.convKey, list);
     }
     case 'ack': {
       const next = ACK_DELIVERY[action.status];
-      const list = (state.messages[action.channel] ?? []).map((m) => {
+      const list = (state.messages[action.convKey] ?? []).map((m) => {
         if (m.id === action.refId) {
           const delivery = advanceDelivery(m.delivery, next);
           // Carry the failure reason only when the row actually lands on
@@ -255,23 +268,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         if (m.responseEnvId === action.refId) return { ...m, respondedDelivery: advanceDelivery(m.respondedDelivery, next) };
         return m;
       });
-      return patch(state, action.channel, list);
+      return patch(state, action.convKey, list);
     }
     case 'typing': {
-      if ((state.typing[action.channel] ?? false) === action.on) return state;
-      return { ...state, typing: { ...state.typing, [action.channel]: action.on } };
+      if ((state.typing[action.convKey] ?? false) === action.on) return state;
+      return { ...state, typing: { ...state.typing, [action.convKey]: action.on } };
     }
     case 'responded': {
-      const list = (state.messages[action.channel] ?? []).map((m) =>
+      const list = (state.messages[action.convKey] ?? []).map((m) =>
         m.kind === 'approval' && m.approval?.refId === action.refId
           ? { ...m, respondedChoice: action.choice, respondedDelivery: 'pending' as const, responseEnvId: action.responseId, respondedEditedText: action.editedText }
           : m,
       );
-      return patch(state, action.channel, list);
+      return patch(state, action.convKey, list);
     }
     case 'reconcile-approvals': {
       if (action.approvals.length === 0) return state;
-      const existing = state.messages[action.channel] ?? [];
+      const existing = state.messages[action.convKey] ?? [];
       const byId = new Map(existing.map((m) => [m.id, m]));
       let changed = false;
       for (const env of action.approvals) {
@@ -282,9 +295,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         const from = parseAddress(env.from);
         byId.set(env.id, {
           id: env.id,
-          channel: action.channel,
+          channel: action.convKey,
           role: 'agent',
-          sender: from.id ?? action.channel,
+          // Sender label stays env-derived — the bare channel, not the ConvKey.
+          sender: from.id ?? env.channel,
           kind: 'approval',
           text: env.payload.description,
           approval: { ...env.payload },
@@ -293,12 +307,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         changed = true;
       }
       if (!changed) return state;
-      return patch(state, action.channel, [...byId.values()].sort(byTs));
+      return patch(state, action.convKey, [...byId.values()].sort(byTs));
     }
     case 'reconcile-responses': {
       if (action.responses.length === 0) return state;
       const byRef = new Map(action.responses.map((r) => [r.refId, r]));
-      const list = (state.messages[action.channel] ?? []).map((m) => {
+      const list = (state.messages[action.convKey] ?? []).map((m) => {
         if (m.kind !== 'approval' || !m.approval) return m;
         const r = byRef.get(m.approval.refId);
         // Only fill in a response the message doesn't already have (don't
@@ -312,9 +326,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           respondedEditedText: r.editedText,
         };
       });
-      return patch(state, action.channel, list);
+      return patch(state, action.convKey, list);
     }
     case 'read-channel':
-      return { ...state, unread: { ...state.unread, [action.channel]: 0 } };
+      return { ...state, unread: { ...state.unread, [action.convKey]: 0 } };
   }
 }

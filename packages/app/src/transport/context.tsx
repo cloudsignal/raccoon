@@ -337,7 +337,7 @@ export function TransportProvider(props: TransportProviderProps) {
   const handleEnvelope = useCallback((env: AnyEnvelope) => {
     if (env.kind === 'msg') {
       clearTypingTimer(env.channel); // the reply is the definitive 'stop'
-      dispatch({ type: 'message', env, active: isActive(env.channel) });
+      dispatch({ type: 'message', env, convKey: env.channel, active: isActive(env.channel) });
       if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
     } else if (env.kind === 'typing') {
       const on = env.payload.state === 'start';
@@ -346,14 +346,14 @@ export function TransportProvider(props: TransportProviderProps) {
         // Arm the self-heal deadline (see TYPING_AUTO_CLEAR_MS).
         typingTimers.current.set(env.channel, setTimeout(() => {
           typingTimers.current.delete(env.channel);
-          dispatch({ type: 'typing', channel: env.channel, on: false });
+          dispatch({ type: 'typing', convKey: env.channel, on: false });
         }, TYPING_AUTO_CLEAR_MS));
       }
-      dispatch({ type: 'typing', channel: env.channel, on });
+      dispatch({ type: 'typing', convKey: env.channel, on });
     }
     else if (env.kind === 'approval.request') {
       clearTypingTimer(env.channel);
-      dispatch({ type: 'approval', env, active: isActive(env.channel) });
+      dispatch({ type: 'approval', env, convKey: env.channel, active: isActive(env.channel) });
       if (isActive(env.channel)) void kvSet(`lastread:${env.channel}`, env.ts);
       // #R8-1: persist the request under this identity scope so a reload can
       // re-render the interactive card (server history keeps it only as text).
@@ -394,7 +394,7 @@ export function TransportProvider(props: TransportProviderProps) {
               // then regress a delivered row and show a false retry. Via 'ack'
               // status 'failed', advanceDelivery keeps a real 'delivered'
               // (higher rank) while still advancing pending/sent → failed.
-              if (applied) dispatch({ type: 'ack', channel: env.channel, refId, status: 'failed' });
+              if (applied) dispatch({ type: 'ack', convKey: env.channel, refId, status: 'failed' });
             });
           }, PROCESSING_TIMEOUT_MS);
           ackTimers.current.set(refId, processingTimer);
@@ -417,7 +417,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // response record → double-response). For a plain msg it just settles.
         void outbox.settleResponseAndPruneApproval(refId);
       }
-      dispatch({ type: 'ack', channel: env.channel, refId, status: env.payload.status });
+      dispatch({ type: 'ack', convKey: env.channel, refId, status: env.payload.status });
     } else if (env.kind === 'history.page') {
       const channel = env.payload.channel;
       // #P1-E3: capture the identity BEFORE any await. This handler performs
@@ -436,7 +436,7 @@ export function TransportProvider(props: TransportProviderProps) {
         if (identityScopeRef.current !== fenceScope) return; // identity changed across the await
         dispatch({
           type: 'history',
-          channel,
+          convKey: channel,
           agentId: channel,
           messages: env.payload.messages,
           nextBefore: env.payload.nextBefore,
@@ -487,8 +487,8 @@ export function TransportProvider(props: TransportProviderProps) {
             });
           // Same-tick, no await between: the card exists AND is marked answered
           // in one React commit.
-          if (stored.length > 0) dispatch({ type: 'reconcile-approvals', channel, approvals: stored.map((a) => a.env) });
-          if (responses.length > 0) dispatch({ type: 'reconcile-responses', channel, responses });
+          if (stored.length > 0) dispatch({ type: 'reconcile-approvals', convKey: channel, approvals: stored.map((a) => a.env) });
+          if (responses.length > 0) dispatch({ type: 'reconcile-responses', convKey: channel, responses });
         });
       });
     }
@@ -549,7 +549,7 @@ export function TransportProvider(props: TransportProviderProps) {
           const applied = await outbox.markFailed(entry.id, 'attachments-expired', claimToken);
           // Monotonic 'ack' route (see the ACK_TIMEOUT note below): a genuine
           // 'delivered' from an earlier attempt still outranks this.
-          if (applied) dispatch({ type: 'ack', channel: entry.channel, refId: entry.id, status: 'failed', reason: 'attachments-expired' });
+          if (applied) dispatch({ type: 'ack', convKey: entry.channel, refId: entry.id, status: 'failed', reason: 'attachments-expired' });
           return;
         }
         // { ok: false } = network/token trouble reaching the lease endpoint —
@@ -578,7 +578,7 @@ export function TransportProvider(props: TransportProviderProps) {
             // arrived while this timer's markFailed CAS was pending must not be
             // regressed to 'failed'. advanceDelivery keeps the higher-rank
             // delivered/read; matches m.id (msg) or m.responseEnvId (approval).
-            if (applied) dispatch({ type: 'ack', channel: entry.channel, refId: entry.id, status: 'failed' });
+            if (applied) dispatch({ type: 'ack', convKey: entry.channel, refId: entry.id, status: 'failed' });
           });
         }, ACK_TIMEOUT_MS);
         ackTimers.current.set(entry.id, timer);
@@ -598,7 +598,7 @@ export function TransportProvider(props: TransportProviderProps) {
       const status = await outbox.markSendFailed(entry.id, err instanceof Error ? err.message : 'send failed', claimToken);
       if (status === 'failed') {
         // #R10: monotonic 'ack' route (see the ACK_TIMEOUT note above).
-        dispatch({ type: 'ack', channel: entry.channel, refId: entry.id, status: 'failed' });
+        dispatch({ type: 'ack', convKey: entry.channel, refId: entry.id, status: 'failed' });
       }
     }
   }, []);
@@ -1241,7 +1241,7 @@ export function TransportProvider(props: TransportProviderProps) {
       from: userAddress(userId), to: agentAddress(channel), channel,
       payload: { refId, choice, ...(editedText !== undefined ? { editedText } : {}) },
     });
-    dispatch({ type: 'responded', channel, refId, choice, responseId: env.id, ...(editedText !== undefined ? { editedText } : {}) });
+    dispatch({ type: 'responded', convKey: channel, refId, choice, responseId: env.id, ...(editedText !== undefined ? { editedText } : {}) });
     sendEnvelope(env);
   }, [sendEnvelope]);
 
@@ -1257,7 +1257,7 @@ export function TransportProvider(props: TransportProviderProps) {
     if (channel && sessionRef.current && !sessionRef.current.channels.includes(channel)) return;
     setActiveChannel(channel);
     if (!channel) return;
-    dispatch({ type: 'read-channel', channel });
+    dispatch({ type: 'read-channel', convKey: channel });
     void kvSet(`lastread:${channel}`, new Date().toISOString());
     // Finding 2: only request history when the transport is open; if closed, the
     // onStatus handler will catch up when the transport reconnects.
@@ -1275,7 +1275,7 @@ export function TransportProvider(props: TransportProviderProps) {
       // tab holds a live claim on it, do nothing (no phantom 'pending' UI,
       // no drain that could double-send).
       if (!applied) return;
-      dispatch({ type: 'delivery', channel, id, delivery: 'pending' });
+      dispatch({ type: 'delivery', convKey: channel, id, delivery: 'pending' });
       await drain();
     });
   }, [drain]);
