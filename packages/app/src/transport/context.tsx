@@ -965,7 +965,19 @@ export function TransportProvider(props: TransportProviderProps) {
       else void rt.transport?.close(); // auth-error: already closed; release fire-and-forget
     }
     rt.transport = null;
-    const authorized = await wipePairingDurable(pid, wipedEpoch, opts.hoistedRemoved ?? false);
+    // #ER-1 host exception: a host-override synthetic pairing intentionally
+    // NEVER persists (#P1-F2), so BOTH the hoisted removal and the durable
+    // wipe's retry always miss — but the epoch gate only exists to protect a
+    // STORED pairing that may have been refreshed behind this caller's back,
+    // and a host pairing has neither a store entry to protect nor a refresh
+    // path (the host owns identity; pairWithPayload is rejected in override
+    // mode). Its outbox/approvals/lastread rows DO live durably under the
+    // hostIdentityKey scope, so without this the host unpair took the
+    // self-heal branch and left them (plus the chat slice) to be resumed —
+    // and transmitted — by a later remount with the same session. Treat it
+    // as authorized so the full terminal wipe path runs.
+    const isHostPairing = props.transportOverride !== undefined && rt.pairing.transportKind === 'host';
+    const authorized = await wipePairingDurable(pid, wipedEpoch, (opts.hoistedRemoved ?? false) || isHostPairing);
     if (!authorized) {
       // #ER-1 self-heal: this caller's epoch is STALE — the stored pairing
       // was refreshed in place (same pairingId, new epoch/token) and NOTHING
@@ -1000,6 +1012,14 @@ export function TransportProvider(props: TransportProviderProps) {
         };
         runtimesRef.current.set(pid, fresh);
         dialPairingRef.current(fresh);
+      } else {
+        // The pairing is gone from the store ENTIRELY (removed wholesale by
+        // another actor — not the refresh case): there is nothing to
+        // re-install onto. Drop the in-memory chat slice — a memory-only
+        // dispatch, safe without wipe authorization (the durable clears stay
+        // withheld) — so a truly-removed pairing doesn't leave a stale slice
+        // behind a runtime that no longer exists.
+        dispatch({ type: 'drop-pairing', pairingId: pid });
       }
       refreshViews();
       // Phase stays 'ready' when the pairing was re-installed; if the store

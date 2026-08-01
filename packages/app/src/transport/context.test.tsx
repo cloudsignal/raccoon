@@ -257,6 +257,50 @@ describe('TransportProvider', () => {
     expect(disabled).toBe(true);
   });
 
+  it('host-override unpair still performs the full terminal wipe — no store entry does not mean no authorization (#ER-1)', async () => {
+    const transport = new FakeTransport();
+    render(
+      <TransportProvider
+        transportOverride={transport}
+        sessionOverride={{ userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: EPOCH }}
+      >
+        <Probe />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('ready'));
+    const pid = api.pairings[0]!.pairingId;
+    const ck = `${pid}/coordinator`;
+    // A live message creates the in-memory chat slice…
+    act(() => {
+      transport.emit(createEnvelope('msg', {
+        from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator', payload: { text: 'hi' },
+      }));
+    });
+    await waitFor(() => expect(api.state.messages[ck]).toHaveLength(1));
+    // …and a queued row lands DURABLY under the host scope (#P1-F2: the host
+    // pairing itself never persists, but its outbox rows do — that is the
+    // whole point of the stable hostIdentityKey scope). Transport closed so
+    // the drain can't flush it before unpair.
+    act(() => { transport.setStatus('closed'); transport.connected = false; });
+    const row = await outbox.enqueue(createEnvelope('msg', {
+      from: 'user:u1', to: 'agent:coordinator', channel: 'coordinator', payload: { text: 'discard me' },
+    }), pid);
+
+    await act(async () => { await api.unpair(pid); });
+
+    // A host pairing has no store entry, so BOTH epoch-gated removals miss —
+    // but the #ER-1 gate exists to protect a STORED pairing that may have
+    // been refreshed, and a host pairing has neither a store entry nor a
+    // refresh path. unpair must therefore stay AUTHORIZED for the full
+    // terminal wipe: slice dropped, durable scope cleared, phase 'setup'. A
+    // later remount with the same session (same epoch → same pairingId) must
+    // NOT resume and transmit rows the user unpaired to discard.
+    expect(api.phase).toBe('setup');
+    expect(api.state.messages[ck]).toBeUndefined();
+    expect(await outbox.getEntry(row.id)).toBeUndefined();
+    expect(await outbox.listForChannel('coordinator', pid)).toEqual([]);
+  });
+
   it('unpair invalidates the durable pairing BEFORE the unbounded push cleanup, so a hung disable() cannot leave a reconnectable pairing (#P1-F3)', async () => {
     await savePairings([{
       url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i',
@@ -1409,9 +1453,10 @@ describe('TransportProvider', () => {
       const tA = new FakeTransport(); const tB = new FakeTransport();
       await mountTwoPaired(tA, tB);
       // Short timeout so A's parked worker un-parks harmlessly within the
-      // test's own lifetime — the assertions below must all hold BEFORE it
-      // fires (B flows because the workers are per-pairing, not because A
-      // timed out and released a shared lock).
+      // test's own lifetime. What this test locks: the wait on A's hung send
+      // is BOUNDED and B's queue is unblocked while A's row stays claimed and
+      // un-failed — not the precise timing of the assertions relative to the
+      // timeout firing.
       __setSendAttemptTimeoutForTests(500);
       try {
         tA.send = () => new Promise(() => {}); // A's transport never settles a send
