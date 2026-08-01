@@ -100,14 +100,35 @@ self.addEventListener('fetch', (event) => {
 self.addEventListener('push', (event) => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch { /* opaque push */ }
-  const title = data.title || 'Raccoon';
-  const tag = data.tag || (data.data && data.data.channel) || undefined;
+  const channel = data.data && data.data.channel;
+  let title = data.title || 'Raccoon';
+  let tag = data.tag || channel || undefined;
+  let navData = data.data || {};
+  // Multi-pairing self-identification (optional). A hub that names itself lets
+  // this client suffix the title, collapse notifications per pairing (two
+  // instances exposing same-named channels must not replace each other's), and
+  // encode tap-routing params the app resolves against its own pairings
+  // (chat-screen.tsx reads ?pi/?pu/?pc). Hubs that omit `instance` keep the
+  // un-suffixed title/tag/url behavior exactly.
+  const instance = data.instance;
+  if (instance && instance.instanceUrl && instance.userId) {
+    if (instance.name) title = `${title} · ${instance.name}`;
+    if (channel) {
+      tag = `${instance.instanceUrl}|${instance.userId}|${channel}`;
+      navData = {
+        ...navData,
+        url: `/?pi=${encodeURIComponent(instance.instanceUrl)}`
+          + `&pu=${encodeURIComponent(instance.userId)}`
+          + `&pc=${encodeURIComponent(channel)}`,
+      };
+    }
+  }
   event.waitUntil(self.registration.showNotification(title, {
     body: data.body || '',
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
     ...(tag ? { tag } : {}),
-    data: data.data || {},
+    data: navData,
   }));
 });
 

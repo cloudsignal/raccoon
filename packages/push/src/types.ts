@@ -19,6 +19,13 @@ export interface PushPayload {
   tag?: string;
   /** Click routing hints, passed through to the notification. */
   data?: { url?: string; channel?: string };
+  /** Self-identification of the pushing instance, so a multi-pairing client
+   *  can title and route notifications when several instances expose
+   *  same-named channels. userId is REQUIRED for unambiguous routing: two
+   *  pairings may point at the same instanceUrl as different users, and the
+   *  pushing hub always knows which user it is notifying. Hubs that omit the
+   *  field degrade to the un-suffixed title and merged-list open. */
+  instance?: { name: string; instanceUrl: string; userId: string };
 }
 
 export interface SubscriptionStore {

@@ -9,23 +9,29 @@ const swSource = readFileSync(
   'utf8',
 ).replaceAll('__RACCOON_BUILD_ID__', 'test-build-2');
 
+type NotificationCall = [string, { tag?: string; data: Record<string, unknown> }];
+
 interface SwHandle {
   listeners: Record<string, (event: { waitUntil: (p: Promise<unknown>) => void }) => void>;
   deleted: string[];
+  notifications: NotificationCall[];
   setCacheNames: (names: string[]) => void;
 }
 
 /** Evaluate the SW source in a sandbox with mock `self`/`caches`, capturing
- *  its event listeners and which caches it deletes. */
+ *  its event listeners, which caches it deletes, and shown notifications. */
 function loadServiceWorker(): SwHandle {
   const listeners: SwHandle['listeners'] = {};
   const deleted: string[] = [];
+  const notifications: NotificationCall[] = [];
   let cacheNames: string[] = [];
   const self = {
     addEventListener: (type: string, fn: SwHandle['listeners'][string]) => { listeners[type] = fn; },
     skipWaiting: async () => {},
     clients: { claim: async () => {}, matchAll: async () => [], openWindow: async () => {} },
-    registration: { showNotification: async () => {} },
+    registration: {
+      showNotification: async (title: string, opts: NotificationCall[1]) => { notifications.push([title, opts]); },
+    },
     location: { origin: 'https://hub.example' },
   };
   const caches = {
@@ -36,12 +42,15 @@ function loadServiceWorker(): SwHandle {
   const ctx = { self, caches, fetch: async () => ({ ok: false }), console, URL };
   vm.createContext(ctx);
   vm.runInContext(swSource, ctx);
-  return { listeners, deleted, setCacheNames: (names) => { cacheNames = names; } };
+  return { listeners, deleted, notifications, setCacheNames: (names) => { cacheNames = names; } };
 }
 
-async function fire(listener: SwHandle['listeners'][string]): Promise<void> {
+async function fire(
+  listener: SwHandle['listeners'][string],
+  event: Record<string, unknown> = {},
+): Promise<void> {
   let held: Promise<unknown> | undefined;
-  listener({ waitUntil: (p) => { held = p; } });
+  listener({ ...event, waitUntil: (p) => { held = p; } });
   await held;
 }
 
@@ -68,5 +77,43 @@ describe('service worker activate cache pruning (#R6-10)', () => {
     sw.setCacheNames(['raccoon-shell-test-build-2', 'raccoon-static-test-build-2', 'some-other-app']);
     await fire(sw.listeners.activate!);
     expect(sw.deleted).toEqual([]);
+  });
+});
+
+describe('push notifications: per-pairing titles and tap-routing', () => {
+  function pushEvent(payload: unknown) {
+    return { data: { json: () => payload } };
+  }
+
+  it('composes the title and tag from payload.instance and routes clicks by (pi, pu, pc)', async () => {
+    const sw = loadServiceWorker();
+    await fire(sw.listeners.push!, pushEvent({
+      title: 'Atlas',
+      body: 'hi',
+      data: { channel: 'coordinator' },
+      instance: { name: 'alpha', instanceUrl: 'wss://a.example/', userId: 'u1' },
+    }));
+    expect(sw.notifications).toHaveLength(1);
+    const [title, opts] = sw.notifications[0]!;
+    expect(title).toBe('Atlas · alpha');
+    // Per-pairing collapse key: two instances exposing same-named channels
+    // must not replace each other's notifications.
+    expect(opts.tag).toBe('wss://a.example/|u1|coordinator');
+    expect(opts.data.url).toBe('/?pi=wss%3A%2F%2Fa.example%2F&pu=u1&pc=coordinator');
+    expect(opts.data.channel).toBe('coordinator'); // original data preserved
+  });
+
+  it('payload without instance keeps today\'s title, tag, and url behavior', async () => {
+    const sw = loadServiceWorker();
+    await fire(sw.listeners.push!, pushEvent({
+      title: 'Atlas',
+      body: 'hi',
+      data: { channel: 'coordinator', url: '/?c=coordinator' },
+    }));
+    expect(sw.notifications).toHaveLength(1);
+    const [title, opts] = sw.notifications[0]!;
+    expect(title).toBe('Atlas');
+    expect(opts.tag).toBe('coordinator');
+    expect(opts.data).toEqual({ channel: 'coordinator', url: '/?c=coordinator' });
   });
 });

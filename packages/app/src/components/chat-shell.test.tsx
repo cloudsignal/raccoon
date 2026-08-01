@@ -170,6 +170,33 @@ describe('merged conversation list', () => {
     expect(screen.queryByText(/·/)).toBeNull();
   });
 
+  it('opens the conversation named by push tap-routing params (?pi/?pu/?pc)', async () => {
+    // The SW's notification click URL carries (instanceUrl, userId, channel);
+    // the app resolves them against its pairings and opens that conversation.
+    window.history.replaceState(null, '', `/?pi=${encodeURIComponent('ws://b/')}&pu=u2&pc=coordinator`);
+    const tA = new FakeTransport();
+    const tB = new FakeTransport();
+    await savePairings([
+      { url: 'ws://a/', sessionToken: 'ta', userId: 'u1', instance: 'alpha', channels: ['coordinator', 'scout', 'echo'], epoch: 'ea', pairingId: P1, transportKind: 'ws', color: COLOR_A },
+      { url: 'ws://b/', sessionToken: 'tb', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eb', pairingId: P2, transportKind: 'ws', color: COLOR_B },
+    ]);
+    render(
+      <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
+        <App />
+      </TransportProvider>,
+    );
+    // B/coordinator's thread is open: the chat header shows the '· beta'
+    // instance suffix (list rows never render it).
+    expect(await screen.findByText('· beta')).toBeTruthy();
+  });
+
+  it('stays on the merged list when the tap-routing params match no pairing', async () => {
+    // An instance this install no longer pairs with (or an old hub's payload).
+    window.history.replaceState(null, '', `/?pi=${encodeURIComponent('wss://gone.example/')}&pu=u9&pc=coordinator`);
+    await mountTwo(); // waits for the merged list's two Coordinator rows
+    expect(screen.queryByText(/·/)).toBeNull(); // no thread header — list only
+  });
+
   it('shows connecting indicator when any pairing is not open', async () => {
     const { tB } = await mountTwo();
     // Both open after boot → indicator absent.

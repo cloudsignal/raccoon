@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useChat } from '../transport/context.js';
+import { convKeyOf } from '../lib/conv-key.js';
 import { handleSwNavigate } from '../lib/sw-navigate.js';
 import { ChannelHeader } from './channel-header.js';
 import { ChannelList } from './channel-list.js';
@@ -8,16 +9,22 @@ import { SettingsSheet } from './settings-sheet.js';
 import { Thread } from './thread.js';
 
 export function ChatScreen() {
-  const { activeChannel, openChannel } = useChat();
+  const { activeChannel, openChannel, pairings } = useChat();
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  // URL sync: ?c=<channel>; popstate (mobile back) closes the thread.
+  // URL sync. `?c=<ConvKey>` opens a conversation directly; `?pi=&pu=&pc=`
+  // (push tap-routing — the SW encodes the pushing hub's instanceUrl, userId,
+  // and channel into the notification click URL) is resolved against the live
+  // pairings to the unique local pairing. Resolution needs the pairings list
+  // loaded, so the URL read runs in an effect keyed on [pairings]; the
+  // ref-guard arms it once per navigation event (mount + each popstate /
+  // SW NAVIGATE, which handleSwNavigate re-dispatches as popstate) so a later
+  // pairings refresh cannot re-fire an already-resolved navigation.
+  const navPendingRef = useRef(true);
+  const [navTick, setNavTick] = useState(0);
+
   useEffect(() => {
-    const initial = new URLSearchParams(window.location.search).get('c');
-    if (initial) openChannel(initial);
-    const onPop = (): void => {
-      openChannel(new URLSearchParams(window.location.search).get('c'));
-    };
+    const onPop = (): void => { navPendingRef.current = true; setNavTick((t) => t + 1); };
     window.addEventListener('popstate', onPop);
     const sw = 'serviceWorker' in navigator ? navigator.serviceWorker : undefined;
     const onSwMessage = (event: MessageEvent): void => { handleSwNavigate(event.data); };
@@ -26,8 +33,35 @@ export function ChatScreen() {
       window.removeEventListener('popstate', onPop);
       sw?.removeEventListener('message', onSwMessage);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!navPendingRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const c = params.get('c');
+    if (c) {
+      // openChannel validates the ConvKey against the live pairings, so a
+      // stale param (unknown pairing or channel) no-ops.
+      navPendingRef.current = false;
+      openChannel(c);
+      return;
+    }
+    const pi = params.get('pi');
+    const pu = params.get('pu');
+    const pc = params.get('pc');
+    if (pi && pu && pc) {
+      if (pairings.length === 0) return; // wait for the pairings to load
+      navPendingRef.current = false;
+      const p = pairings.find((x) => x.url === pi && x.userId === pu);
+      if (p) openChannel(convKeyOf(p.pairingId, pc));
+      // unresolvable (an instance this install no longer pairs with, or an old
+      // hub's payload): stay on the merged list.
+      return;
+    }
+    navPendingRef.current = false;
+    openChannel(null); // no params — popstate (mobile back) closes the thread
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairings, navTick]);
 
   // `?c=` carries the encoded ConvKey; openChannel validates it against the
   // live pairings, so a stale param (unknown pairing or channel) no-ops.
