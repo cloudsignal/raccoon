@@ -8,8 +8,8 @@ import {
 } from '@raccoon/protocol';
 import { WsClientTransport } from '@raccoon/transport-ws';
 import { ulid } from 'ulid';
-import { kvGet, kvSet, probeStorageWritable, wipeKvByPrefix } from '../lib/idb.js';
-import { browserPushEnv, enablePushFlow, unsubscribeCurrentPush } from '../lib/push-client.js';
+import { kvDel, kvGet, kvSet, probeStorageWritable, wipeKvByPrefix } from '../lib/idb.js';
+import { browserPushEnv, enablePushFlow, unsubscribeInstanceOnly } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
 import * as adopt from '../lib/adopt.js';
@@ -878,6 +878,25 @@ export function TransportProvider(props: TransportProviderProps) {
     // superseded this one (the TOCTOU the deferral pattern exists to avoid).
     if (runtimesRef.current.get(pid) !== rt || rt.gen !== myGen) return false;
     runtimesRef.current.delete(pid);
+    // Browser-level push teardown belongs to the LAST pairing only, and the
+    // "last" determination is made HERE — at the point this runtime is
+    // actually removed — so two concurrent terminal wipes (unpair or
+    // auth-error) of the final two pairings cannot both observe a
+    // pre-deletion size of 2 and both skip it: only the wipe that deletes the
+    // final runtime sees size 0. The subscription endpoint is shared
+    // device-wide across pairings; the per-instance server-side unsubscribe
+    // happens in unpair() while the transport is still live (impossible on
+    // the auth-error path — the transport is already dead; a later push to
+    // the stale server row 404/410s, which the store prunes on). A host push
+    // registrar has no browser-level half here — its device-level disable()
+    // runs in unpair() itself. Bounded + fire-and-forget: best-effort
+    // teardown must not delay the React-state transition below.
+    if (runtimesRef.current.size === 0) {
+      if (!props.pushRegistrarOverride) {
+        void settleWithinCall(() => browserPushEnv()?.unsubscribeLocal(), UNPAIR_CLEANUP_TIMEOUT_MS);
+      }
+      void kvDel('push-enabled').catch(() => { /* best-effort */ });
+    }
     refreshViews();
     // R2-10: clear a stale active conversation belonging to this pairing (and
     // the URL's ?c= param, via ChatScreen) so it cannot reopen under a fresh
@@ -885,7 +904,7 @@ export function TransportProvider(props: TransportProviderProps) {
     if (activeRef.current && resolveConvKey(activeRef.current, [pid])) setActiveChannel(null);
     setPhase(runtimesRef.current.size === 0 ? 'setup' : 'ready');
     return true;
-  }, [wipePairingDurable, refreshViews, props.transportOverride]);
+  }, [wipePairingDurable, refreshViews, props.transportOverride, props.pushRegistrarOverride]);
 
   /** Open-time catch-up for ONE pairing: re-drive its processing rows, drain
    *  its queued sends, and re-request history for its channels + its already-
@@ -973,19 +992,13 @@ export function TransportProvider(props: TransportProviderProps) {
       // Scoped to the exact pairing identity (#R6-8: pairingId + epoch) so a
       // delayed event can't log out an unrelated newer pairing.
       bcRef.current?.postMessage({ type: 'identity-wiped', pairingId: pid, epoch: wiped.epoch });
-      // The transport is already closed here, so there is no live connection
-      // to ask the server to drop the subscription (unlike unpair(), which
-      // runs before closing). Still invalidate the browser-level subscription
-      // — but ONLY when this was the last pairing: the endpoint is shared
-      // browser-wide, and killing it while other pairings still deliver push
-      // through it would silence THEIR notifications too. (Task 7 refines the
-      // per-pairing server-side bookkeeping.) It tells the push service to
-      // stop routing to this endpoint AT ALL, so even a stale server-side row
-      // for the now-revoked user can no longer deliver here (a later send to
-      // it just 404/410s, which the store already prunes on).
-      if (runtimesRef.current.size === 1) {
-        void browserPushEnv()?.unsubscribeLocal().catch(() => { /* best-effort */ });
-      }
+      // Push: the transport is already closed here, so the per-instance
+      // server-side unsubscribe (unpair()'s unsubscribeInstanceOnly) is
+      // impossible — a later push to the stale server row 404/410s, which the
+      // store prunes on. The browser-level subscription is shared by every
+      // pairing, so it is torn down only when the LAST runtime is actually
+      // removed — inside wipePairing, at the deletion point, where the
+      // last-pairing check cannot race a concurrent wipe of another pairing.
       // The REACT-STATE side of the transition defers until the wipe settles,
       // guarded inside wipePairing by the generation captured above: only if
       // the transition actually APPLIED does the instance-named error surface
@@ -1141,7 +1154,10 @@ export function TransportProvider(props: TransportProviderProps) {
         rt.validUserId = null;
         for (const u of rt.unsubs) u();
         rt.unsubs = [];
-        void rt.transport?.close();
+        // Never close an override transport — the host owns its lifecycle
+        // (same guard as wipePairing; unreachable today since this listener
+        // only registers in non-override mode, but kept consistent).
+        if (rt.transport && rt.transport !== props.transportOverride) void rt.transport.close();
         rt.transport = null;
         clearPairingTypingTimers(data.pairingId);
         // Prune THIS pairing's ack timers too: their row/claim-gated durable
@@ -1261,6 +1277,20 @@ export function TransportProvider(props: TransportProviderProps) {
       clearTimers();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Register the ONE browser push subscription with a single pairing's
+   *  instance, over that pairing's own transport, as that pairing's own
+   *  userId. Loop body of enablePush's fan-out, extracted so a pairing added
+   *  while push is already enabled can be registered on its own (see the
+   *  pairWithPayload tail). Returns whether the registration succeeded. */
+  const enablePushFlowForRuntime = useCallback(async (rt: PairingRuntime): Promise<boolean> => {
+    const { vapidPublicKey, userId } = rt.pairing;
+    const transport = rt.transport;
+    if (!vapidPublicKey || !transport) return false;
+    const env = browserPushEnv();
+    if (!env) return false;
+    return enablePushFlow({ env, vapidPublicKey, userId, send: (e) => transport.send(e) });
   }, []);
 
   const pairWithPayload = useCallback(async (json: string) => {
@@ -1408,9 +1438,19 @@ export function TransportProvider(props: TransportProviderProps) {
       refreshViews();
       catchUpOnOpen(rt);
     }
+    // A pairing added while push is already enabled gets registered
+    // automatically: the user opted in ONCE for this device; every pairing
+    // participates (see enablePush's fan-out comment). Fire-and-forget and
+    // fenced on the runtime still being the installed one when the flag read
+    // resolves — best-effort, like every push registration.
+    if (rt && stored.vapidPublicKey) {
+      void kvGet<boolean>('push-enabled').then((enabled) => {
+        if (enabled && runtimesRef.current.get(stored.pairingId) === rt) void enablePushFlowForRuntime(rt);
+      }).catch(() => { /* best-effort */ });
+    }
     // Go ready WITHOUT touching the other runtimes — pairing appends.
     setPhase('ready');
-  }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen]);
+  }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen, enablePushFlowForRuntime]);
 
   const sendEnvelope = useCallback((pairingId: string, env: AnyEnvelope) => {
     // Enqueue to IDB first.  Once the write commits, if this pairing's
@@ -1554,22 +1594,23 @@ export function TransportProvider(props: TransportProviderProps) {
       if (ok) await kvSet('push-enabled', true);
       return ok;
     }
-    // Built-in VAPID flow: register against the first pairing that advertises
-    // a key and has a live transport. (Per-pairing push routing is Task 7.)
-    const rt = [...runtimesRef.current.values()].find((r) => r.pairing.vapidPublicKey && r.transport);
-    if (!rt || !rt.transport) return false;
+    // Built-in VAPID flow, fanned out across pairings. One browser
+    // subscription per install; each pairing is told about it over its own
+    // transport and pushes independently. Browsers key the subscription to
+    // ONE VAPID application key — instances that use the standard web-push
+    // vendor must share a public key to co-deliver; vendor-scheme transports
+    // are unaffected. The first pairing's key wins the browser registration;
+    // enablePushFlow for a mismatched-key instance fails closed (returns
+    // false) rather than throwing.
     const env = browserPushEnv();
     if (!env) return false;
-    const transport = rt.transport;
-    const ok = await enablePushFlow({
-      env,
-      vapidPublicKey: rt.pairing.vapidPublicKey!,
-      userId: rt.pairing.userId,
-      send: (e) => transport.send(e),
-    });
-    if (ok) await kvSet('push-enabled', true);
-    return ok;
-  }, [props.pushRegistrarOverride]);
+    let any = false;
+    for (const rt of runtimesRef.current.values()) {
+      any = (await enablePushFlowForRuntime(rt)) || any;
+    }
+    if (any) await kvSet('push-enabled', true);
+    return any;
+  }, [props.pushRegistrarOverride, enablePushFlowForRuntime]);
 
   const unpair = useCallback(async (pairingId: string) => {
     // Per-pairing unpair — the other pairings keep running.
@@ -1587,16 +1628,17 @@ export function TransportProvider(props: TransportProviderProps) {
     // R5-3/#R6-8: tell every OTHER open tab this exact pairing identity is
     // gone — see the auth-error handler's matching comment.
     bcRef.current?.postMessage({ type: 'identity-wiped', pairingId, epoch: wiped.epoch });
-    // Tear down THIS device's push registration before closing the transport
-    // (still need the connection + userId for the server-side unsubscribe).
-    // Without this, only local app state was ever wiped: the server-side
-    // subscription row and the browser's own PushManager registration both
-    // survived, so the device kept receiving the PRIOR user's push
-    // notifications (message bodies included) after pairing as someone else,
-    // until the next 404/410-based prune (or indefinitely, if that never
-    // happened). Best-effort: unpair proceeds regardless of outcome.
-    // (Per-pairing push bookkeeping is Task 7 — this is the current-behavior
-    // equivalent scoped to this pairing's transport.)
+    // Tear down THIS pairing's server-side push registration before closing
+    // the transport (still need the connection + userId for the instance
+    // envelope). Without this, the instance's subscription row survived, so
+    // the device kept receiving the PRIOR user's push notifications (message
+    // bodies included) after pairing as someone else, until the next
+    // 404/410-based prune (or indefinitely, if that never happened).
+    // Per-instance ONLY: the browser-level subscription is shared by every
+    // pairing on this device — it (and the host registrar's device-level
+    // registration, and the push-enabled flag) is torn down inside
+    // wipePairing when the LAST runtime is actually removed. Best-effort:
+    // unpair proceeds regardless of outcome.
     //
     // Captured into locals BEFORE nulling validUserId below — every further
     // use in this function reads these locals, never the runtime field, so
@@ -1618,11 +1660,22 @@ export function TransportProvider(props: TransportProviderProps) {
     // server unsubscribe cannot prevent the durable wipe from running its
     // clear retry. The cleanup keeps running detached; we just stop waiting.
     if (props.pushRegistrarOverride) {
-      await settleWithinCall(() => props.pushRegistrarOverride!.disable?.(), UNPAIR_CLEANUP_TIMEOUT_MS);
+      // Host-managed push is DEVICE-level (no per-instance half): disable()
+      // only with the last pairing. Two concurrent unpairs of the final two
+      // pairings can each see size 2 here and both skip it — an accepted
+      // residual for the host-registrar path (its disable() needs no live
+      // transport, so a host can re-run it; moving it after the runtime
+      // removal would break the durable-removal-while-parked ordering that
+      // #P1-F3 pins). The built-in browser-subscription teardown, where the
+      // same race silently strands OS-level deliveries, is checked at the
+      // deletion point inside wipePairing instead.
+      if (runtimesRef.current.size === 1) {
+        await settleWithinCall(() => props.pushRegistrarOverride!.disable?.(), UNPAIR_CLEANUP_TIMEOUT_MS);
+      }
     } else if (userId && transport) {
       const env = browserPushEnv();
       if (env) {
-        await settleWithinCall(() => unsubscribeCurrentPush({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
+        await settleWithinCall(() => unsubscribeInstanceOnly({ env, userId, send: (e) => transport.send(e) }), UNPAIR_CLEANUP_TIMEOUT_MS);
       }
     }
     // Shared teardown tail with the auth-error path (listeners off, bounded
@@ -1643,10 +1696,12 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, [refreshViews]);
 
-  // Push availability: a host registrar, or a VAPID key on ANY pairing. Reads
-  // the runtimes map keyed off `views`, which updates in lockstep with it.
-  const canEnablePush = !!props.pushRegistrarOverride
-    || views.some((v) => !!runtimesRef.current.get(v.pairingId)?.pairing.vapidPublicKey);
+  // Push availability: a VAPID key on ANY pairing, or a host registrar — but
+  // never with ZERO pairings (nothing could deliver a push worth enabling).
+  // Reads the runtimes map keyed off `views`, which updates in lockstep with
+  // it, so the banner re-evaluates as pairings come and go.
+  const canEnablePush = views.length > 0
+    && ([...runtimesRef.current.values()].some((r) => !!r.pairing.vapidPublicKey) || !!props.pushRegistrarOverride);
 
   const retryStorage = useCallback(async () => {
     // #F6: re-probe durable storage from the storage-error state. On success,

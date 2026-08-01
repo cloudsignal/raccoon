@@ -2,9 +2,10 @@
 import 'fake-indexeddb/auto';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createEnvelope } from '@raccoon/protocol';
+import { createEnvelope, type Envelope } from '@raccoon/protocol';
 import { closeDbForTests, kvGet, kvSet } from '../lib/idb.js';
 import { loadPairingsRaw, savePairings } from '../lib/session.js';
+import { __setPushEnvForTests, type PushEnv } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
 import { TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from './context.js';
@@ -14,7 +15,7 @@ import { TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from '
 // prior test's provider can't run async outbox work against the next test's
 // shared fake-IndexedDB (a cross-test flake once 'open' began scheduling
 // recoverProcessing()/drain(), #R6-2b/#R6-5b).
-afterEach(async () => { cleanup(); currentPairingTransport = null; await closeDbForTests(); });
+afterEach(async () => { cleanup(); currentPairingTransport = null; __setPushEnvForTests(null); await closeDbForTests(); });
 
 // The pairingId IS the outbox/approvals scope and every per-conversation key
 // prefix. Seeded pairings use a fixed ULID so keys are deterministic across
@@ -46,10 +47,28 @@ function agentMsg(channel: string, text: string) {
   });
 }
 
-async function mountPaired(transport: FakeTransport) {
+/** jsdom has no Notification/PushManager, so browserPushEnv() is null in every
+ *  test by default — this installs a deterministic PushEnv via the module
+ *  seam (mirrors idb's __setBlockedTimeoutMsForTests) and counts local
+ *  browser-level unsubscribes. Reset in afterEach. */
+function installFakePushEnv() {
+  const fake: PushEnv & { unsubscribeLocalCalls: number } = {
+    unsubscribeLocalCalls: 0,
+    permission: () => 'granted' as NotificationPermission,
+    requestPermission: async () => 'granted' as NotificationPermission,
+    getSubscription: async () => ({ endpoint: 'https://push.example/ep1', keys: { p256dh: 'p', auth: 'a' } }),
+    currentEndpoint: async () => 'https://push.example/ep1',
+    unsubscribeLocal: async () => { fake.unsubscribeLocalCalls += 1; },
+  };
+  __setPushEnvForTests(fake);
+  return fake;
+}
+
+async function mountPaired(transport: FakeTransport, opts?: { vapid?: string }) {
   await savePairings([{
     url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i',
     channels: ['coordinator'], epoch: EPOCH, pairingId: P1, transportKind: 'ws',
+    ...(opts?.vapid ? { vapidPublicKey: opts.vapid } : {}),
   }]);
   render(
     <TransportProvider makeTransport={(opts) => {
@@ -68,10 +87,11 @@ async function mountPaired(transport: FakeTransport) {
   await new Promise((r) => setTimeout(r, 20));
 }
 
-async function mountTwoPaired(tA: FakeTransport, tB: FakeTransport) {
+async function mountTwoPaired(tA: FakeTransport, tB: FakeTransport, opts?: { vapid?: string }) {
+  const vapid = opts?.vapid ? { vapidPublicKey: opts.vapid } : {};
   await savePairings([
-    { url: 'ws://a/', sessionToken: 'tA', userId: 'u1', instance: 'alpha', channels: ['coordinator'], epoch: 'eA', pairingId: P1, transportKind: 'ws' },
-    { url: 'ws://b/', sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eB', pairingId: P2, transportKind: 'ws' },
+    { url: 'ws://a/', sessionToken: 'tA', userId: 'u1', instance: 'alpha', channels: ['coordinator'], epoch: 'eA', pairingId: P1, transportKind: 'ws', ...vapid },
+    { url: 'ws://b/', sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eB', pairingId: P2, transportKind: 'ws', ...vapid },
   ]);
   render(
     <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
@@ -1395,6 +1415,9 @@ describe('TransportProvider', () => {
       act(() => { tB.setStatus('closed'); });
       act(() => { api.sendMessage(CK2, 'queued on B'); });
       act(() => { api.openChannel(CK2); }); // set a lastread marker for B
+      // openChannel's lastread write is fire-and-forget — await its commit
+      // before unpairing, or the later assertion races the IDB write (flake).
+      await waitFor(async () => expect(await kvGet(`lastread:${CK2}`)).toBeTruthy());
       await waitFor(async () => expect((await outbox.listForChannel('coordinator', P2)).length).toBe(1));
       await act(async () => { await api.unpair(P1); });
       await waitFor(() => expect(api.pairings).toHaveLength(1));
@@ -1486,6 +1509,59 @@ describe('TransportProvider', () => {
       });
       expect(api.pairings).toHaveLength(2);
       expect((await loadPairingsRaw()).map((p) => p.userId).sort()).toEqual(['u1', 'u9']);
+    });
+  });
+
+  describe('push registration fan-out (Task 7)', () => {
+    const pushSubs = (t: FakeTransport) =>
+      t.sent.filter((e): e is Envelope<'push.subscribe'> => e.kind === 'push.subscribe');
+    const pushUnsubs = (t: FakeTransport) => t.sent.filter((e) => e.kind === 'push.unsubscribe');
+
+    it('enablePush registers the same subscription with every pairing', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB, { vapid: 'BKey' });
+      installFakePushEnv();
+      await act(async () => { await api.enablePush(); });
+      const subA = pushSubs(tA);
+      const subB = pushSubs(tB);
+      expect(subA).toHaveLength(1);
+      expect(subB).toHaveLength(1);
+      expect(subA[0]!.payload.subscription.endpoint).toBe(subB[0]!.payload.subscription.endpoint); // ONE browser subscription
+      expect(subA[0]!.from).toBe('user:u1');   // each pairing's own userId
+      expect(subB[0]!.from).toBe('user:u2');
+    });
+
+    it('unpair sends push.unsubscribe only to that instance and keeps the browser subscription while others remain', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB, { vapid: 'BKey' });
+      const fakeEnv = installFakePushEnv();
+      await act(async () => { await api.enablePush(); });
+      await act(async () => { await api.unpair(P1); });
+      expect(pushUnsubs(tA)).toHaveLength(1);
+      expect(pushUnsubs(tB)).toHaveLength(0);
+      expect(fakeEnv.unsubscribeLocalCalls).toBe(0);   // B still needs the browser subscription
+      await act(async () => { await api.unpair(P2); });
+      expect(fakeEnv.unsubscribeLocalCalls).toBe(1);   // last pairing gone: local teardown
+    });
+
+    it('a pairing added while push is enabled gets registered automatically', async () => {
+      const t = new FakeTransport();
+      await mountPaired(t, { vapid: 'BKey' });         // single pairing seeding vapidPublicKey: 'BKey'
+      installFakePushEnv();
+      await act(async () => { await api.enablePush(); });
+      expect(pushSubs(t)).toHaveLength(1);
+      const t2 = new FakeTransport();
+      currentPairingTransport = t2;
+      let pair!: Promise<void>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://b/', transport: 'ws', token: 'tok' })); });
+      await act(async () => {
+        await t2.grant(createEnvelope('pair.grant', {
+          from: 'system', to: 'user:u2', channel: 'pairing',
+          payload: { sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], vapidPublicKey: 'BKey' },
+        }));
+        await pair;
+      });
+      await waitFor(() => expect(pushSubs(t2)).toHaveLength(1));
     });
   });
 });

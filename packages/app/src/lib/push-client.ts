@@ -18,7 +18,13 @@ export interface PushEnv {
   unsubscribeLocal(): Promise<void>;
 }
 
+// Test seam: browserPushEnv() feature-detects real browser APIs, which test
+// environments (jsdom) cannot supply. Mirrors idb's __setBlockedTimeoutMsForTests.
+let envOverride: PushEnv | null = null;
+export function __setPushEnvForTests(env: PushEnv | null): void { envOverride = env; }
+
 export function browserPushEnv(): PushEnv | null {
+  if (envOverride) return envOverride;
   if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return null;
   return {
     permission: () => Notification.permission,
@@ -89,14 +95,28 @@ export async function unsubscribeCurrentPush(opts: {
   userId: string;
   send: (env: AnyEnvelope) => Promise<void>;
 }): Promise<void> {
-  const endpoint = await opts.env.currentEndpoint().catch(() => null);
-  if (endpoint) {
-    await opts.send(createEnvelope('push.unsubscribe', {
-      from: userAddress(opts.userId),
-      to: 'system',
-      channel: 'system',
-      payload: { endpoint },
-    })).catch(() => { /* best-effort: still tear down locally below */ });
-  }
+  await unsubscribeInstanceOnly(opts);
   await opts.env.unsubscribeLocal().catch(() => { /* best-effort */ });
+}
+
+/**
+ * Server-side half of the teardown above, on its own: tell ONE instance (over
+ * its own transport, as its own userId) to drop this device's subscription
+ * row. The browser-level subscription is left intact — it is shared by every
+ * pairing on this device, and other instances may still deliver through it.
+ * Best-effort: a failed send must not block the caller's unpair teardown.
+ */
+export async function unsubscribeInstanceOnly(opts: {
+  env: PushEnv;
+  userId: string;
+  send: (env: AnyEnvelope) => Promise<void>;
+}): Promise<void> {
+  const endpoint = await opts.env.currentEndpoint().catch(() => null);
+  if (!endpoint) return;
+  await opts.send(createEnvelope('push.unsubscribe', {
+    from: userAddress(opts.userId),
+    to: 'system',
+    channel: 'system',
+    payload: { endpoint },
+  })).catch(() => { /* best-effort: caller proceeds with its teardown regardless */ });
 }
