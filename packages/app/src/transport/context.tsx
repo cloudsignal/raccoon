@@ -72,6 +72,9 @@ export interface PairingView {
   newAgents: string[];
   displayName: string;          // pairing.displayName ?? pairing.instance
   color: string;                // pairing.color ?? accentColor(pairingId)
+  /** Local marker override for non-branded instances ('bot' | 'server' |
+   *  'home' | 'sparkle'); undefined = the PlatformMark default. */
+  icon?: string;
   status: TransportStatus;
   transportKind: string;        // 'ws' | 'host' | a registered kind
   url?: string;
@@ -153,6 +156,9 @@ export interface ChatApi {
   unpair(pairingId: string): Promise<void>;
   /** Local display-name override; empty string clears it back to the default. */
   renamePairing(pairingId: string, displayName: string): Promise<void>;
+  /** Local icon/accent overrides (Platform detail). Same store rule as
+   *  renamePairing: an empty value clears that override. */
+  updatePlatformMeta(pairingId: string, patch: { color?: string; icon?: string }): Promise<void>;
 }
 
 /** Host-supplied push registration flow. enable() performs the vendor
@@ -436,6 +442,7 @@ export function TransportProvider(props: TransportProviderProps) {
       newAgents: newAgentsRef.current.get(r.pairing.pairingId) ?? [],
       displayName: r.pairing.displayName ?? r.pairing.instance,
       color: r.pairing.color ?? accentColor(r.pairing.pairingId),
+      ...(r.pairing.icon ? { icon: r.pairing.icon } : {}),
       status: r.statusNow,
       transportKind: r.pairing.transportKind,
       ...(r.pairing.url ? { url: r.pairing.url } : {}),
@@ -2129,6 +2136,19 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, [refreshViews]);
 
+  // Icon/accent counterpart to renamePairing — same store call, same
+  // runtime/view refresh. Kept separate so displayName's blur-commit UI and
+  // the tap-to-pick pickers each call the API they mean.
+  const updatePlatformMeta = useCallback(async (pairingId: string, patch: { color?: string; icon?: string }) => {
+    const list = await updatePairingMeta(pairingId, patch);
+    const rt = runtimesRef.current.get(pairingId);
+    const updated = list.find((p) => p.pairingId === pairingId);
+    if (rt && updated) {
+      rt.pairing = updated;
+      refreshViews();
+    }
+  }, [refreshViews]);
+
   // Push availability: a VAPID key on ANY pairing, or a host registrar — but
   // never with ZERO pairings (nothing could deliver a push worth enabling).
   // Reads the runtimes map keyed off `views`, which updates in lockstep with
@@ -2149,7 +2169,7 @@ export function TransportProvider(props: TransportProviderProps) {
   const api = useMemo<ChatApi>(() => ({
     phase, pairings: views, state, activeChannel, authError,
     pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing,
-    rescanPlatform, subscribeEvents,
+    updatePlatformMeta, rescanPlatform, subscribeEvents,
     // sendMessage, respondApproval, retryMessage are only wired once the
     // pairings are loaded and the transports are connected (phase === 'ready').
     // Before ready they are undefined at runtime (the `as` cast is intentional —
@@ -2159,7 +2179,7 @@ export function TransportProvider(props: TransportProviderProps) {
     sendMessage: (phase === 'ready' ? sendMessage : undefined) as ChatApi['sendMessage'],
     respondApproval: (phase === 'ready' ? respondApproval : undefined) as ChatApi['respondApproval'],
     retryMessage: (phase === 'ready' ? retryMessage : undefined) as ChatApi['retryMessage'],
-  }), [phase, views, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing, rescanPlatform, subscribeEvents]);
+  }), [phase, views, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing, updatePlatformMeta, rescanPlatform, subscribeEvents]);
 
   return <ChatContext.Provider value={api}>{props.children}</ChatContext.Provider>;
 }

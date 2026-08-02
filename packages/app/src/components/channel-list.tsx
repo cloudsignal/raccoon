@@ -199,7 +199,7 @@ export function ChannelList(props: {
               <div key={p.pairingId} className="mb-1">
                 {/* Header is a label, not a button — no drill-down. */}
                 <div className="flex items-center gap-[7px] px-4 pb-1.5 pt-4">
-                  <PlatformMark instance={p.instance} color={p.color} size={20} />
+                  <PlatformMark instance={p.instance} color={p.color} icon={p.icon} size={20} />
                   <span className="text-xs font-semibold uppercase tracking-wider text-ink-faint">
                     {p.displayName}{collides ? ` · ${p.instance}` : ''}
                   </span>

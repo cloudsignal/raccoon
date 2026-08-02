@@ -39,7 +39,7 @@ export function resolveConvKey(
  *  New pairings persist the first unused hue at creation (nextAccentColor);
  *  accentColor is the deterministic hash fallback for entries without a
  *  stored color. Locally overridable via PairedSession.color. */
-const ACCENTS = [
+export const ACCENTS = [
   'oklch(0.55 0.13 255)', // Blue
   'oklch(0.62 0.14 30)',  // Rust
   'oklch(0.56 0.1 155)',  // Moss

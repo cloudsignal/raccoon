@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
@@ -94,15 +94,16 @@ describe('chat shell', () => {
     expect(await screen.findByText('ping')).toBeTruthy(); // list preview
   });
 
-  it('unpairs from the settings sheet', async () => {
+  it('unpairs from the platform detail screen', async () => {
     await mount();
     const user = userEvent.setup();
-    await user.click(screen.getByText('Coordinator'));
-    await user.click(await screen.findByRole('button', { name: /open settings/i }));
-    // Two-step: arm the row's confirm, then confirm. displayName defaults to
-    // the instance name ('i'), so the arm button reads "Unpair i".
+    // Gear → Platforms → the platform's detail → destructive unpair (two-step
+    // sheet). displayName defaults to the instance name ('i').
+    await user.click(screen.getByRole('button', { name: 'Platforms' }));
+    await user.click(await screen.findByTestId('platform-row'));
     await user.click(await screen.findByRole('button', { name: 'Unpair i' }));
-    await user.click(await screen.findByRole('button', { name: 'Unpair' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Unpair' }));
+    // Last pairing gone — back to first-run setup.
     await waitFor(() => expect(screen.getByText(/pair this device/i)).toBeTruthy());
   });
 
@@ -352,5 +353,60 @@ describe('platform event toasts', () => {
     // Past the ~2.8s auto-dismiss only the row subtitle remains.
     await flushFake(3000);
     expect(screen.getAllByText('New agent granted on i')).toHaveLength(1);
+  });
+});
+
+describe('platforms navigation (push stack)', () => {
+  it('gear pushes Platforms, rows drill into detail, back pops in order', async () => {
+    await mountTwo();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Platforms' }));
+    // Platforms screen: one row per pairing.
+    expect(await screen.findByText('u1 on alpha · Connected')).toBeTruthy();
+    expect(screen.getAllByTestId('platform-row')).toHaveLength(2);
+    // Drill into beta's detail — identity rows replace the list (only the
+    // top of the stack renders).
+    await user.click(screen.getAllByTestId('platform-row')[1]!);
+    expect(await screen.findByText('You')).toBeTruthy();
+    expect(screen.getByText('u2')).toBeTruthy();
+    expect(screen.queryByText('u1 on alpha · Connected')).toBeNull();
+    // Back pops to Platforms...
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(await screen.findByText('u1 on alpha · Connected')).toBeTruthy();
+    expect(screen.queryByText('You')).toBeNull();
+    // ...and again to the chat list.
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await waitFor(() => expect(screen.queryAllByTestId('platform-row')).toHaveLength(0));
+    expect(screen.getByText('2 platforms · 4 agents')).toBeTruthy();
+  });
+
+  it('surfaces the revoke banner on Platforms, instance-discriminated on a name collision', async () => {
+    // Two pairings sharing the display name — the banner must say WHICH one.
+    const tA = new FakeTransport();
+    const tB = new FakeTransport();
+    await savePairings([
+      { url: 'ws://a/', sessionToken: 'ta', userId: 'u1', instance: 'alpha', displayName: 'Studio', channels: ['coordinator'], epoch: 'ea', pairingId: P1, transportKind: 'ws' },
+      { url: 'ws://b/', sessionToken: 'tb', userId: 'u2', instance: 'beta', displayName: 'Studio', channels: ['coordinator'], epoch: 'eb', pairingId: P2, transportKind: 'ws' },
+    ]);
+    render(
+      <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
+        <App />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getAllByText('Coordinator')).toHaveLength(2));
+    vi.useFakeTimers();
+    // The server terminally revokes B.
+    act(() => { tB.authFail(4403); });
+    await flushFake(500);
+    // Drain the revoked toast so only the banner carries the copy below.
+    await flushFake(3000);
+    fireEvent.click(screen.getByRole('button', { name: 'Platforms' }));
+    await flushFake(200);
+    expect(screen.getByText(
+      'Studio · beta was disconnected by its owner — everything else keeps running.',
+    )).toBeTruthy();
+    // Dismissible.
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(/disconnected by its owner/)).toBeNull();
   });
 });
