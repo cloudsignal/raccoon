@@ -59,6 +59,12 @@ export const pairedSessionSchema = sessionSchema.extend({
    *  'sparkle'); kept as an open string so the marker set can grow without a
    *  schema change. Same never-sent-anywhere local override as displayName. */
   icon: z.string().min(1).optional(),
+  /** Opaque per-transport-kind dial blob carried by the pair.grant. The
+   *  registry's transport factory for `transportKind` receives it verbatim at
+   *  dial time; the store never interprets it. Refreshed on re-pair (a fresh
+   *  grant may carry updated endpoints) — upsertPairing REPLACES it from the
+   *  incoming candidate, like sessionToken/epoch, never preserves the old one. */
+  transportConfig: z.unknown().optional(),
 });
 export type PairedSession = z.infer<typeof pairedSessionSchema>;
 
@@ -92,7 +98,8 @@ export async function savePairings(list: PairedSession[]): Promise<void> {
  * the same (url, userId) already exists: same instance re-scanned as the same
  * user. The refresh keeps the existing pairingId (all scoped state stays
  * attached), displayName and color (local user choices), and takes the fresh
- * sessionToken/channels/vapidPublicKey/epoch. Atomic via kvUpdate so two tabs
+ * sessionToken/channels/vapidPublicKey/epoch/transportConfig. Atomic via
+ * kvUpdate so two tabs
  * pairing concurrently cannot drop each other's entry.
  */
 export async function upsertPairing(p: PairedSession): Promise<PairedSession> {

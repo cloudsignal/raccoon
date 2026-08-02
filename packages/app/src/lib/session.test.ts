@@ -126,6 +126,37 @@ describe('pairings store', () => {
     expect((await updatePairingMeta(pairingA.pairingId, { icon: '' }))[0]!.icon).toBeUndefined();
   });
 
+  it('round-trips a pairing carrying an opaque transportConfig blob', async () => {
+    const withConfig: PairedSession = { ...pairingA, transportConfig: { host: 'x', n: 1 } };
+    await savePairings([withConfig]);
+    const [loaded] = await loadPairingsRaw();
+    expect(loaded!.transportConfig).toEqual({ host: 'x', n: 1 });
+  });
+
+  it('upsertPairing refresh replaces transportConfig from the fresh grant while preserving local meta', async () => {
+    await savePairings([{
+      ...pairingA, displayName: 'Home', color: '#10b981',
+      transportConfig: { host: 'old.example', n: 1 },
+    }]);
+    const rescanned: PairedSession = {
+      ...pairingA, pairingId: '01SHOULDNOTREPLACETHEOLDID', sessionToken: 'tokA2',
+      epoch: 'eA2', transportConfig: { host: 'new.example', n: 2 },
+    };
+    const stored = await upsertPairing(rescanned);
+    expect(stored.transportConfig).toEqual({ host: 'new.example', n: 2 }); // replaced
+    expect(stored.pairingId).toBe(pairingA.pairingId);                    // preserved
+    expect(stored.displayName).toBe('Home');                              // preserved
+    expect(stored.color).toBe('#10b981');                                 // preserved
+    expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ host: 'new.example', n: 2 });
+  });
+
+  it('absent transportConfig stays absent through a round-trip', async () => {
+    await savePairings([pairingA]);
+    const [loaded] = await loadPairingsRaw();
+    expect(loaded!.transportConfig).toBeUndefined();
+    expect('transportConfig' in loaded!).toBe(false);
+  });
+
   it('hostIdentityKey matches the legacy identity-key format', () => {
     expect(hostIdentityKey({ instance: 'i', userId: 'u1', epoch: 'e1' }))
       .toBe(JSON.stringify({ i: 'i', u: 'u1', e: 'e1' }));
