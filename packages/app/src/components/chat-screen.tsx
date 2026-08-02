@@ -5,6 +5,7 @@ import { handleSwNavigate } from '../lib/sw-navigate.js';
 import { ChannelHeader } from './channel-header.js';
 import { ChannelList } from './channel-list.js';
 import { Composer } from './composer.js';
+import { AddPlatformScreen } from './pair-panel.js';
 import { PlatformDetail } from './platform-detail.js';
 import { PlatformsScreen } from './platforms-screen.js';
 import { SettingsSheet } from './settings-sheet.js';
@@ -13,15 +14,13 @@ import { pushToast, ToastHost } from './ui/primitives.js';
 
 /** Pushed screens (README Interactions: push stack, 200ms slide-in). The
  *  chat list/thread is the stack's floor and never an entry. */
-type NavEntry = { s: 'platforms' } | { s: 'platform'; id: string };
+type NavEntry = { s: 'platforms' } | { s: 'platform'; id: string } | { s: 'pair' };
 
 export function ChatScreen() {
   const { activeChannel, openChannel, pairings, subscribeEvents } = useChat();
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // "+" opens the settings sheet directly on its Add-platform panel — the
-  // minimal seam until the dedicated pairing screen (Task 11) takes it over.
-  const [settingsStartOnAdd, setSettingsStartOnAdd] = useState(false);
-  // Platforms / platform-detail push stack (gear → Platforms → detail).
+  // Platforms / platform-detail / add-platform push stack
+  // (gear → Platforms → detail; "+" or a Platforms add entry → pair).
   const [nav, setNav] = useState<NavEntry[]>([]);
   // Remote-revoke banner for the Platforms screen (README decision 12) —
   // held here, not in the screen, so a revoke landing while the screen is
@@ -124,7 +123,9 @@ export function ChatScreen() {
     openChannel(null);
   };
 
-  const openAdd = (): void => { setSettingsStartOnAdd(true); setSettingsOpen(true); };
+  // Pushes the Add-platform flow screen on top of wherever the user is (the
+  // chat list's "+" or the Platforms screen's add entries).
+  const openAdd = (): void => setNav((n) => [...n, { s: 'pair' }]);
   const navTop = nav[nav.length - 1];
 
   return (
@@ -153,9 +154,7 @@ export function ChatScreen() {
       </main>
       {navTop ? (
         // Pushed screen: each push remounts the container (stack-signature
-        // key), replaying the 200ms slide-in (README Interactions). Sits
-        // under the settings sheet (z-10) so the Add-platform seam opens
-        // over the Platforms screen.
+        // key), replaying the 200ms slide-in (README Interactions).
         <div
           key={nav.map((e) => (e.s === 'platform' ? `platform:${e.id}` : e.s)).join('/')}
           className="absolute inset-0 z-[5] animate-screen-in bg-surface"
@@ -168,16 +167,19 @@ export function ChatScreen() {
               revokeNotice={revokeNotice}
               onDismissRevoke={() => setRevokeNotice(null)}
             />
-          ) : (
+          ) : navTop.s === 'platform' ? (
             <PlatformDetail pairingId={navTop.id} onBack={() => setNav((n) => n.slice(0, -1))} />
+          ) : (
+            // Success/reconnected "Done" opens the chats (stack reset); Back
+            // pops to wherever the flow was pushed from.
+            <AddPlatformScreen
+              onBack={() => setNav((n) => n.slice(0, -1))}
+              onDone={() => setNav([])}
+            />
           )}
         </div>
       ) : null}
-      <SettingsSheet
-        open={settingsOpen}
-        startOnAdd={settingsStartOnAdd}
-        onClose={() => setSettingsOpen(false)}
-      />
+      <SettingsSheet open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <ToastHost />
     </div>
   );

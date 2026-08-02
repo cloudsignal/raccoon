@@ -123,12 +123,9 @@ function Row(props: {
 
 export function ChannelList(props: {
   onOpen: (key: ConvKey) => void;
-  /** "+" entry — opens the Add-platform flow. For now the chat screen routes
-   *  it to the settings sheet's Add-platform panel; the dedicated pairing
-   *  screen (Task 11) takes this seam over. */
+  /** "+" entry — pushes the Add-platform flow screen. */
   onAddPlatform: () => void;
-  /** Gear entry — opens the settings sheet (the Platforms screen reroutes it
-   *  in Task 10). */
+  /** Gear entry — pushes the Platforms screen. */
   onSettings: () => void;
 }) {
   const { pairings, state } = useChat();
@@ -205,7 +202,10 @@ export function ChannelList(props: {
                   </span>
                   {p.status !== 'open' ? (
                     <span className="text-[11px] text-ink-faint">
-                      · {p.status === 'closed' ? 'offline' : 'connecting'}
+                      {/* Prototype casing; unsupported kinds read "Can't connect here". */}
+                      · {p.status !== 'closed' ? 'Connecting'
+                        : p.transportKind !== 'ws' && p.transportKind !== 'host' ? 'Can’t connect here'
+                        : 'Offline'}
                     </span>
                   ) : null}
                 </div>

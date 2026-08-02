@@ -30,8 +30,7 @@ function statusLine(p: PairingView, queued: number): string {
 export function PlatformsScreen(props: {
   onBack: () => void;
   onOpenDetail: (pairingId: string) => void;
-  /** "+ Add platform" — routes to the Add-platform seam (the settings sheet's
-   *  PairPanel until the dedicated pairing screen, Task 11, takes it over). */
+  /** "+ Add platform" — pushes the Add-platform flow screen. */
   onAddPlatform: () => void;
   /** Remote-revoke banner text (README decision 12), or null. Owned by the
    *  caller — ChatScreen builds it from the `revoked` PlatformEvent so a

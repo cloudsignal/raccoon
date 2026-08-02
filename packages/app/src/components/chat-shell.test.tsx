@@ -104,7 +104,7 @@ describe('chat shell', () => {
     await user.click(await screen.findByRole('button', { name: 'Unpair i' }));
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Unpair' }));
     // Last pairing gone — back to first-run setup.
-    await waitFor(() => expect(screen.getByText(/pair this device/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/pair your first platform/i)).toBeTruthy());
   });
 
   it('clears the composer draft when switching channels', async () => {
@@ -273,6 +273,9 @@ describe('grouped conversation list (default)', () => {
     // no instance suffix.
     expect(screen.queryAllByTestId('pairing-badge')).toHaveLength(0);
     expect(rows.some((t) => t.includes('Coordinator ·'))).toBe(false);
+    // Group-header status hint uses the prototype casing.
+    act(() => tB.setStatus('closed'));
+    expect(await screen.findByText('· Offline')).toBeTruthy();
   });
 
   it('discriminates duplicate platform display names by instance in the group header', async () => {
@@ -322,11 +325,10 @@ describe('grouped conversation list (default)', () => {
   it('offers add-platform and platforms entries; "+" hides for host-managed installs', async () => {
     await mount();
     expect(screen.getByRole('button', { name: 'Platforms' })).toBeTruthy();
-    // "+" opens the settings sheet with the Add-platform panel expanded (the
-    // Task 11 pairing screen will take this seam over).
+    // "+" pushes the dedicated Add-platform screen — not the settings sheet.
     await userEvent.setup().click(screen.getByRole('button', { name: 'Add platform' }));
-    expect(await screen.findByText('Settings')).toBeTruthy();
-    expect(screen.getByText('Enter code manually')).toBeTruthy(); // PairPanel is open
+    expect(await screen.findByPlaceholderText(/paste the pairing code/i)).toBeTruthy();
+    expect(screen.queryByText('Settings')).toBeNull();
     cleanup();
     await closeDbForTests();
     // A host-managed pairing owns identity — never offer "Add platform".
@@ -339,6 +341,53 @@ describe('grouped conversation list (default)', () => {
     await waitFor(() => expect(screen.getByText('Coordinator')).toBeTruthy());
     expect(screen.queryByRole('button', { name: 'Add platform' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Platforms' })).toBeTruthy();
+  });
+});
+
+describe('add-platform flow (pushed screen)', () => {
+  it('pairs a second platform through the pushed screen; Open chats resets to the list', async () => {
+    const tA = new FakeTransport();
+    const tNew = new FakeTransport();
+    await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator', 'echo'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
+    render(
+      <TransportProvider makeTransport={(opts) => {
+        if (opts.url === 'ws://new/') { tNew.onAdoptGrant = opts.onAdoptGrant; return tNew; }
+        return tA;
+      }}>
+        <App />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('Coordinator')).toBeTruthy());
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Add platform' }));
+    await user.type(
+      await screen.findByPlaceholderText(/paste the pairing code/i),
+      JSON.stringify({ v: 1, instanceUrl: 'ws://new/', transport: 'ws', token: 'tok' })
+        .replaceAll('{', '{{').replaceAll('[', '[['),
+    );
+    await user.click(screen.getByRole('button', { name: /^connect$/i }));
+    await act(async () => {
+      await tNew.grant(createEnvelope('pair.grant', {
+        from: 'system', to: 'user:u2', channel: 'pairing',
+        payload: { sessionToken: 's2', userId: 'u2', instance: 'beta', channels: ['coordinator'] },
+      }));
+    });
+    // Success screen: platform name + granted agents from the stored pairing.
+    expect(await screen.findByText('Connected · beta')).toBeTruthy();
+    expect(screen.getByText(/1 agent granted — Coordinator/)).toBeTruthy();
+    // Open chats resets the push stack to the (now two-platform) list.
+    await user.click(screen.getByRole('button', { name: /open chats/i }));
+    expect(await screen.findByText('2 platforms · 3 agents')).toBeTruthy();
+  });
+
+  it('pushes the flow from the Platforms screen add entry and pops back to Platforms', async () => {
+    await mount();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Platforms' }));
+    await user.click(await screen.findByRole('button', { name: '+ Add platform' }));
+    expect(await screen.findByPlaceholderText(/paste the pairing code/i)).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(await screen.findByTestId('platform-row')).toBeTruthy();
   });
 });
 
