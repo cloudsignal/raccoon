@@ -22,7 +22,7 @@ export function StorageErrorScreen() {
       <div className="text-center">
         <h1 className="text-xl font-semibold text-ink">Storage unavailable</h1>
         <p className="mt-1 max-w-xs text-sm text-ink-faint">
-          {authError ?? 'This device can’t save data locally, so pairing is disabled until storage works.'}
+          {authError?.message ?? 'This device can’t save data locally, so pairing is disabled until storage works.'}
         </p>
       </div>
       <button

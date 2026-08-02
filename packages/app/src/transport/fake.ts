@@ -1,5 +1,5 @@
 import type { AnyEnvelope, Envelope, TransportStatus } from '@raccoon/protocol';
-import type { AppTransport } from './types.js';
+import type { AppTransport, SessionMeta } from './types.js';
 
 export class FakeTransport implements AppTransport {
   sent: AnyEnvelope[] = [];
@@ -16,6 +16,7 @@ export class FakeTransport implements AppTransport {
   private statusHandlers = new Set<(s: TransportStatus) => void>();
   private grantHandlers = new Set<(g: Envelope<'pair.grant'>) => void>();
   private authHandlers = new Set<(code: number) => void>();
+  private sessionMetaHandlers = new Set<(meta: SessionMeta) => void>();
 
   async connect(): Promise<void> {
     if (this.failConnect) { this.failConnect = false; this.setStatus('closed'); throw new Error('connect failed'); }
@@ -32,6 +33,7 @@ export class FakeTransport implements AppTransport {
   onStatus(h: (s: TransportStatus) => void): () => void { this.statusHandlers.add(h); return () => this.statusHandlers.delete(h); }
   onGrant(h: (g: Envelope<'pair.grant'>) => void): () => void { this.grantHandlers.add(h); return () => this.grantHandlers.delete(h); }
   onAuthError(h: (code: number) => void): () => void { this.authHandlers.add(h); return () => this.authHandlers.delete(h); }
+  onSessionMeta(h: (meta: SessionMeta) => void): () => void { this.sessionMetaHandlers.add(h); return () => this.sessionMetaHandlers.delete(h); }
 
   emit(env: AnyEnvelope): void { for (const h of this.envelopeHandlers) h(env); }
   setStatus(s: TransportStatus): void { for (const h of this.statusHandlers) h(s); }
@@ -42,4 +44,7 @@ export class FakeTransport implements AppTransport {
     this.setStatus('open');
   }
   authFail(code: number): void { for (const h of this.authHandlers) h(code); }
+  /** Models the WS transport's resume-ok grant re-delivery (Task 4): emitted
+   *  AFTER the 'open' status for the connection that produced it. */
+  emitSessionMeta(meta: SessionMeta): void { for (const h of this.sessionMetaHandlers) h(meta); }
 }

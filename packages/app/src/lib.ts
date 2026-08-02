@@ -37,8 +37,18 @@
  *   PairingView).
  * - The host is fully responsible for authentication and transport lifecycle
  *   (the provider does NOT call close() on an override transport on unmount).
- * - `pairWithPayload` resolves `false` with an error message (authError)
- *   under an override — the host owns identity.
+ * - `pairWithPayload` resolves `false` with a typed notice (authError:
+ *   AuthNotice, kind 'host-managed') under an override — the host owns
+ *   identity. Outside override mode it resolves a PairSuccess object
+ *   ({ kind: 'new' | 'refreshed', pairingId }) on success — object-truthy, so
+ *   plain truthiness checks keep working — or `false` with the failure reason
+ *   in `authError` ({ kind, message }; kinds: rejected, unsupported,
+ *   unreachable, host-managed, revoked, unpaired-elsewhere).
+ * - `subscribeEvents` delivers PlatformEvents (new-agents, reconnect-flush,
+ *   revoked) for toast/banner surfaces; `rescanPlatform` bounces one
+ *   pairing's transport so a fresh resume re-delivers its channel grant
+ *   (SessionMeta); each PairingView carries `newAgents` — channel names
+ *   granted since last seen.
  *
  * `sessionOverride` MUST accompany `transportOverride`.  Without it,
  * `pairings` is empty, the conversation list is empty, and all outbound
@@ -67,8 +77,8 @@ export { UpdateGate } from './components/update-gate.js';
 
 // Transport layer
 export { TransportProvider, useChat } from './transport/context.js';
-export type { ChatApi, PairingView, TransportProviderProps, PushRegistrar } from './transport/context.js';
-export type { AppTransport, MakeTransport, TransportRegistry } from './transport/types.js';
+export type { ChatApi, PairingView, TransportProviderProps, PushRegistrar, PairSuccess, AuthNotice, PlatformEvent } from './transport/context.js';
+export type { AppTransport, MakeTransport, TransportRegistry, SessionMeta } from './transport/types.js';
 
 // Conversation keys — `${pairingId}/${channel}`, the state key for every
 // per-conversation ChatApi call.

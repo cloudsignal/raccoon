@@ -17,6 +17,7 @@ export function PairPanel(props: { onDone?: () => void }) {
     setBusy(true);
     setError(null);
     try {
+      // PairSuccess (object) is truthy on success; false = resolved-but-failed.
       const paired = await pairWithPayload(payload.trim());
       if (paired) {
         props.onDone?.();
@@ -34,7 +35,7 @@ export function PairPanel(props: { onDone?: () => void }) {
 
   return (
     <div className="flex w-full max-w-xs flex-col gap-3">
-      {authError ? <p className="text-center text-sm text-ink-soft">{authError}</p> : null}
+      {authError ? <p className="text-center text-sm text-ink-soft">{authError.message}</p> : null}
       {mode === 'scan' ? (
         <div className="flex flex-col gap-3">
           <QrScanner onResult={(text) => void pair(text)} />

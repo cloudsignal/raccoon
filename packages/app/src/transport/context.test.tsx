@@ -8,7 +8,10 @@ import { loadPairingsRaw, savePairings } from '../lib/session.js';
 import { __setPushEnvForTests, type PushEnv } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
-import { __setSendAttemptTimeoutForTests, TransportProvider, TYPING_AUTO_CLEAR_MS, useChat, type ChatApi } from './context.js';
+import {
+  __setSendAttemptTimeoutForTests, TransportProvider, TYPING_AUTO_CLEAR_MS, useChat,
+  type ChatApi, type PairSuccess, type PlatformEvent,
+} from './context.js';
 
 // Unmount every rendered provider BEFORE resetting the DB — the boot effect's
 // cleanup clears its periodic lease sweep, BroadcastChannels, and timers, so a
@@ -128,7 +131,7 @@ describe('TransportProvider', () => {
         payload: { sessionToken: 's1', userId: 'u1', instance: 'echo', channels: ['coordinator'] },
       }));
       // Success is REPORTED: the caller (PairPanel's onDone) relies on it.
-      expect(await pairing).toBe(true);
+      expect(await pairing).toMatchObject({ kind: 'new' });
     });
     await waitFor(() => expect(api.phase).toBe('ready'));
     expect(api.pairings[0]?.userId).toBe('u1');
@@ -183,7 +186,7 @@ describe('TransportProvider', () => {
       // Failure resolves false (never throws) — the reason lands in authError.
       expect(await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }))).toBe(false);
     });
-    expect(api.authError).toContain('No transport is available');
+    expect(api.authError?.message).toContain('No transport is available');
     expect(api.phase).toBe('setup');
   });
 
@@ -936,7 +939,7 @@ describe('TransportProvider', () => {
     expect(api.activeChannel).toBe(CK);
     act(() => { transport.authFail(4403); });
     await waitFor(() => expect(api.phase).toBe('setup'));
-    expect(api.authError).toContain('unpaired');
+    expect(api.authError?.message).toContain('unpaired');
     // Without this, a stale ?c= URL (or activeChannel) could reopen a
     // conversation left over from the prior pairing after a fresh one.
     expect(api.activeChannel).toBeNull();
@@ -1262,7 +1265,7 @@ describe('TransportProvider', () => {
       await act(async () => {
         await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://h:1/', transport: 'ws', token: 'tok' }));
       });
-      expect(api.authError).toContain('managed by the host');
+      expect(api.authError?.message).toContain('managed by the host');
       expect(await loadPairingsRaw()).toEqual([]); // never wrote IDB pairings
     });
 
@@ -1291,7 +1294,7 @@ describe('TransportProvider', () => {
       await mountPaired(transport);
       act(() => { transport.authFail(4403); });
       await waitFor(() => expect(api.phase).toBe('setup'));
-      expect(api.authError).toContain('unpaired');
+      expect(api.authError?.message).toContain('unpaired');
     });
   });
 
@@ -1571,7 +1574,7 @@ describe('TransportProvider', () => {
       await waitFor(() => expect(api.pairings).toHaveLength(1));
       expect(api.pairings[0]!.pairingId).toBe(P2);
       expect(api.phase).toBe('ready');
-      expect(api.authError).toContain('alpha');   // names the affected instance
+      expect(api.authError?.message).toContain('alpha');   // names the affected instance
       // B still live:
       act(() => { tB.emit(agentMsg('coordinator', 'still works')); });
       await waitFor(() => expect(api.state.messages[CK2]!.some((m) => m.text === 'still works')).toBe(true));
@@ -1599,14 +1602,16 @@ describe('TransportProvider', () => {
       // mountPaired's makeTransport hands pairWithPayload the staged transport.
       const t2 = new FakeTransport();
       currentPairingTransport = t2;
-      let pair!: Promise<boolean>;
+      let pair!: Promise<PairSuccess | false>;
       act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://x/', transport: 'ws', token: 'fresh' })); });
       await act(async () => {
         await t2.grant(createEnvelope('pair.grant', {
           from: 'system', to: 'user:u1', channel: 'pairing',
           payload: { sessionToken: 't2', userId: 'u1', instance: 'i', channels: ['coordinator'] },
         }));
-        expect(await pair).toBe(true); // boolean contract: success reported
+        // PairSuccess contract: a re-scan of an existing (url, userId) reports
+        // 'refreshed' with the PRESERVED pairingId.
+        expect(await pair).toEqual({ kind: 'refreshed', pairingId: P1 });
       });
       const list = await loadPairingsRaw();
       expect(list).toHaveLength(1);
@@ -1666,17 +1671,156 @@ describe('TransportProvider', () => {
       await mountPaired(t);
       const t2 = new FakeTransport();
       currentPairingTransport = t2;
-      let pair!: Promise<boolean>;
+      let pair!: Promise<PairSuccess | false>;
       act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://x/', transport: 'ws', token: 'other' })); });
       await act(async () => {
         await t2.grant(createEnvelope('pair.grant', {
           from: 'system', to: 'user:u9', channel: 'pairing',
           payload: { sessionToken: 't9', userId: 'u9', instance: 'i', channels: ['coordinator'] },
         }));
-        expect(await pair).toBe(true); // boolean contract: success reported
+        // PairSuccess contract: a dup-guard miss appends and reports 'new'.
+        expect(await pair).toMatchObject({ kind: 'new' });
       });
       expect(api.pairings).toHaveLength(2);
       expect((await loadPairingsRaw()).map((p) => p.userId).sort()).toEqual(['u1', 'u9']);
+    });
+  });
+
+  describe('platform UX — SessionMeta refresh, NEW agents, rescan, typed notices (Task 5)', () => {
+    it('SessionMeta with a new channel updates the stored pairing and marks it NEW', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB);
+      act(() => { tA.emitSessionMeta({ instance: 'alpha', channels: ['coordinator', 'courier'] }); });
+      await waitFor(() => expect(api.pairings.find((p) => p.pairingId === P1)!.channels).toContain('courier'));
+      expect(api.pairings.find((p) => p.pairingId === P1)!.newAgents).toEqual(['courier']);
+      // Durably persisted through the epoch-gated grant update — survives reload.
+      expect((await loadPairingsRaw()).find((p) => p.pairingId === P1)!.channels).toContain('courier');
+      // The other pairing's grant is untouched.
+      expect(api.pairings.find((p) => p.pairingId === P2)!.channels).toEqual(['coordinator']);
+      // Opening the marked conversation clears its NEW state.
+      act(() => { api.openChannel(`${P1}/courier`); });
+      await waitFor(() => expect(api.pairings.find((p) => p.pairingId === P1)!.newAgents).toEqual([]));
+      expect(await kvGet<string[]>(`newagents:${P1}`)).toEqual([]);
+    });
+
+    it('SessionMeta with a stale runtime epoch is dropped (no store write)', async () => {
+      const transport = new FakeTransport();
+      await mountPaired(transport); // runtime holds epoch 'e1'
+      // Another tab refreshed the pairing behind this runtime's back: the
+      // durable store now carries epoch 'e2'. This runtime's epoch is STALE.
+      await savePairings([{
+        url: 'ws://x/', sessionToken: 't2', userId: 'u1', instance: 'i',
+        channels: ['coordinator'], epoch: 'e2', pairingId: P1, transportKind: 'ws',
+      }]);
+      act(() => { transport.emitSessionMeta({ instance: 'i', channels: ['coordinator', 'courier'] }); });
+      await new Promise((r) => setTimeout(r, 30));
+      // No write happened (epoch-gated null) and no NEW marks were minted.
+      expect((await loadPairingsRaw())[0]!.channels).toEqual(['coordinator']);
+      expect(api.pairings.find((p) => p.pairingId === P1)!.channels).toEqual(['coordinator']);
+      expect(api.pairings.find((p) => p.pairingId === P1)!.newAgents).toEqual([]);
+      expect(await kvGet(`newagents:${P1}`)).toBeUndefined();
+    });
+
+    it('SessionMeta removing a channel hides its conversation row source', async () => {
+      const transport = new FakeTransport();
+      await mountPaired(transport); // channels: ['coordinator']
+      act(() => { transport.emitSessionMeta({ instance: 'i', channels: ['scout'] }); });
+      await waitFor(() => expect(api.pairings.find((p) => p.pairingId === P1)!.channels).toEqual(['scout']));
+      expect(api.pairings.find((p) => p.pairingId === P1)!.channels).not.toContain('coordinator');
+      expect((await loadPairingsRaw())[0]!.channels).toEqual(['scout']);
+    });
+
+    it('rescanPlatform bounces the transport and applies the fresh meta', async () => {
+      const t1 = new FakeTransport(); const t2 = new FakeTransport();
+      const queue = [t1, t2];
+      await savePairings([{
+        url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i',
+        channels: ['coordinator'], epoch: EPOCH, pairingId: P1, transportKind: 'ws',
+      }]);
+      render(
+        <TransportProvider makeTransport={() => queue.shift() ?? new FakeTransport()}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(t1.connected).toBe(true);
+      await act(async () => { await api.rescanPlatform(P1); });
+      // Re-dialed through the factory: fresh transport connected, old one closed.
+      await waitFor(() => expect(t2.connected).toBe(true));
+      expect(t1.connected).toBe(false);
+      // The fresh connection's resume-ok meta applies onto the same pairing.
+      act(() => { t2.emitSessionMeta({ instance: 'i', channels: ['coordinator', 'courier'] }); });
+      await waitFor(() => expect(api.pairings.find((p) => p.pairingId === P1)!.channels).toContain('courier'));
+      expect(api.pairings.find((p) => p.pairingId === P1)!.newAgents).toEqual(['courier']);
+    });
+
+    it('authError carries a kind', async () => {
+      // unsupported: no registered factory for the payload's transport kind.
+      render(
+        <TransportProvider makeTransport={() => new FakeTransport()}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      await act(async () => {
+        expect(await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }))).toBe(false);
+      });
+      expect(api.authError).toMatchObject({ kind: 'unsupported' });
+      // rejected: a terminal auth failure during interactive pairing.
+      const t = new FakeTransport();
+      render(
+        <TransportProvider makeTransport={(opts) => { t.onAdoptGrant = opts.onAdoptGrant; return t; }}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      let pair!: Promise<PairSuccess | false>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://h/', transport: 'ws', token: 'tok' })); });
+      await act(async () => {
+        t.authFail(4401);
+        expect(await pair).toBe(false);
+      });
+      expect(api.authError).toMatchObject({ kind: 'rejected' });
+    });
+
+    it('boot loads persisted NEW-agent marks and unpair wipes them (kv + view)', async () => {
+      await kvSet(`newagents:${P1}`, ['coordinator']);
+      const transport = new FakeTransport();
+      await mountPaired(transport);
+      await waitFor(() => expect(api.pairings[0]!.newAgents).toEqual(['coordinator']));
+      await act(async () => { await api.unpair(P1); });
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      expect(await kvGet(`newagents:${P1}`)).toBeUndefined();
+    });
+
+    it('emits a revoked event when a pairing is terminally unpaired by its server', async () => {
+      const tA = new FakeTransport(); const tB = new FakeTransport();
+      await mountTwoPaired(tA, tB);
+      const events: PlatformEvent[] = [];
+      const unsub = api.subscribeEvents((e) => events.push(e));
+      act(() => { tA.authFail(4401); });
+      await waitFor(() => expect(events.some((e) => e.type === 'revoked')).toBe(true));
+      expect(events.find((e) => e.type === 'revoked')).toMatchObject({ pairingId: P1, displayName: 'alpha' });
+      expect(api.authError).toMatchObject({ kind: 'revoked' });
+      unsub();
+    });
+
+    it('emits reconnect-flush with the count of rows sent by the first drain pass after reconnect', async () => {
+      const transport = new FakeTransport();
+      await mountPaired(transport);
+      const events: PlatformEvent[] = [];
+      const unsub = api.subscribeEvents((e) => events.push(e));
+      act(() => { transport.setStatus('closed'); transport.connected = false; });
+      act(() => { api.sendMessage(CK, 'one'); });
+      await waitFor(async () => expect((await outbox.listForChannel('coordinator', P1)).length).toBe(1));
+      await new Promise((r) => setTimeout(r, 2)); // deterministic FIFO order
+      act(() => { api.sendMessage(CK, 'two'); });
+      await waitFor(async () => expect((await outbox.listForChannel('coordinator', P1)).length).toBe(2));
+      await act(async () => { await transport.connect(); });
+      await waitFor(() => expect(events.some((e) => e.type === 'reconnect-flush')).toBe(true));
+      expect(events.find((e) => e.type === 'reconnect-flush')).toMatchObject({ pairingId: P1, sent: 2 });
+      unsub();
     });
   });
 
@@ -1748,14 +1892,14 @@ describe('TransportProvider', () => {
       expect(pushSubs(t)).toHaveLength(1);
       const t2 = new FakeTransport();
       currentPairingTransport = t2;
-      let pair!: Promise<boolean>;
+      let pair!: Promise<PairSuccess | false>;
       act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://b/', transport: 'ws', token: 'tok' })); });
       await act(async () => {
         await t2.grant(createEnvelope('pair.grant', {
           from: 'system', to: 'user:u2', channel: 'pairing',
           payload: { sessionToken: 'tB', userId: 'u2', instance: 'beta', channels: ['coordinator'], vapidPublicKey: 'BKey' },
         }));
-        expect(await pair).toBe(true); // boolean contract: success reported
+        expect(await pair).toMatchObject({ kind: 'new' }); // object-truthy success
       });
       await waitFor(() => expect(pushSubs(t2)).toHaveLength(1));
     });

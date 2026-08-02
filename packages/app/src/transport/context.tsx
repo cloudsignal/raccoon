@@ -14,7 +14,7 @@ import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
 import * as adopt from '../lib/adopt.js';
 import {
-  hostIdentityKey, loadPairingsRaw, removePairingIfMatches, updatePairingMeta, upsertPairing,
+  hostIdentityKey, loadPairingsRaw, removePairingIfMatches, updatePairingGrant, updatePairingMeta, upsertPairing,
   type PairedSession, type Session,
 } from '../lib/session.js';
 import { accentColor, convKeyOf, nextAccentColor, resolveConvKey, type ConvKey } from '../lib/conv-key.js';
@@ -66,12 +66,45 @@ export interface PairingView {
   instance: string;
   userId: string;
   channels: string[];
+  /** Channel names currently marked NEW — granted by a SessionMeta/grant
+   *  refresh and not yet opened. Persisted per pairing (kv `newagents:` key);
+   *  opening the conversation clears its mark. */
+  newAgents: string[];
   displayName: string;          // pairing.displayName ?? pairing.instance
   color: string;                // pairing.color ?? accentColor(pairingId)
   status: TransportStatus;
   transportKind: string;        // 'ws' | 'host' | a registered kind
   url?: string;
 }
+
+/** pairWithPayload's success report. 'refreshed' = the (url, userId) dup-guard
+ *  preserved an existing pairingId (a re-scan of an already-paired instance);
+ *  'new' = a fresh pairing was appended. Object-truthy, so callers that only
+ *  care about success/failure keep working with a plain truthiness check. */
+export type PairSuccess = { kind: 'new' | 'refreshed'; pairingId: string };
+
+/** Typed pairing/auth notice (was a bare string). `message` stays the
+ *  human-readable copy the UI renders; `kind` lets screens branch:
+ *  - rejected: the server refused the pairing (bad/expired token)
+ *  - unsupported: no transport factory registered for the payload's kind, or
+ *    the transport cannot do interactive pairing
+ *  - unreachable: pairing recovery timed out, or durable local storage is
+ *    unavailable (the storage-error phase keeps its own screen/phase paths)
+ *  - host-managed: identity is owned by the embedding host
+ *  - revoked: a pairing was terminally unpaired by its server (message names
+ *    the platform's displayName)
+ *  - unpaired-elsewhere: another tab unpaired this device */
+export interface AuthNotice {
+  kind: 'rejected' | 'unsupported' | 'unreachable' | 'host-managed' | 'revoked' | 'unpaired-elsewhere';
+  message: string;
+}
+
+/** Platform lifecycle moments for toast/banner surfaces. Delivered to
+ *  subscribeEvents callbacks; fire-and-forget (no replay). */
+export type PlatformEvent =
+  | { type: 'new-agents'; pairingId: string; displayName: string; agents: string[] }
+  | { type: 'reconnect-flush'; pairingId: string; displayName: string; sent: number }
+  | { type: 'revoked'; pairingId: string; displayName: string };
 
 export interface ChatApi {
   phase: 'loading' | 'setup' | 'ready' | 'storage-error';
@@ -81,11 +114,21 @@ export interface ChatApi {
   pairings: PairingView[];
   state: ChatState;
   activeChannel: ConvKey | null;
-  authError: string | null;
+  authError: AuthNotice | null;
   /** Appends a pairing (or refreshes a re-scanned one in place); never wipes
-   *  other pairings. Resolves false when pairing failed — the reason is
-   *  surfaced via authError. Throws only on a malformed payload. */
-  pairWithPayload(json: string): Promise<boolean>;
+   *  other pairings. Resolves a PairSuccess (object-truthy) on success —
+   *  kind 'refreshed' when the dup-guard preserved an existing pairingId —
+   *  or false when pairing failed (the reason is surfaced via authError).
+   *  Throws only on a malformed payload. */
+  pairWithPayload(json: string): Promise<PairSuccess | false>;
+  /** Bounce ONE pairing's transport: unsubscribe + close, then re-dial via the
+   *  registered factory. A fresh resume-ok re-delivers the SessionMeta grant
+   *  fields, so this is the manual "rescan for new agents" affordance. No-op
+   *  in host-override mode (the host owns the transport lifecycle). */
+  rescanPlatform(pairingId: string): Promise<void>;
+  /** Subscribe to platform lifecycle events (new agents granted, reconnect
+   *  flush, remote revoke). Returns the unsubscribe. */
+  subscribeEvents(cb: (e: PlatformEvent) => void): () => void;
   /** #F6: re-probe durable storage from the 'storage-error' phase. On success,
    *  moves to 'setup' (pairing enabled); otherwise stays in 'storage-error'. */
   retryStorage(): Promise<void>;
@@ -304,7 +347,7 @@ interface PairingRuntime {
 export function TransportProvider(props: TransportProviderProps) {
   const [phase, setPhase] = useState<'loading' | 'setup' | 'ready' | 'storage-error'>('loading');
   const [views, setViews] = useState<PairingView[]>([]);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<AuthNotice | null>(null);
   const [state, dispatch] = useReducer(chatReducer, emptyChatState);
   const [activeChannel, setActiveChannel] = useState<ConvKey | null>(null);
 
@@ -325,7 +368,14 @@ export function TransportProvider(props: TransportProviderProps) {
   // auth-error / cross-tab wipe / unmount); a worker mid-flight keeps its own
   // state object, and attempt()'s claim CAS remains the authoritative
   // double-send guard either way.
-  const drainStatesRef = useRef(new Map<string, { lock: boolean; pending: boolean }>());
+  const drainStatesRef = useRef(new Map<string, { lock: boolean; pending: boolean; flushArmed: boolean }>());
+  // NEW-agent marks per pairing (channel names granted by a meta/grant refresh
+  // and not yet opened). UI-only state, persisted per pairing under the kv
+  // `newagents:${pairingId}` key (loaded at boot, wiped with the pairing).
+  const newAgentsRef = useRef(new Map<string, string[]>());
+  // subscribeEvents listeners. A ref (not state): subscription changes must
+  // not re-render the provider, and emitters run from transport callbacks.
+  const eventSubsRef = useRef(new Set<(e: PlatformEvent) => void>());
   // R4-4: a stable, unique id for THIS tab/window instance, lazily generated
   // once. Stamped onto every row this tab claims via markSending() so
   // release/recovery can tell "a row I myself abandoned" (always safe to
@@ -383,6 +433,7 @@ export function TransportProvider(props: TransportProviderProps) {
       instance: r.pairing.instance,
       userId: r.pairing.userId,
       channels: r.pairing.channels,
+      newAgents: newAgentsRef.current.get(r.pairing.pairingId) ?? [],
       displayName: r.pairing.displayName ?? r.pairing.instance,
       color: r.pairing.color ?? accentColor(r.pairing.pairingId),
       status: r.statusNow,
@@ -390,6 +441,48 @@ export function TransportProvider(props: TransportProviderProps) {
       ...(r.pairing.url ? { url: r.pairing.url } : {}),
     })));
   }, []);
+
+  /** Fan a PlatformEvent out to subscribeEvents listeners. A throwing listener
+   *  never breaks the emitting transport/drain path. */
+  const emitEvent = useCallback((e: PlatformEvent) => {
+    for (const cb of eventSubsRef.current) {
+      try { cb(e); } catch { /* listener errors are the listener's problem */ }
+    }
+  }, []);
+
+  const subscribeEvents = useCallback((cb: (e: PlatformEvent) => void): (() => void) => {
+    eventSubsRef.current.add(cb);
+    return () => { eventSubsRef.current.delete(cb); };
+  }, []);
+
+  /** Get-or-create one pairing's drain-state entry (#ER-2 lock/pending plus
+   *  the reconnect-flush arming flag). */
+  const getDrainState = useCallback((pairingId: string) => {
+    let st = drainStatesRef.current.get(pairingId);
+    if (!st) { st = { lock: false, pending: false, flushArmed: false }; drainStatesRef.current.set(pairingId, st); }
+    return st;
+  }, []);
+
+  /** Reconcile one pairing's NEW-agent marks after a grant change: prune marks
+   *  whose channel is no longer granted, merge `added`, persist to the kv key,
+   *  and emit the `new-agents` event when anything was actually added. Callers
+   *  refreshViews() after (marks surface on PairingView.newAgents). Runs only
+   *  behind the caller's runtime/gen fence — never on a stale identity. */
+  const syncNewAgents = useCallback((rt: PairingRuntime, added: string[]) => {
+    const pid = rt.pairing.pairingId;
+    const current = newAgentsRef.current.get(pid) ?? [];
+    const next = [
+      ...current.filter((c) => rt.pairing.channels.includes(c) && !added.includes(c)),
+      ...added,
+    ];
+    if (next.length !== current.length || next.some((c, i) => current[i] !== c)) {
+      newAgentsRef.current.set(pid, next);
+      void kvSet(`newagents:${pid}`, next).catch(() => { /* marks are best-effort durable */ });
+    }
+    if (added.length > 0) {
+      emitEvent({ type: 'new-agents', pairingId: pid, displayName: rt.pairing.displayName ?? rt.pairing.instance, agents: added });
+    }
+  }, [emitEvent]);
 
   // Effective registry: built-in ws (overridable via the legacy makeTransport
   // prop) + host-registered kinds. A stored pairing whose kind has no factory
@@ -637,14 +730,17 @@ export function TransportProvider(props: TransportProviderProps) {
     }
   }, [isActive, clearTypingTimer]);
 
-  const attempt = useCallback(async (entry: outbox.OutboxEntry) => {
+  /** One delivery attempt. Returns whether the row was actually handed to the
+   *  transport successfully this attempt (drives the reconnect-flush count) —
+   *  false on skip, claim miss, timeout, or failure. */
+  const attempt = useCallback(async (entry: outbox.OutboxEntry): Promise<boolean> => {
     // Per-pairing routing: the row's scope IS its pairingId. A row for a
     // pairing we don't hold, or whose transport is closed, is skipped — its
     // own pairing drains it on reconnect. The explicit status gate replaces
     // the old caller-side "never drain over a closed transport" check, which
     // was global and cannot be per-pairing.
     const rt = runtimesRef.current.get(entry.scope ?? '');
-    if (!rt || !rt.transport || rt.statusNow !== 'open') return;
+    if (!rt || !rt.transport || rt.statusNow !== 'open') return false;
     // R4-3: drain() iterates a SNAPSHOT of listPending() taken at its start.
     // If a wipe (unpair/auth-error) clears this pairing's rows WHILE that
     // snapshot is still being processed, a later entry in it no longer has a
@@ -674,7 +770,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // elsewhere, their delayed writes no-op instead of clobbering the newer
     // owner's in-flight send.
     const claimToken = await outbox.markSending(entry.id, tabIdRef.current!, entry.scope!);
-    if (!claimToken) return;
+    if (!claimToken) return false;
     const ck = convKeyOf(entry.scope!, entry.channel);
     if (entry.env.kind === 'msg') {
       const attachments = entry.env.payload.attachments;
@@ -695,7 +791,7 @@ export function TransportProvider(props: TransportProviderProps) {
           // Monotonic 'ack' route (see the ACK_TIMEOUT note below): a genuine
           // 'delivered' from an earlier attempt still outranks this.
           if (applied) dispatch({ type: 'ack', convKey: ck, refId: entry.id, status: 'failed', reason: 'attachments-expired' });
-          return;
+          return false;
         }
         // { ok: false } = network/token trouble reaching the lease endpoint —
         // proceed with the send; the lease self-heals on the next drain.
@@ -721,7 +817,7 @@ export function TransportProvider(props: TransportProviderProps) {
         rt.transport.send(entry.env).then(() => 'sent' as const, (err: unknown) => ({ err })),
         new Promise<'timeout'>((resolve) => { timeoutTimer = setTimeout(() => resolve('timeout'), sendAttemptTimeoutMs); }),
       ]).finally(() => clearTimeout(timeoutTimer));
-      if (outcome === 'timeout') return;
+      if (outcome === 'timeout') return false; // outcome unknown — never counted as sent
       if (outcome !== 'sent') throw outcome.err; // rejected in time: the normal failure path below
       // msg and approval.response both get a server ack (bridge.ts) and so both
       // wait for round-trip confirmation before settling. Without this (R2-5),
@@ -752,6 +848,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // fire-and-forget; settle them immediately without waiting for an ack.
         await outbox.settle(entry.id);
       }
+      return true; // handed to the transport successfully this attempt
     } catch (err) {
       // R3-11: markSendFailed's resulting status distinguishes a terminal
       // failure (MAX_ATTEMPTS reached — the outbox will not retry this entry
@@ -765,6 +862,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // #R10: monotonic 'ack' route (see the ACK_TIMEOUT note above).
         dispatch({ type: 'ack', convKey: ck, refId: entry.id, status: 'failed' });
       }
+      return false;
     }
   }, []);
 
@@ -773,8 +871,7 @@ export function TransportProvider(props: TransportProviderProps) {
    *  per-pairing ordering is preserved), re-running once for triggers
    *  coalesced while it ran. */
   const drainPairing = useCallback(async (pairingId: string) => {
-    let st = drainStatesRef.current.get(pairingId);
-    if (!st) { st = { lock: false, pending: false }; drainStatesRef.current.set(pairingId, st); }
+    const st = getDrainState(pairingId);
     // Serialise concurrent calls for THIS pairing. If its worker is already
     // in flight, set the pending flag and return — the worker re-runs once
     // after finishing, picking up entries enqueued after its initial
@@ -784,6 +881,14 @@ export function TransportProvider(props: TransportProviderProps) {
     try {
       do {
         st.pending = false;
+        // Reconnect-flush accounting: the 'open' transition armed the flag;
+        // the FIRST pass that observes it consumes it and counts its own
+        // successful sends. Read per pass (not per worker run) so a flag set
+        // while a worker is already mid-run is picked up by its coalesced
+        // re-run rather than leaking to an unrelated later drain.
+        const flushPass = st.flushArmed;
+        if (flushPass) st.flushArmed = false;
+        let sent = 0;
         const pending = await outbox.listPending();
         // R5-3/R6-3: attempt()'s scope-gated claim is the authoritative
         // guard — it can never transmit a foreign-pairing row. #R7-3: SKIP
@@ -797,13 +902,19 @@ export function TransportProvider(props: TransportProviderProps) {
         // its own identity's tab drains it, and its own wipe clears it.
         for (const entry of pending) {
           if (entry.scope !== pairingId) continue; // not this worker's row
-          await attempt(entry);
+          if (await attempt(entry)) sent += 1;
+        }
+        if (flushPass && sent > 0) {
+          // Guarded on the runtime still being installed — a pairing wiped
+          // mid-drain must not emit a lifecycle event for a dead identity.
+          const rt = runtimesRef.current.get(pairingId);
+          if (rt) emitEvent({ type: 'reconnect-flush', pairingId, displayName: rt.pairing.displayName ?? rt.pairing.instance, sent });
         }
       } while (st.pending);
     } finally {
       st.lock = false;
     }
-  }, [attempt]);
+  }, [attempt, getDrainState, emitEvent]);
 
   /** drain(pairingId) drives that ONE pairing's worker — a reconnect on
    *  pairing A drains only A's rows; B's stay queued for B's own worker.
@@ -914,12 +1025,17 @@ export function TransportProvider(props: TransportProviderProps) {
     if (!hoistedRemoved && !retryRemoved) return false; // #ER-1: stale epoch — wipe nothing
     clearPairingTypingTimers(pairingId);
     clearPairingAckTimers(pairingId);
+    // NEW-agent marks are part of this pairing's slice: durable key + the
+    // in-memory mirror go together (authorized wipes only — a stale-epoch
+    // caller never reaches this line).
+    newAgentsRef.current.delete(pairingId);
     await Promise.all([
       outbox.clearScope(pairingId),
       // #R8-1: drop this pairing's durable approval requests too, so a
       // re-pair as a different user cannot re-render the prior user's cards.
       approvals.clearApprovalsForScope(pairingId),
       wipeKvByPrefix(`lastread:${pairingId}/`),
+      kvDel(`newagents:${pairingId}`).catch(() => { /* best-effort */ }),
     ]);
     // One pairing's slice only — a global 'reset' would wipe other pairings'
     // live conversations.
@@ -1094,6 +1210,22 @@ export function TransportProvider(props: TransportProviderProps) {
     for (const c of channels) requestHistory(pid, c);
   }, [drain, requestHistory]);
 
+  /** Register the ONE browser push subscription with a single pairing's
+   *  instance, over that pairing's own transport, as that pairing's own
+   *  userId. Loop body of enablePush's fan-out, extracted so a pairing added
+   *  while push is already enabled can be registered on its own (see the
+   *  pairWithPayload tail and the SessionMeta vapid-appeared path). Returns
+   *  whether the registration succeeded. Defined ABOVE wirePairing, which
+   *  consumes it from the meta handler. */
+  const enablePushFlowForRuntime = useCallback(async (rt: PairingRuntime): Promise<boolean> => {
+    const { vapidPublicKey, userId } = rt.pairing;
+    const transport = rt.transport;
+    if (!vapidPublicKey || !transport) return false;
+    const env = browserPushEnv();
+    if (!env) return false;
+    return enablePushFlow({ env, vapidPublicKey, userId, send: (e) => transport.send(e) });
+  }, []);
+
   const wirePairing = useCallback((rt: PairingRuntime, transport: AppTransport) => {
     // Tear down any existing subscriptions before re-wiring.
     for (const u of rt.unsubs) u();
@@ -1105,8 +1237,14 @@ export function TransportProvider(props: TransportProviderProps) {
       // Update statusNow synchronously FIRST so that any async callbacks
       // that resolve immediately after this point (e.g. outbox.enqueue().then)
       // see the current status without waiting for a React render commit.
+      const wasOpen = rt.statusNow === 'open';
       rt.statusNow = s;
       refreshViews();
+      // Reconnect-flush arming: a not-open -> open transition marks this
+      // pairing's NEXT drain pass as the reconnect flush (the pass counts its
+      // successful sends and emits the event when >= 1 queued row went out).
+      // Armed synchronously, BEFORE catchUpOnOpen kicks the drain.
+      if (s === 'open' && !wasOpen) getDrainState(rt.pairing.pairingId).flushArmed = true;
       if (s === 'open') catchUpOnOpen(rt);
       // #R6-5b: on close, reclaim THIS tab's own in-flight rows immediately
       // (owner-scoped, lease-independent) — this pairing's transport is gone,
@@ -1122,8 +1260,8 @@ export function TransportProvider(props: TransportProviderProps) {
       if (isOverride) {
         // In override mode the host owns auth recovery — the transport's own
         // retry budget handles the first attempt.  Never terminal-unpair here;
-        // just surface the error string and leave phase as 'ready'.
-        setAuthError('Authentication error. The host is attempting to reconnect.');
+        // just surface the notice and leave phase as 'ready'.
+        setAuthError({ kind: 'host-managed', message: 'Authentication error. The host is attempting to reconnect.' });
         return;
       }
       // Default (standalone) path: terminal unpair of THIS pairing only.
@@ -1163,11 +1301,61 @@ export function TransportProvider(props: TransportProviderProps) {
       // just came back.
       void wipePairing(rt, myGen, wiped.epoch, { closeTransport: false }).then((applied) => {
         if (!applied) return;
-        setAuthError(`${wiped.displayName ?? wiped.instance} was unpaired by its server. Scan a new QR code to reconnect it.`);
+        const displayName = wiped.displayName ?? wiped.instance;
+        setAuthError({ kind: 'revoked', message: `${displayName} was unpaired by its server. Scan a new QR code to reconnect it.` });
+        // Lifecycle event alongside the notice — same applied-gate, so a
+        // superseding re-pair never toasts "revoked" for a pairing that just
+        // came back.
+        emitEvent({ type: 'revoked', pairingId: pid, displayName });
       });
     });
     rt.unsubs = [u1, u2, u3];
-  }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairing, props.transportOverride]);
+    // Channel-grant refresh: a transport whose resume acknowledgment
+    // re-delivers the session grant fields (onSessionMeta capability, emitted
+    // AFTER the 'open' status) keeps the stored pairing's channels/vapid
+    // current. Follows the history.page fence pattern (#P1-E3): capture the
+    // runtime identity + gen BEFORE any await, re-check after every await,
+    // drop stale. The ONLY stored-pairing write is the epoch-gated
+    // updatePairingGrant — a null result means THIS runtime's epoch is stale
+    // (the pairing was refreshed behind it): drop silently, never retry.
+    if (transport.onSessionMeta) {
+      rt.unsubs.push(transport.onSessionMeta((meta) => {
+        const now = runtimesRef.current.get(pid);
+        if (now !== rt || rt.validUserId === null) return; // no live identity
+        const fenceGen = rt.gen;
+        const fenced = () => {
+          const n = runtimesRef.current.get(pid);
+          return n !== undefined && n === rt && n.gen === fenceGen;
+        };
+        const prev = rt.pairing;
+        const added = meta.channels.filter((c) => !prev.channels.includes(c));
+        const removed = prev.channels.filter((c) => !meta.channels.includes(c));
+        const vapidChanged = meta.vapidPublicKey !== undefined && meta.vapidPublicKey !== prev.vapidPublicKey;
+        if (added.length === 0 && removed.length === 0 && !vapidChanged) return; // grant unchanged
+        void updatePairingGrant(pid, prev.epoch, {
+          channels: meta.channels,
+          // Omitting vapidPublicKey leaves the stored value untouched — a hub
+          // that stops sending the key must not silently clear it here.
+          ...(meta.vapidPublicKey !== undefined ? { vapidPublicKey: meta.vapidPublicKey } : {}),
+        }).then((updated) => {
+          if (updated === null) return; // stale epoch — NO write happened; drop
+          if (!fenced()) return;        // identity changed across the await — drop
+          const hadVapid = !!rt.pairing.vapidPublicKey;
+          rt.pairing = updated;
+          syncNewAgents(rt, added);     // prunes removed-channel marks too
+          refreshViews();
+          // A vapid key APPEARING while the user already opted into push on
+          // this device registers the pairing automatically (mirrors the
+          // pairWithPayload tail) — best-effort and re-fenced after the read.
+          if (!hadVapid && updated.vapidPublicKey) {
+            void kvGet<boolean>('push-enabled').then((enabled) => {
+              if (enabled && fenced()) void enablePushFlowForRuntime(rt);
+            }).catch(() => { /* best-effort */ });
+          }
+        }).catch(() => { /* grant refresh is best-effort; retried on next resume */ });
+      }));
+    }
+  }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairing, props.transportOverride, getDrainState, emitEvent, syncNewAgents, enablePushFlowForRuntime]);
 
   /** Dial + wire + connect ONE stored pairing's transport onto an installed
    *  runtime — the shared install path for the boot effect and the
@@ -1229,6 +1417,7 @@ export function TransportProvider(props: TransportProviderProps) {
       }
       runtimesRef.current.clear();
       drainStatesRef.current.clear(); // #ER-2: per-pairing drain state goes with the runtimes
+      newAgentsRef.current.clear();   // in-memory marks go with the runtimes (kv persists)
     };
     const clearTimers = (): void => {
       for (const { timer } of ackTimers.current.values()) clearTimeout(timer);
@@ -1345,10 +1534,11 @@ export function TransportProvider(props: TransportProviderProps) {
         dispatch({ type: 'drop-pairing', pairingId: data.pairingId });
         runtimesRef.current.delete(data.pairingId);
         drainStatesRef.current.delete(data.pairingId); // #ER-2: no runtime, no drain worker state
+        newAgentsRef.current.delete(data.pairingId);   // wiping tab owns the kv key
         refreshViews();
         if (activeRef.current && resolveConvKey(activeRef.current, [data.pairingId])) setActiveChannel(null);
         if (runtimesRef.current.size === 0) {
-          setAuthError('This device was unpaired in another tab. Scan a new QR code to reconnect.');
+          setAuthError({ kind: 'unpaired-elsewhere', message: 'This device was unpaired in another tab. Scan a new QR code to reconnect.' });
           setPhase('setup');
         }
       });
@@ -1360,7 +1550,9 @@ export function TransportProvider(props: TransportProviderProps) {
     void probeStorageWritable().then((writable) => {
       if (cancelled) return;
       if (!writable) {
-        setAuthError('This device can’t save data locally (private browsing or full storage). Fix that, then retry.');
+        // Storage-phase notices keep their existing phase machinery (the
+        // dedicated 'storage-error' screen); 'unreachable' is their kind.
+        setAuthError({ kind: 'unreachable', message: 'This device can’t save data locally (private browsing or full storage). Fix that, then retry.' });
         setPhase('storage-error');
         return;
       }
@@ -1388,6 +1580,19 @@ export function TransportProvider(props: TransportProviderProps) {
             pairing: p, transport: null, statusNow: 'closed', unsubs: [], gen: 1, validUserId: p.userId,
           });
         }
+        refreshViews();
+        // Load each pairing's persisted NEW-agent marks (best-effort — a
+        // missing/corrupt key just means no marks). Before wiring, so the
+        // first connected paint already carries them; the post-sweep cancel
+        // check below covers a teardown landing across this await too.
+        await Promise.all(live.map(async (p) => {
+          const marks = await kvGet<unknown>(`newagents:${p.pairingId}`).catch(() => undefined);
+          if (Array.isArray(marks)) {
+            const clean = marks.filter((m): m is string => typeof m === 'string');
+            if (clean.length > 0) newAgentsRef.current.set(p.pairingId, clean);
+          }
+        }));
+        if (cancelled || bootGenRef.current !== bootGen) return;
         refreshViews();
         // R3-8: must complete before wiring so the boot drain() (triggered by
         // the first 'open' status event) can't miss rows stranded in
@@ -1432,7 +1637,7 @@ export function TransportProvider(props: TransportProviderProps) {
       refreshViews();
       setActiveChannel(null);
       dispatch({ type: 'reset' });
-      setAuthError('Local storage is unavailable on this device. Retry once it’s available.');
+      setAuthError({ kind: 'unreachable', message: 'Local storage is unavailable on this device. Retry once it’s available.' });
       setPhase('storage-error');
     });
     return () => {
@@ -1447,25 +1652,11 @@ export function TransportProvider(props: TransportProviderProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Register the ONE browser push subscription with a single pairing's
-   *  instance, over that pairing's own transport, as that pairing's own
-   *  userId. Loop body of enablePush's fan-out, extracted so a pairing added
-   *  while push is already enabled can be registered on its own (see the
-   *  pairWithPayload tail). Returns whether the registration succeeded. */
-  const enablePushFlowForRuntime = useCallback(async (rt: PairingRuntime): Promise<boolean> => {
-    const { vapidPublicKey, userId } = rt.pairing;
-    const transport = rt.transport;
-    if (!vapidPublicKey || !transport) return false;
-    const env = browserPushEnv();
-    if (!env) return false;
-    return enablePushFlow({ env, vapidPublicKey, userId, send: (e) => transport.send(e) });
-  }, []);
-
-  const pairWithPayload = useCallback(async (json: string) => {
+  const pairWithPayload = useCallback(async (json: string): Promise<PairSuccess | false> => {
     // In override mode the HOST owns identity — the provider must not start
     // writing IDB pairings under it.
     if (props.transportOverride) {
-      setAuthError('Pairing is managed by the host application.');
+      setAuthError({ kind: 'host-managed', message: 'Pairing is managed by the host application.' });
       return false;
     }
     const payload = parsePairingPayload(json);
@@ -1475,7 +1666,7 @@ export function TransportProvider(props: TransportProviderProps) {
     const kind = payload.transport ?? 'ws';
     const make = registry[kind];
     if (!make) {
-      setAuthError('No transport is available for this platform type.');
+      setAuthError({ kind: 'unsupported', message: 'No transport is available for this platform type.' });
       return false;
     }
     // #P1-B: DURABLE client adoption BEFORE the server confirms. onAdoptGrant is
@@ -1487,6 +1678,13 @@ export function TransportProvider(props: TransportProviderProps) {
     // unreachable without that commit. The stored pairing is stashed for the
     // ready path.
     let adopted: PairedSession | null = null;
+    // Refresh-vs-new determination + the pre-refresh channel set for the
+    // NEW-agent diff. Latched on the FIRST adoption only: a recovery re-grant
+    // re-runs onAdoptGrant and would otherwise "refresh" the entry the first
+    // run just appended, misreporting a genuinely new pairing as refreshed.
+    // Boxed (property, not a bare let) so the closure assignment survives
+    // TS's control-flow narrowing at the post-await read sites.
+    const pairOutcome: { current: { refreshed: boolean; priorChannels: string[] } | null } = { current: null };
     const transport = make({
       url: payload.instanceUrl,
       pairingToken: payload.token,
@@ -1498,6 +1696,7 @@ export function TransportProvider(props: TransportProviderProps) {
         // the accent never shifts when other pairings come and go.
         const existing = await loadPairingsRaw().catch((): PairedSession[] => []);
         const usedColors = existing.map((e) => e.color ?? accentColor(e.pairingId));
+        const prior = existing.find((e) => e.url === payload.instanceUrl && e.userId === g.payload.userId);
         const pairingId = ulid();
         const candidate: PairedSession = {
           url: payload.instanceUrl,
@@ -1518,13 +1717,16 @@ export function TransportProvider(props: TransportProviderProps) {
         // returns it with the PRIOR pairingId — all scoped state (history
         // keys, outbox rows, approvals) stays attached to it.
         adopted = await upsertPairing(candidate); // throws => transport does NOT confirm; pairing fails safely
+        // Refreshed = the dup-guard preserved an existing pairingId (the
+        // returned id differs from the one freshly minted above).
+        if (!pairOutcome.current) pairOutcome.current = { refreshed: adopted.pairingId !== pairingId, priorChannels: prior?.channels ?? [] };
       },
     });
     // #A2: interactive pairing requires the transport to support pair.grant. A
     // non-pairing transport (host-managed session) never reaches this path —
     // it's driven by sessionOverride, not pairWithPayload.
     if (!transport.onGrant) {
-      setAuthError('This transport does not support interactive pairing.');
+      setAuthError({ kind: 'unsupported', message: 'This transport does not support interactive pairing.' });
       return false;
     }
     // Resolves once the server ACKs (onGrant fires on pair.confirmed OR on a
@@ -1595,8 +1797,8 @@ export function TransportProvider(props: TransportProviderProps) {
           ]);
     } catch {
       setAuthError(sawAuthError
-        ? 'Pairing was rejected. Ask for a fresh QR code and try again.'
-        : 'Could not finish pairing — the server was unreachable or the session could not be saved. Try a fresh QR code.');
+        ? { kind: 'rejected', message: 'Pairing was rejected. Ask for a fresh QR code and try again.' }
+        : { kind: 'unreachable', message: 'Could not finish pairing — the server was unreachable or the session could not be saved. Try a fresh QR code.' });
       void transport.close();
       return false;
     }
@@ -1624,10 +1826,18 @@ export function TransportProvider(props: TransportProviderProps) {
         if (enabled && runtimesRef.current.get(stored.pairingId) === rt) void enablePushFlowForRuntime(rt);
       }).catch(() => { /* best-effort */ });
     }
+    // A refresh-in-place runs the same NEW-agent diff as the SessionMeta path
+    // (a QR re-scan can carry newly granted channels too): channels added
+    // relative to the pre-refresh stored entry are marked NEW.
+    if (rt && pairOutcome.current?.refreshed) {
+      const prior = pairOutcome.current.priorChannels;
+      syncNewAgents(rt, stored.channels.filter((c) => !prior.includes(c)));
+      refreshViews();
+    }
     // Go ready WITHOUT touching the other runtimes — pairing appends.
     setPhase('ready');
-    return true;
-  }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen, enablePushFlowForRuntime]);
+    return { kind: pairOutcome.current?.refreshed ? 'refreshed' : 'new', pairingId: stored.pairingId };
+  }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen, enablePushFlowForRuntime, syncNewAgents]);
 
   const sendEnvelope = useCallback((pairingId: string, env: AnyEnvelope) => {
     // Enqueue to IDB first.  Once the write commits, if this pairing's
@@ -1736,8 +1946,17 @@ export function TransportProvider(props: TransportProviderProps) {
     // the onStatus handler catches up when it reconnects.
     const r = resolveConvKey(key, runtimesRef.current.keys())!;
     const rt = runtimesRef.current.get(r.pairingId)!;
+    // Opening a conversation whose channel is marked NEW consumes the mark
+    // (ref + kv + views) — the "new agent" moment ends once it's been seen.
+    const marks = newAgentsRef.current.get(r.pairingId);
+    if (marks?.includes(r.channel)) {
+      const next = marks.filter((c) => c !== r.channel);
+      newAgentsRef.current.set(r.pairingId, next);
+      void kvSet(`newagents:${r.pairingId}`, next).catch(() => { /* best-effort */ });
+      refreshViews();
+    }
     if (!stateRef.current.historyLoaded[key] && rt.statusNow === 'open') requestHistory(r.pairingId, r.channel);
-  }, [requestHistory]);
+  }, [requestHistory, refreshViews]);
 
   const loadOlder = useCallback((key: ConvKey) => {
     const before = stateRef.current.nextBefore[key];
@@ -1867,6 +2086,37 @@ export function TransportProvider(props: TransportProviderProps) {
     await wipePairing(rt, myGen, wiped.epoch, { closeTransport: true, hoistedRemoved });
   }, [wipePairing, props.pushRegistrarOverride]);
 
+  /** Bounce ONE pairing's transport and re-dial it (the manual "rescan"): the
+   *  fresh connection's resume-ok re-delivers SessionMeta, which the
+   *  wirePairing handler applies. Deliberately NOT an identity transition —
+   *  gen is not bumped and validUserId stays set, so in-flight enqueues keep
+   *  their rows (this is a reconnect, not a wipe). The old transport's
+   *  listeners are detached BEFORE close (wipePairing's discipline), so its
+   *  'closed' event never fires our handlers; the owned-rows release that
+   *  handler would have run is invoked explicitly instead. */
+  const rescanPlatform = useCallback(async (pairingId: string) => {
+    // Host-override mode: the host owns the transport lifecycle — never bounce.
+    if (props.transportOverride) return;
+    const rt = runtimesRef.current.get(pairingId);
+    if (!rt || rt.validUserId === null) return;
+    for (const u of rt.unsubs) u();
+    rt.unsubs = [];
+    const old = rt.transport;
+    rt.transport = null;
+    rt.statusNow = 'closed';
+    if (old) {
+      void old.close();
+      // Mirror the onStatus('closed') handler we just detached: reclaim THIS
+      // tab's in-flight rows for this pairing so the re-dial's open drain
+      // sees them as pending (#R6-5b, scope-filtered).
+      void outbox.releaseOwnedSending(tabIdRef.current!, pairingId);
+    }
+    refreshViews();
+    // Re-dial through the same path boot uses (#A3 semantics apply: no
+    // factory/url leaves the pairing listed but offline).
+    dialPairingRef.current(rt);
+  }, [refreshViews, props.transportOverride]);
+
   const renamePairing = useCallback(async (pairingId: string, displayName: string) => {
     // updatePairingMeta validates before write and treats an empty value as
     // "clear the local override" — see lib/session.ts.
@@ -1893,12 +2143,13 @@ export function TransportProvider(props: TransportProviderProps) {
     // stay in storage-error with an updated message.
     const writable = await probeStorageWritable();
     if (writable) { setAuthError(null); setPhase('setup'); }
-    else setAuthError('Still can’t save data locally. Free up space or leave private browsing, then retry.');
+    else setAuthError({ kind: 'unreachable', message: 'Still can’t save data locally. Free up space or leave private browsing, then retry.' });
   }, []);
 
   const api = useMemo<ChatApi>(() => ({
     phase, pairings: views, state, activeChannel, authError,
     pairWithPayload, retryStorage, openChannel, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing,
+    rescanPlatform, subscribeEvents,
     // sendMessage, respondApproval, retryMessage are only wired once the
     // pairings are loaded and the transports are connected (phase === 'ready').
     // Before ready they are undefined at runtime (the `as` cast is intentional —
@@ -1908,7 +2159,7 @@ export function TransportProvider(props: TransportProviderProps) {
     sendMessage: (phase === 'ready' ? sendMessage : undefined) as ChatApi['sendMessage'],
     respondApproval: (phase === 'ready' ? respondApproval : undefined) as ChatApi['respondApproval'],
     retryMessage: (phase === 'ready' ? retryMessage : undefined) as ChatApi['retryMessage'],
-  }), [phase, views, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing]);
+  }), [phase, views, state, activeChannel, authError, pairWithPayload, retryStorage, openChannel, sendMessage, respondApproval, retryMessage, loadOlder, enablePush, canEnablePush, uploadProvider, unpair, renamePairing, rescanPlatform, subscribeEvents]);
 
   return <ChatContext.Provider value={api}>{props.children}</ChatContext.Provider>;
 }
