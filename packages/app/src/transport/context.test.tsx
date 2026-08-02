@@ -1768,6 +1768,62 @@ describe('TransportProvider', () => {
       expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ dial: 'cfg1' });
     });
 
+    it('a registered runtime factory that THROWS on construction still pairs: listed offline, blob persisted, no authError', async () => {
+      // Adversarial input: the factory VALIDATES the server-supplied
+      // transportConfig and throws on a malformed blob. By then the pairing
+      // was already durably adopted (#P1-B) and confirmed — the throw must
+      // degrade to the missing-factory #A3 shape (listed offline), never
+      // reject out of pairWithPayload.
+      const pairingFake = new FakeTransport();
+      renderUniversal(pairingFake, () => { throw new Error('bad transportConfig'); });
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      let pair!: Promise<PairSuccess | false>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://pairhost/', transport: 'hostedkind', token: 'tok' })); });
+      await act(async () => {
+        await pairingFake.grant(hostedGrant({ dial: 'malformed' }));
+        expect(await pair).toMatchObject({ kind: 'new' });
+      });
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(api.pairings).toHaveLength(1);
+      expect(api.pairings[0]!.status).toBe('closed'); // listed but offline (#A3 shape)
+      expect(api.authError).toBeNull();               // a bad blob is NOT a pairing error
+      expect(pairingFake.connected).toBe(false);      // handshake socket still closed
+      expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ dial: 'malformed' });
+    });
+
+    it('a throwing runtime factory at boot does not prevent OTHER pairings from dialing (and never lands in storage-error)', async () => {
+      await savePairings([
+        {
+          url: 'ws://bad/', sessionToken: 'tX', userId: 'u1', instance: 'bad',
+          channels: ['coordinator'], epoch: 'eX', pairingId: P1, transportKind: 'hostedkind',
+          transportConfig: { dial: 'malformed' },
+        },
+        {
+          url: 'ws://x/', sessionToken: 't', userId: 'u2', instance: 'good',
+          channels: ['coordinator'], epoch: 'eY', pairingId: P2, transportKind: 'ws',
+        },
+      ]);
+      const wsFake = new FakeTransport();
+      render(
+        <TransportProvider
+          makeTransport={() => wsFake}
+          transports={{ hostedkind: () => { throw new Error('bad transportConfig'); } }}
+        >
+          <Probe />
+        </TransportProvider>,
+      );
+      // Pre-fix, the throw aborted the boot dial loop and fell into the #F6
+      // catch — a misdiagnosed 'storage-error'. It must instead reach ready…
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      // …with the SECOND pairing (after the thrower in list order) dialed
+      // and connected.
+      await waitFor(() => expect(wsFake.connected).toBe(true));
+      expect(api.pairings).toHaveLength(2);
+      expect(api.pairings.find((p) => p.pairingId === P1)!.status).toBe('closed');
+      expect(api.pairings.find((p) => p.pairingId === P2)!.status).toBe('open');
+      expect(api.authError).toBeNull();
+    });
+
     it('re-scanning a hosted pairing replaces the stored transportConfig and re-dials the runtime with the fresh blob', async () => {
       await savePairings([{
         url: 'ws://pairhost/', sessionToken: 't0', userId: 'u1', instance: 'hosted',

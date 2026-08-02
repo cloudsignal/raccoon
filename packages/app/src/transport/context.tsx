@@ -1367,11 +1367,12 @@ export function TransportProvider(props: TransportProviderProps) {
   }, [makeEnvelopeHandler, catchUpOnOpen, refreshViews, wipePairing, props.transportOverride, getDrainState, emitEvent, syncNewAgents, enablePushFlowForRuntime]);
 
   /** Dial + wire + connect ONE stored pairing's transport onto an installed
-   *  runtime — the shared install path for the boot effect and the
-   *  stale-unpair self-heal (#ER-1). #A3: no registered factory for the
-   *  pairing's kind, or no stored url ⇒ the pairing stays LISTED but offline
-   *  (transport null, status 'closed') — its history remains readable and its
-   *  sends queue in the outbox. */
+   *  runtime — the shared install path for the boot effect, the stale-unpair
+   *  self-heal (#ER-1), and pairWithPayload's post-confirm runtime dial. #A3:
+   *  no registered factory for the pairing's kind, no stored url, OR a
+   *  factory that throws at construction ⇒ the pairing stays LISTED but
+   *  offline (transport null, status 'closed') — its history remains readable
+   *  and its sends queue in the outbox. NEVER throws. */
   const dialPairing = useCallback((rt: PairingRuntime) => {
     const p = rt.pairing;
     const make = registry[p.transportKind];
@@ -1380,10 +1381,25 @@ export function TransportProvider(props: TransportProviderProps) {
     // — the opaque per-kind transportConfig (persisted from the pair.grant)
     // plus the session identity fields. The built-in ws factory ignores the
     // extras, so ws pairings dial byte-identically to before.
-    const transport = make({
-      url: p.url, session: p.sessionToken, device: 'raccoon-app',
-      transportConfig: p.transportConfig, userId: p.userId, instance: p.instance,
-    });
+    //
+    // NEVER-THROW: a factory that validates the SERVER-SUPPLIED
+    // transportConfig and throws on a malformed blob (the exact adversarial
+    // input) must degrade to the missing-factory #A3 shape — listed but
+    // offline, transport stays null — never propagate. A throw here otherwise
+    // leaked out of every call site: pairWithPayload's post-confirm dial
+    // (rejecting a pairing that was already durably adopted + confirmed) and
+    // the boot loop (aborting subsequent pairings' dials into a misdiagnosed
+    // #F6 'storage-error').
+    let transport: AppTransport;
+    try {
+      transport = make({
+        url: p.url, session: p.sessionToken, device: 'raccoon-app',
+        transportConfig: p.transportConfig, userId: p.userId, instance: p.instance,
+      });
+    } catch (err) {
+      console.warn(`[raccoon] transport factory for kind "${p.transportKind}" threw; listing the platform offline:`, err);
+      return;
+    }
     wirePairing(rt, transport);
     void transport.connect().catch(() => { /* per-pairing reconnect loop handles it */ });
   }, [registry, wirePairing]);
@@ -1845,13 +1861,24 @@ export function TransportProvider(props: TransportProviderProps) {
     // fields. #A3: a missing runtime factory leaves the pairing listed but
     // offline — NO authError; the pairing itself succeeded.
     if (kind !== 'ws') {
+      // R4-3 preamble, SYNCHRONOUS — before any await: on a refresh-in-place
+      // of a hosted pairing (same pairingId preserved by the dup-guard), the
+      // superseded runtime's identity dies the instant the swap is decided,
+      // not after the (up to 3s) bounded handshake close below. Gen bump +
+      // validUserId null reject any send through the old connection from
+      // this point on.
+      const superseded = runtimesRef.current.get(stored.pairingId);
+      if (superseded) {
+        superseded.gen += 1;
+        superseded.validUserId = null;
+      }
       await settleWithinCall(() => transport.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
-      // Re-read AFTER the bounded close: a refresh-in-place of a hosted
-      // pairing finds the superseded runtime here (same pairingId preserved
-      // by the dup-guard) — kill it with the synchronous-kill discipline
-      // (R4-3: gen bump + validUserId null before anything async) so nothing
-      // keeps sending through the superseded connection.
-      const prior = runtimesRef.current.get(stored.pairingId);
+      // Re-read AFTER the bounded close (a concurrent actor may have removed
+      // the runtime across the await), falling back to the sync-killed
+      // reference for gen continuation. The teardown is idempotent — a
+      // second gen bump is harmless (monotonicity is all the fences need),
+      // and detaching/closing an already-torn-down runtime no-ops.
+      const prior = runtimesRef.current.get(stored.pairingId) ?? superseded;
       if (prior) {
         prior.gen += 1;
         prior.validUserId = null;
