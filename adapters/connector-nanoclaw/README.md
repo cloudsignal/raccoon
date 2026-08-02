@@ -106,14 +106,31 @@ role grants.
 ## Verifying against a real NanoClaw install
 
 Manual end-to-end checklist. Automated tests cover the adapter against a
-simulated host; this list is what to confirm against the real thing.
+simulated host (including a post-`tsc` layout simulation,
+`src/dist-layout.test.ts`, that proves the copied bundle serves the PWA from
+`dist/channels/`); this list is what to confirm against the real thing.
+
+An opt-in scripted rehearsal of the install's file steps exists at
+`scripts/verify-nanoclaw-install.sh`: it clones NanoClaw shallow into a temp
+dir (or copies an existing checkout passed as `$1`), applies the skill's
+copy/barrel/.env/postbuild steps mechanically, runs their install and build,
+boots `node dist/index.js`, and curls the raccoon port for the PWA's
+`index.html`. It is NOT run by CI or vitest — it needs network access,
+NanoClaw's toolchain, and a checkout that can boot far enough to register
+channels.
 
 1. Clone `github.com/nanocoai/nanoclaw` and get it running per its README
    (at least one agent, owner approval channel working).
 2. Build the connector deliverables in a raccoon checkout
    (`npm install && npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw`),
-   then run the `add-raccoon` skill in the NanoClaw checkout.
-3. Pair a phone via the admin API and scan the QR.
+   then run the `add-raccoon` skill in the NanoClaw checkout. The skill also
+   wires a `postbuild` copy step into the fork's `package.json` — NanoClaw's
+   bare-`tsc` build does not copy the bundle or the PWA into `dist/`, so
+   after `npm run build` confirm `dist/channels/raccoon.bundle.mjs` and
+   `dist/channels/raccoon-app/index.html` both exist before
+   `node dist/index.js`.
+3. Pair a phone via the admin API (see the pairing flow above: open the
+   served PWA on the phone first, then scan or paste from inside the app).
 4. Verify **(a) chat turn round-trip**: send a message from the phone; the
    agent's reply arrives in the same turn, with a typing indicator while it
    thinks.
@@ -136,6 +153,12 @@ simulated host; this list is what to confirm against the real thing.
 
 ## Limitations (v1)
 
+- **The fork's build needs the postbuild copy step.** NanoClaw's production
+  build is bare `tsc`, which compiles `.ts` only — the install must wire a
+  `postbuild` script that copies `raccoon.bundle.mjs` and `raccoon-app/`
+  into `dist/channels/` (the add-raccoon skill does this). Without it,
+  `node dist/index.js` fails with `ERR_MODULE_NOT_FOUND` on the bundle while
+  dev mode (`tsx src/index.ts`) works, masking the breakage.
 - **In-memory message history.** The endpoint's message store does not
   survive a restart — pairing sessions persist (`sessions.json`), chat
   history does not. Buffered offline approval cards are also lost on

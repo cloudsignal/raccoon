@@ -31,6 +31,12 @@ indicators, approval cards for agent questions, and media in both directions.
   agent configured, and an owner approval channel working — for example their
   CLI channel — so registration approvals have somewhere to land).
 
+An opt-in end-to-end rehearsal of these file steps against a throwaway
+NanoClaw checkout exists at
+`adapters/connector-nanoclaw/scripts/verify-nanoclaw-install.sh` (needs
+network and NanoClaw's toolchain; see the connector README's Verifying
+section).
+
 ## Installing this skill
 
 NanoClaw has no plugin mechanism; skills live in the checkout's own
@@ -71,7 +77,28 @@ install-time type check resolves the bundle's types from it. `raccoon-app/`
 is the built PWA the channel serves; without it there is nothing for a phone
 to open.
 
-### 2. Register the channel in the barrel
+### 2. Wire the asset copy into the fork's build
+
+NanoClaw's production flow is `npm run build` (bare `tsc`, outDir `dist/`)
+then `node dist/index.js`. `tsc` compiles `.ts` files only — it does NOT copy
+`raccoon.bundle.mjs`, `raccoon.bundle.d.mts`, or the `raccoon-app/` static
+directory into `dist/`. Without this step the compiled
+`dist/channels/raccoon.js` fails at startup with `ERR_MODULE_NOT_FOUND` on
+`./raccoon.bundle.mjs` (dev mode via `tsx src/index.ts` is unaffected, which
+makes the breakage easy to miss).
+
+Add a `postbuild` script to the fork's `package.json` — npm runs `postbuild`
+automatically after every `npm run build`:
+
+```json
+"postbuild": "cp src/channels/raccoon.bundle.mjs dist/channels/ && cp -R src/channels/raccoon-app dist/channels/raccoon-app"
+```
+
+VERIFY first whether the fork's `package.json` already defines `postbuild`
+(current NanoClaw main does not). If it does, append the two copies to the
+existing command with `&&` instead of replacing it.
+
+### 3. Register the channel in the barrel
 
 Append to `src/channels/index.ts` (follow the barrel's existing comment
 convention — the other channels each have a one-line import with a comment):
@@ -80,7 +107,7 @@ convention — the other channels each have a one-line import with a comment):
 import './raccoon.js';
 ```
 
-### 3. VERIFY the wrapper compiles against the current trunk
+### 4. VERIFY the wrapper compiles against the current trunk
 
 Run the fork's type check (typically `npx tsc --noEmit`). The explicit
 `ChannelRegistration` annotation in `src/channels/raccoon.ts` is the
@@ -91,7 +118,7 @@ NanoClaw's interface has moved, this file fails to compile; adjust the thin
 wrapper in `src/channels/raccoon.ts` to match their current names (do not
 loosen the types, and do not edit the bundle).
 
-### 4. Append the .env block
+### 5. Append the .env block
 
 Append the following to the checkout's `.env` and fill in the values:
 
@@ -135,13 +162,24 @@ If any of the five required vars is missing, the factory returns null and
 NanoClaw skips the channel (their graceful-skip convention). A present but
 malformed value throws at startup instead — misconfiguration is loud.
 
-### 5. Restart the host and confirm registration
+### 6. Rebuild, verify the layout, and restart the host
+
+Run the fork's build and confirm the assets landed next to the compiled
+wrapper:
+
+```bash
+npm run build
+ls dist/channels/raccoon.bundle.mjs dist/channels/raccoon-app/index.html
+```
+
+Both paths must exist — if either is missing, revisit step 2 (the
+`postbuild` wiring did not run or did not copy).
 
 Restart the NanoClaw host process. Confirm from the logs that the `raccoon`
 channel registered and its hub is listening on `RACCOON_PORT` — or, if it
 was skipped, which required variable was missing.
 
-### 6. Pair the first device
+### 7. Pair the first device
 
 ```bash
 curl -X POST \
@@ -156,7 +194,7 @@ tool, or a terminal renderer such as `qrencode -t ansiutf8`) and scan it with
 the phone's camera. The phone opens the Raccoon PWA and connects to
 `RACCOON_INSTANCE_URL`.
 
-### 7. Wire the owner's conversations
+### 8. Wire the owner's conversations
 
 Adapters never write NanoClaw's database — use NanoClaw's own surfaces.
 
@@ -191,8 +229,11 @@ paired identity has owner privileges.
    `src/channels/raccoon.bundle.mjs`, `src/channels/raccoon.bundle.d.mts`,
    `src/channels/raccoon-app/`, `src/channels/raccoon.ts`.
 2. Remove the `import './raccoon.js';` line from `src/channels/index.ts`.
-3. Remove the Raccoon block from `.env`.
-4. If you copied the skill: remove `.claude/skills/add-raccoon/`.
+3. Remove the raccoon copies from the `postbuild` script in `package.json`
+   (or the whole script if it only contained them), and delete the copied
+   outputs `dist/channels/raccoon.bundle.mjs` and `dist/channels/raccoon-app/`.
+4. Remove the Raccoon block from `.env`.
+5. If you copied the skill: remove `.claude/skills/add-raccoon/`.
 
 Pairing sessions and media live under `RACCOON_DATA_DIR` (default
 `./data/raccoon`) — delete that directory too if you want a clean slate.
