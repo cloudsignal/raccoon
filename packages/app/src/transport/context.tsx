@@ -1376,7 +1376,14 @@ export function TransportProvider(props: TransportProviderProps) {
     const p = rt.pairing;
     const make = registry[p.transportKind];
     if (!make || !p.url) return;
-    const transport = make({ url: p.url, session: p.sessionToken, device: 'raccoon-app' });
+    // Universal pairing: EVERY kind's factory receives the stored dial inputs
+    // — the opaque per-kind transportConfig (persisted from the pair.grant)
+    // plus the session identity fields. The built-in ws factory ignores the
+    // extras, so ws pairings dial byte-identically to before.
+    const transport = make({
+      url: p.url, session: p.sessionToken, device: 'raccoon-app',
+      transportConfig: p.transportConfig, userId: p.userId, instance: p.instance,
+    });
     wirePairing(rt, transport);
     void transport.connect().catch(() => { /* per-pairing reconnect loop handles it */ });
   }, [registry, wirePairing]);
@@ -1670,14 +1677,15 @@ export function TransportProvider(props: TransportProviderProps) {
     }
     const payload = parsePairingPayload(json);
     setAuthError(null);
-    // The payload's transport kind selects the factory. 'ws' is built in;
-    // other kinds come from the host's `transports` registry prop.
+    // Universal pairing: the PAIRING dial is ALWAYS the ws pairing client
+    // against payload.instanceUrl — whatever `payload.transport` says. The
+    // kind only selects the RUNTIME transport, dialed AFTER pair.confirmed
+    // from the grant's transportConfig (the post-confirm split below). A
+    // missing RUNTIME factory for the kind is therefore NOT a pairing-time
+    // error: pairing succeeds and the platform is listed but offline (#A3),
+    // exactly like a stored pairing whose kind has no factory at boot.
     const kind = payload.transport ?? 'ws';
-    const make = registry[kind];
-    if (!make) {
-      setAuthError({ kind: 'unsupported', message: 'No transport is available for this platform type.' });
-      return false;
-    }
+    const make = registry['ws']; // built-in slot — always present (props.makeTransport ?? default)
     // #P1-B: DURABLE client adoption BEFORE the server confirms. onAdoptGrant is
     // called by the transport on the pair.grant and AWAITED before it sends
     // pair.confirm — the save (durable IDB commit) therefore happens BEFORE the
@@ -1714,6 +1722,12 @@ export function TransportProvider(props: TransportProviderProps) {
           instance: g.payload.instance,
           channels: g.payload.channels,
           vapidPublicKey: g.payload.vapidPublicKey,
+          // Opaque per-kind dial blob from the grant — the runtime factory's
+          // input for non-ws kinds (dialPairing hands it over verbatim).
+          // Assigned unconditionally, like sessionToken: a refresh grant with
+          // NO config must CLEAR a stale stored blob, never preserve it
+          // (upsertPairing replaces it from this candidate).
+          transportConfig: g.payload.transportConfig,
           // #R7-3: fresh NON-SECRET epoch so a re-pair is distinguishable from
           // a prior pairing (the wipe broadcasts use it, never the token).
           epoch: crypto.randomUUID(),
@@ -1731,9 +1745,12 @@ export function TransportProvider(props: TransportProviderProps) {
         if (!pairOutcome.current) pairOutcome.current = { refreshed: adopted.pairingId !== pairingId, priorChannels: prior?.channels ?? [] };
       },
     });
-    // #A2: interactive pairing requires the transport to support pair.grant. A
-    // non-pairing transport (host-managed session) never reaches this path —
-    // it's driven by sessionOverride, not pairWithPayload.
+    // #A2: the pairing HANDSHAKE requires the pair.grant capability. Under
+    // universal pairing this is only reachable when the registry's 'ws' slot
+    // itself was overridden with a non-pairing transport (a host
+    // misconfiguration) — an unknown payload KIND no longer lands here (it
+    // pairs over ws and lists offline). 'unsupported' stays in the AuthNotice
+    // type for this path and for Task 5's kind heuristics.
     if (!transport.onGrant) {
       setAuthError({ kind: 'unsupported', message: 'This transport does not support interactive pairing.' });
       return false;
@@ -1753,6 +1770,13 @@ export function TransportProvider(props: TransportProviderProps) {
       transport.onGrant!(() => {
         const stored = adopted;
         if (!stored) return;
+        // Non-ws kind: the pairing socket is ONLY the handshake — the durable
+        // save already happened (onAdoptGrant, #P1-B unchanged) and the
+        // RUNTIME is dialed after confirmation (the post-confirm split below)
+        // via the registry factory, from the stored transportConfig.
+        // Installing nothing here also makes a #R10 recovery re-grant a
+        // natural no-op: the promise is already resolved.
+        if (kind !== 'ws') { resolve(stored); return; }
         const prior = runtimesRef.current.get(stored.pairingId);
         if (prior?.transport === transport) { resolve(stored); return; } // recovery re-grant: already installed
         if (prior) {
@@ -1811,6 +1835,42 @@ export function TransportProvider(props: TransportProviderProps) {
       void transport.close();
       return false;
     }
+    // Post-confirm runtime split (universal pairing): for 'ws' the pairing
+    // transport IS the runtime — installed by the grant callback above,
+    // byte-identical single-socket behavior, no re-dial. For every other kind
+    // the handshake socket has served its purpose: close it bounded
+    // (settleWithinCall — close() is not timeout-bounded on its own), then
+    // dial the RUNTIME through the SAME install path boot uses (dialPairing),
+    // which hands the registry factory the stored transportConfig + identity
+    // fields. #A3: a missing runtime factory leaves the pairing listed but
+    // offline — NO authError; the pairing itself succeeded.
+    if (kind !== 'ws') {
+      await settleWithinCall(() => transport.close(), UNPAIR_CLEANUP_TIMEOUT_MS);
+      // Re-read AFTER the bounded close: a refresh-in-place of a hosted
+      // pairing finds the superseded runtime here (same pairingId preserved
+      // by the dup-guard) — kill it with the synchronous-kill discipline
+      // (R4-3: gen bump + validUserId null before anything async) so nothing
+      // keeps sending through the superseded connection.
+      const prior = runtimesRef.current.get(stored.pairingId);
+      if (prior) {
+        prior.gen += 1;
+        prior.validUserId = null;
+        for (const u of prior.unsubs) u();
+        prior.unsubs = [];
+        void prior.transport?.close();
+        prior.transport = null;
+      }
+      const fresh: PairingRuntime = {
+        pairing: stored, transport: null, statusNow: 'closed', unsubs: [],
+        // Monotonic across the swap (R4-3 gen continuation): a stale
+        // continuation fenced on the superseded runtime's pre-bump gen must
+        // never match the fresh runtime.
+        gen: (prior?.gen ?? 0) + 1, validUserId: stored.userId,
+      };
+      runtimesRef.current.set(stored.pairingId, fresh);
+      dialPairing(fresh);
+      refreshViews();
+    }
     // `stored` is ALREADY durably persisted (onAdoptGrant) and its runtime
     // installed by the grant callback. If the transport's 'open' status fired
     // BEFORE the grant installed the runtime (wire-after-grant), sync the
@@ -1846,7 +1906,7 @@ export function TransportProvider(props: TransportProviderProps) {
     // Go ready WITHOUT touching the other runtimes — pairing appends.
     setPhase('ready');
     return { kind: pairOutcome.current?.refreshed ? 'refreshed' : 'new', pairingId: stored.pairingId };
-  }, [props.transportOverride, registry, wirePairing, refreshViews, catchUpOnOpen, enablePushFlowForRuntime, syncNewAgents]);
+  }, [props.transportOverride, registry, wirePairing, dialPairing, refreshViews, catchUpOnOpen, enablePushFlowForRuntime, syncNewAgents]);
 
   const sendEnvelope = useCallback((pairingId: string, env: AnyEnvelope) => {
     // Enqueue to IDB first.  Once the write commits, if this pairing's

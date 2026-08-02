@@ -8,6 +8,7 @@ import { loadPairingsRaw, savePairings } from '../lib/session.js';
 import { __setPushEnvForTests, type PushEnv } from '../lib/push-client.js';
 import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
+import type { MakeTransport } from './types.js';
 import {
   __setSendAttemptTimeoutForTests, TransportProvider, TYPING_AUTO_CLEAR_MS, useChat,
   type ChatApi, type PairSuccess, type PlatformEvent,
@@ -173,21 +174,6 @@ describe('TransportProvider', () => {
     const saved = await loadPairingsRaw();
     expect(saved[0]?.sessionToken).toBe('s-recovered');
     expect(saved[0]?.userId).toBe('u1');
-  });
-
-  it('rejects a pairing payload whose transport kind has no registered factory', async () => {
-    render(
-      <TransportProvider makeTransport={() => new FakeTransport()}>
-        <Probe />
-      </TransportProvider>,
-    );
-    await waitFor(() => expect(api.phase).toBe('setup'));
-    await act(async () => {
-      // Failure resolves false (never throws) — the reason lands in authError.
-      expect(await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }))).toBe(false);
-    });
-    expect(api.authError?.message).toContain('No transport is available');
-    expect(api.phase).toBe('setup');
   });
 
   it('auto-clears a typing indicator whose stop never arrives (TYPING_AUTO_CLEAR_MS)', async () => {
@@ -1686,6 +1672,141 @@ describe('TransportProvider', () => {
     });
   });
 
+  describe('universal pairing (Task 3) — WS handshake for every kind, runtime dialed from transportConfig', () => {
+    type FactoryOpts = Parameters<MakeTransport>[0];
+
+    /** Provider whose ws slot hands the PAIRING dial `pairingFake` (attaching
+     *  onAdoptGrant, mountPaired-style) and registers `hostedkind` from
+     *  `hosted` when given. */
+    function renderUniversal(pairingFake: FakeTransport, hosted?: MakeTransport) {
+      render(
+        <TransportProvider
+          makeTransport={(opts) => { if (opts.onAdoptGrant) pairingFake.onAdoptGrant = opts.onAdoptGrant; return pairingFake; }}
+          {...(hosted ? { transports: { hostedkind: hosted } } : {})}
+        >
+          <Probe />
+        </TransportProvider>,
+      );
+    }
+
+    const hostedGrant = (cfg: unknown, sessionToken = 's1') => createEnvelope('pair.grant', {
+      from: 'system', to: 'user:u1', channel: 'pairing',
+      payload: {
+        sessionToken, userId: 'u1', instance: 'hosted', channels: ['coordinator'],
+        ...(cfg !== undefined ? { transportConfig: cfg } : {}),
+      },
+    });
+
+    it('pairs a hosted kind over the ws pairing socket, closes it, and dials the runtime factory with the grant transportConfig + identity', async () => {
+      const pairingFake = new FakeTransport();
+      const hostedFake = new FakeTransport();
+      const hostedCalls: FactoryOpts[] = [];
+      renderUniversal(pairingFake, (opts) => { hostedCalls.push(opts); return hostedFake; });
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      let pair!: Promise<PairSuccess | false>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://pairhost/', transport: 'hostedkind', token: 'tok' })); });
+      await act(async () => {
+        await pairingFake.grant(hostedGrant({ dial: 'cfg1' }));
+        expect(await pair).toMatchObject({ kind: 'new' });
+      });
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      // The handshake socket is closed once the grant is confirmed…
+      expect(pairingFake.connected).toBe(false);
+      // …and the RUNTIME comes from the registry factory, dialed with the
+      // grant's opaque blob + the session identity fields.
+      expect(hostedCalls).toHaveLength(1);
+      expect(hostedCalls[0]).toMatchObject({
+        transportConfig: { dial: 'cfg1' }, userId: 'u1', instance: 'hosted', session: 's1', url: 'ws://pairhost/',
+      });
+      await waitFor(() => expect(hostedFake.connected).toBe(true));
+      expect(api.pairings[0]!.transportKind).toBe('hostedkind');
+      // The stored pairing carries the blob durably (boot re-dials from it).
+      expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ dial: 'cfg1' });
+    });
+
+    it('ws payload keeps single-socket behavior: the factory is called exactly once and the pairing transport IS the runtime', async () => {
+      let wsCalls = 0;
+      const t = new FakeTransport();
+      render(
+        <TransportProvider makeTransport={(opts) => { wsCalls += 1; t.onAdoptGrant = opts.onAdoptGrant; return t; }}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      let pair!: Promise<PairSuccess | false>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://h:1/', transport: 'ws', token: 'tok' })); });
+      await act(async () => {
+        await t.grant(createEnvelope('pair.grant', {
+          from: 'system', to: 'user:u1', channel: 'pairing',
+          payload: { sessionToken: 's1', userId: 'u1', instance: 'echo', channels: ['coordinator'] },
+        }));
+        expect(await pair).toMatchObject({ kind: 'new' });
+      });
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(wsCalls).toBe(1);          // the pairing dial — never a second (runtime) dial
+      expect(t.connected).toBe(true);   // the pairing socket IS the runtime — never closed
+      expect(api.pairings[0]!.status).toBe('open');
+    });
+
+    it('a hosted payload with no runtime factory still pairs: listed offline (status closed), NO authError', async () => {
+      const pairingFake = new FakeTransport();
+      renderUniversal(pairingFake); // NO hostedkind runtime factory registered
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      let pair!: Promise<PairSuccess | false>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://pairhost/', transport: 'hostedkind', token: 'tok' })); });
+      await act(async () => {
+        await pairingFake.grant(hostedGrant({ dial: 'cfg1' }));
+        // A missing RUNTIME factory is not a pairing error — the WS handshake
+        // succeeded and the session was durably adopted.
+        expect(await pair).toMatchObject({ kind: 'new' });
+      });
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(api.pairings).toHaveLength(1);
+      expect(api.pairings[0]!.status).toBe('closed'); // listed but offline (#A3)
+      expect(api.authError).toBeNull();               // listed-offline is NOT an error
+      expect(pairingFake.connected).toBe(false);      // handshake socket closed regardless
+      expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ dial: 'cfg1' });
+    });
+
+    it('re-scanning a hosted pairing replaces the stored transportConfig and re-dials the runtime with the fresh blob', async () => {
+      await savePairings([{
+        url: 'ws://pairhost/', sessionToken: 't0', userId: 'u1', instance: 'hosted',
+        channels: ['coordinator'], epoch: EPOCH, pairingId: P1, transportKind: 'hostedkind',
+        transportConfig: { dial: 'cfg1' },
+      }]);
+      const pairingFake = new FakeTransport();
+      const hostedFakes: FakeTransport[] = [];
+      const hostedCalls: FactoryOpts[] = [];
+      renderUniversal(pairingFake, (opts) => {
+        hostedCalls.push(opts);
+        const f = new FakeTransport();
+        hostedFakes.push(f);
+        return f;
+      });
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      await new Promise((r) => setTimeout(r, 20));
+      // Boot dialed the runtime from the STORED blob.
+      expect(hostedCalls[0]).toMatchObject({ transportConfig: { dial: 'cfg1' }, session: 't0' });
+      // Re-scan: the fresh grant carries an UPDATED blob.
+      let pair!: Promise<PairSuccess | false>;
+      act(() => { pair = api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://pairhost/', transport: 'hostedkind', token: 'fresh' })); });
+      await act(async () => {
+        await pairingFake.grant(hostedGrant({ dial: 'cfg2' }, 't2'));
+        expect(await pair).toEqual({ kind: 'refreshed', pairingId: P1 });
+      });
+      // Blob replaced durably…
+      expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ dial: 'cfg2' });
+      // …and the runtime was re-dialed with the fresh blob + token; the
+      // superseded runtime transport is closed, the handshake socket too.
+      await waitFor(() => expect(hostedCalls).toHaveLength(2));
+      expect(hostedCalls[1]).toMatchObject({ transportConfig: { dial: 'cfg2' }, session: 't2', userId: 'u1' });
+      await waitFor(() => expect(hostedFakes[1]!.connected).toBe(true));
+      expect(hostedFakes[0]!.connected).toBe(false);
+      expect(pairingFake.connected).toBe(false);
+      expect(api.pairings).toHaveLength(1);
+    });
+  });
+
   describe('platform UX — SessionMeta refresh, NEW agents, rescan, typed notices (Task 5)', () => {
     it('SessionMeta with a new channel updates the stored pairing and marks it NEW', async () => {
       const tA = new FakeTransport(); const tB = new FakeTransport();
@@ -1756,15 +1877,20 @@ describe('TransportProvider', () => {
     });
 
     it('authError carries a kind', async () => {
-      // unsupported: no registered factory for the payload's transport kind.
+      // unsupported: under universal pairing an unknown payload KIND pairs
+      // fine over ws (see the Task 3 tests) — the one remaining pairing-time
+      // 'unsupported' is a ws slot overridden with a NON-PAIRING transport
+      // (no onGrant capability).
+      const noGrant = new FakeTransport();
+      (noGrant as { onGrant?: unknown }).onGrant = undefined;
       render(
-        <TransportProvider makeTransport={() => new FakeTransport()}>
+        <TransportProvider makeTransport={() => noGrant}>
           <Probe />
         </TransportProvider>,
       );
       await waitFor(() => expect(api.phase).toBe('setup'));
       await act(async () => {
-        expect(await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }))).toBe(false);
+        expect(await api.pairWithPayload(JSON.stringify({ v: 1, instanceUrl: 'ws://h/', transport: 'ws', token: 'tok' }))).toBe(false);
       });
       expect(api.authError).toMatchObject({ kind: 'unsupported' });
       // rejected: a terminal auth failure during interactive pairing.

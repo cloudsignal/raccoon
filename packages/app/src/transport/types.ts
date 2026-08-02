@@ -47,4 +47,13 @@ export type MakeTransport = (opts: {
   // resolves. A non-WS/host-managed transport may ignore it. See
   // WsClientOptions.onAdoptGrant.
   onAdoptGrant?: (grant: Envelope<'pair.grant'>) => Promise<void>;
+  // Universal pairing (all optional, additive): the RUNTIME dial inputs.
+  // Pairing itself is always the ws handshake against the QR's instanceUrl;
+  // the registry factory for the pairing's kind is then dialed with the
+  // stored pairing's fields — the opaque per-kind `transportConfig` blob the
+  // pair.grant carried, plus the session identity for transports that need
+  // it at construction. The built-in WS factory ignores all three.
+  transportConfig?: unknown;
+  userId?: string;
+  instance?: string;
 }) => AppTransport;

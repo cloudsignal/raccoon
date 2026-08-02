@@ -132,9 +132,14 @@ describe('pairing flow states', () => {
   });
 
   it('explains an unsupported platform type and offers scanning a different code', async () => {
-    mount(() => new FakeTransport());
+    // Universal pairing (Task 3): an unknown payload KIND now pairs fine over
+    // ws (listed offline) — the surviving pairing-time 'unsupported' is a ws
+    // slot overridden with a NON-PAIRING transport (no onGrant capability).
+    const noGrant = new FakeTransport();
+    (noGrant as { onGrant?: unknown }).onGrant = undefined;
+    mount(() => noGrant);
     const user = userEvent.setup();
-    await pasteAndConnect(user, typable({ v: 1, instanceUrl: 'x://h/', transport: 'exotic', token: 'tok' }));
+    await pasteAndConnect(user, typable({ v: 1, instanceUrl: 'ws://h/', transport: 'ws', token: 'tok' }));
     expect(await screen.findByText('Platform type not supported')).toBeTruthy();
     // README decision 13: paired elsewhere, it still shows up here read-only.
     expect(screen.getByText(/read-only/i)).toBeTruthy();
