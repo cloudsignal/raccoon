@@ -67,8 +67,12 @@ The admin listener is a separate loopback-bound HTTP server (the hub exposes
 no custom-route hook). Both routes are `POST`, authenticated with
 `Authorization: Bearer $RACCOON_ADMIN_SECRET` (compared constant-time).
 
-Pair a device — returns `{ token, payload, qr }`; render `qr` for the phone
-to scan:
+Pair a device — returns `{ token, payload, qr }`. The QR encodes a raw JSON
+pairing payload (instance URL + one-time token), not an http link, so a
+phone camera cannot open it directly. Pairing is app-first: open the served
+PWA in the phone's browser (`http(s)://<host>:<RACCOON_PORT>/`), then use
+the app's own pairing screen — scan the QR from within the app, or paste the
+`payload` string via "Enter code manually":
 
 ```bash
 curl -X POST \
@@ -87,6 +91,15 @@ curl -X POST \
   -d '{"userId":"owner"}' \
   http://127.0.0.1:4821/revoke
 ```
+
+### Deployment note: phones need HTTPS/WSS
+
+Away from localhost (which browsers exempt as a secure context), the PWA's
+service-worker install and web push both require HTTPS, and the socket then
+must be WSS. The expected production shape is a reverse proxy terminating
+TLS in front of `RACCOON_PORT`, with `RACCOON_INSTANCE_URL` set to the
+public `wss://` URL. Plain `http://<lan-ip>:<port>` still loads the chat UI
+for quick LAN tests, but installability and push stay off.
 
 ## How new users get wired
 

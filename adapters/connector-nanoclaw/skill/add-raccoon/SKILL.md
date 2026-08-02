@@ -189,10 +189,19 @@ curl -X POST \
   http://127.0.0.1:<admin-port>/pair
 ```
 
-The response contains a `qr` payload. Render it as a QR code (any local QR
-tool, or a terminal renderer such as `qrencode -t ansiutf8`) and scan it with
-the phone's camera. The phone opens the Raccoon PWA and connects to
-`RACCOON_INSTANCE_URL`.
+The response contains `token`, `payload`, and `qr`. The QR encodes a raw
+JSON pairing payload (the instance URL plus the one-time token), NOT an http
+link — a phone camera cannot "open" it. The flow is app-first:
+
+1. On the phone, open the served PWA in the browser:
+   `http(s)://<host>:<RACCOON_PORT>/`. (Phones other than localhost need
+   HTTPS — see the deployment note in the connector README.)
+2. In the app's pairing screen, either scan the QR (`qr` is a
+   terminal-renderable string — print it, or render `payload` with any QR
+   tool) or tap "Enter code manually" and paste the `payload` string.
+
+The app then connects to `RACCOON_INSTANCE_URL` with the token and stores
+the granted session.
 
 ### 8. Wire the owner's conversations
 
