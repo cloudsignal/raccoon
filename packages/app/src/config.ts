@@ -20,6 +20,17 @@ const configSchema = z.object({
     z.string(),
     z.object({ label: z.string().optional(), blurb: z.string().optional(), tone: tone.optional() }),
   ).default({}),
+  listLayout: z.enum(['grouped', 'merged']).optional(),
+  mergedSuffix: z.enum(['badge', 'collision', 'always']).optional(),
+  platformBranding: z.record(
+    z.string(),
+    z.object({ glyph: z.string().min(1), label: z.string().optional() }),
+  ).optional(),
+  hostManaged: z.object({
+    banner: z.string().optional(),
+    renameNote: z.string().optional(),
+    logoutLabel: z.string().optional(),
+  }).optional(),
 });
 
 export type RaccoonConfig = z.infer<typeof configSchema>;
@@ -45,6 +56,31 @@ function humanize(id: string): string {
     .filter((w) => w.length > 0)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
     .join(' ');
+}
+
+/** Pairing-list layout — 'grouped' (per-instance sections) unless the host opts into 'merged'. */
+export function listLayout(): 'grouped' | 'merged' {
+  return appConfig.listLayout ?? 'grouped';
+}
+
+/** When the merged list shows the instance suffix: on name collision by default. */
+export function mergedSuffix(): 'badge' | 'collision' | 'always' {
+  return appConfig.mergedSuffix ?? 'collision';
+}
+
+/** Host-declared glyph (built-in marker id or inline SVG path d-string) for an instance, if any. */
+export function platformGlyph(instance: string): { glyph: string; label?: string } | null {
+  return appConfig.platformBranding?.[instance] ?? null;
+}
+
+/** Copy for host-managed identity surfaces; unset fields fall back to neutral defaults. */
+export function hostManagedCopy(): { banner: string; renameNote: string; logoutLabel: string } {
+  const overrides = appConfig.hostManaged ?? {};
+  return {
+    banner: overrides.banner ?? 'Managed by the host application',
+    renameNote: overrides.renameNote ?? 'Set by the host application',
+    logoutLabel: overrides.logoutLabel ?? 'Log out',
+  };
 }
 
 export function channelMeta(id: string): ChannelMeta {
