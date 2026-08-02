@@ -1,6 +1,6 @@
 // packages/app/src/lib/conv-key.test.ts
 import { describe, expect, it } from 'vitest';
-import { accentColor, convKeyOf, resolveConvKey } from './conv-key.js';
+import { accentColor, convKeyOf, nextAccentColor, resolveConvKey } from './conv-key.js';
 
 describe('conv-key', () => {
   it('builds pairingId/channel', () => {
@@ -34,7 +34,28 @@ describe('conv-key', () => {
   it('accent color is deterministic and from the palette', () => {
     const c = accentColor('01ARZ3NDEKTSV4RRFFQ69G5FAV');
     expect(c).toBe(accentColor('01ARZ3NDEKTSV4RRFFQ69G5FAV'));
-    expect(c).toMatch(/^#[0-9a-f]{6}$/);
-    expect(accentColor('x')).toMatch(/^#[0-9a-f]{6}$/);
+    expect(c).toMatch(/^oklch\(/);
+    expect(accentColor('x')).toMatch(/^oklch\(/);
+  });
+
+  it('nextAccentColor picks the first palette entry not in use', () => {
+    const blue = 'oklch(0.55 0.13 255)';
+    const rust = 'oklch(0.62 0.14 30)';
+    const moss = 'oklch(0.56 0.1 155)';
+    expect(nextAccentColor([])).toBe(blue);
+    expect(nextAccentColor([blue])).toBe(rust);
+    // Gaps are refilled: with Blue and Moss taken, Rust is the first unused.
+    expect(nextAccentColor([blue, moss])).toBe(rust);
+    // Unknown strings (custom user colors) never block a palette entry.
+    expect(nextAccentColor(['#123456'])).toBe(blue);
+  });
+
+  it('nextAccentColor returns "" when all 8 palette entries are taken', () => {
+    const all = [
+      'oklch(0.55 0.13 255)', 'oklch(0.62 0.14 30)', 'oklch(0.56 0.1 155)',
+      'oklch(0.58 0.12 300)', 'oklch(0.68 0.12 75)', 'oklch(0.62 0.12 355)',
+      'oklch(0.6 0.1 215)', 'oklch(0.6 0.09 120)',
+    ];
+    expect(nextAccentColor(all)).toBe('');
   });
 });

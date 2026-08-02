@@ -53,6 +53,7 @@ describe('adoption migration', () => {
     expect(adopted.transportKind).toBe('ws');
     expect(adopted.epoch).toBe('e1');
     expect(adopted.pairingId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/); // a ULID
+    expect(adopted.color).toBe('oklch(0.55 0.13 255)'); // pairing #1 gets Blue (first unused hue)
     // legacy singleton gone, list present
     expect(await kvGet('session')).toBeUndefined();
     // lastread rewritten under the pairing

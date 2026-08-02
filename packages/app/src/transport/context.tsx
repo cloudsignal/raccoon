@@ -17,7 +17,7 @@ import {
   hostIdentityKey, loadPairingsRaw, removePairingIfMatches, updatePairingMeta, upsertPairing,
   type PairedSession, type Session,
 } from '../lib/session.js';
-import { accentColor, convKeyOf, resolveConvKey, type ConvKey } from '../lib/conv-key.js';
+import { accentColor, convKeyOf, nextAccentColor, resolveConvKey, type ConvKey } from '../lib/conv-key.js';
 import { leaseUploads, type UploadProvider } from '../lib/uploads.js';
 import { chatReducer, emptyChatState, type ChatState } from '../state/messages.js';
 import type { AppTransport, MakeTransport, TransportRegistry } from './types.js';
@@ -1492,6 +1492,13 @@ export function TransportProvider(props: TransportProviderProps) {
       pairingToken: payload.token,
       device: 'raccoon-app',
       onAdoptGrant: async (g) => {
+        // First-unused-hue assignment: the new pairing takes the first palette
+        // entry no stored pairing is showing (stored color ?? hash fallback);
+        // all 8 taken -> deterministic hash fallback. Persisted at creation so
+        // the accent never shifts when other pairings come and go.
+        const existing = await loadPairingsRaw().catch((): PairedSession[] => []);
+        const usedColors = existing.map((e) => e.color ?? accentColor(e.pairingId));
+        const pairingId = ulid();
         const candidate: PairedSession = {
           url: payload.instanceUrl,
           sessionToken: g.payload.sessionToken,
@@ -1502,8 +1509,9 @@ export function TransportProvider(props: TransportProviderProps) {
           // #R7-3: fresh NON-SECRET epoch so a re-pair is distinguishable from
           // a prior pairing (the wipe broadcasts use it, never the token).
           epoch: crypto.randomUUID(),
-          pairingId: ulid(),
+          pairingId,
           transportKind: kind,
+          color: nextAccentColor(usedColors) || accentColor(pairingId),
         };
         // upsertPairing dup-guards on (url, userId): a re-scan of the same
         // instance as the same user REFRESHES the stored entry in place and

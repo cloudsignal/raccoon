@@ -34,16 +34,33 @@ export function resolveConvKey(
 }
 
 /** Muted, professional accent palette — used as the per-pairing identity cue
- *  (avatar badge, Platforms rows). Deterministic from the pairingId so the
- *  color is stable across sessions without any stored state; locally
- *  overridable via PairedSession.color. */
+ *  (avatar badge, Platforms rows). oklch keeps perceived lightness even across
+ *  the 8 hues: Blue, Rust, Moss, Violet, Amber, Rose, Cyan, Olive.
+ *  New pairings persist the first unused hue at creation (nextAccentColor);
+ *  accentColor is the deterministic hash fallback for entries without a
+ *  stored color. Locally overridable via PairedSession.color. */
 const ACCENTS = [
-  '#6366f1', '#0ea5e9', '#10b981', '#f59e0b',
-  '#ef4444', '#8b5cf6', '#14b8a6', '#f43f5e',
+  'oklch(0.55 0.13 255)', // Blue
+  'oklch(0.62 0.14 30)',  // Rust
+  'oklch(0.56 0.1 155)',  // Moss
+  'oklch(0.58 0.12 300)', // Violet
+  'oklch(0.68 0.12 75)',  // Amber
+  'oklch(0.62 0.12 355)', // Rose
+  'oklch(0.6 0.1 215)',   // Cyan
+  'oklch(0.6 0.09 120)',  // Olive
 ] as const;
 
 export function accentColor(pairingId: string): string {
   let h = 0;
   for (let i = 0; i < pairingId.length; i++) h = (h * 31 + pairingId.charCodeAt(i)) >>> 0;
   return ACCENTS[h % ACCENTS.length];
+}
+
+/** First palette entry not present in `used` (pass the current pairings'
+ *  EFFECTIVE colors: stored color ?? accentColor(pairingId)). Returns '' when
+ *  all 8 are taken — callers fall back to accentColor(pairingId). */
+export function nextAccentColor(used: Iterable<string>): string {
+  const taken = new Set(used);
+  for (const c of ACCENTS) if (!taken.has(c)) return c;
+  return '';
 }

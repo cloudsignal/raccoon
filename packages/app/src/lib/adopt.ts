@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ulid } from 'ulid';
+import { accentColor, nextAccentColor } from './conv-key.js';
 import { promisifyRequest, withStores } from './idb.js';
 import {
   PAIRINGS_KEY, hostIdentityKey, pairedSessionSchema, sessionSchema,
@@ -45,7 +46,13 @@ export async function loadPairings(): Promise<PairedSession[]> {
 
     const pairingId = ulid();
     const epoch = legacy.data.epoch ?? crypto.randomUUID();
-    const adopted: PairedSession = { ...legacy.data, epoch, pairingId, transportKind: 'ws' };
+    const adopted: PairedSession = {
+      ...legacy.data, epoch, pairingId, transportKind: 'ws',
+      // First-unused-hue policy: the adopted session is pairing #1, so it gets
+      // Blue. The hash fallback is unreachable here (empty list) but keeps the
+      // assignment shape identical to the pairWithPayload site.
+      color: nextAccentColor([]) || accentColor(pairingId),
+    };
 
     // 1. lastread:<channel>  ->  lastread:<pairingId>/<channel>
     const keys = await promisifyRequest(kv.getAllKeys());
