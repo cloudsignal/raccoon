@@ -1,8 +1,9 @@
 // Vendored STRUCTURAL types for NanoClaw's channel-adapter surface,
 // transcribed 2026-08-02 from github.com/nanocoai/nanoclaw main:
-//   src/channels/adapter.ts        (ChannelAdapter, ChannelSetup, messages, defaults)
+//   src/channels/adapter.ts        (ChannelAdapter, ChannelSetup, messages,
+//                                   defaults, ChannelAdapterFactory,
+//                                   ChannelRegistration)
 //   src/channels/ask-question.ts   (AskQuestionContent, NormalizedOption)
-//   src/channels/channel-registry.ts (ChannelRegistration)
 // NanoClaw is not on npm; the real interface binds structurally when the
 // wrapper file compiles inside the user's NanoClaw checkout. Their trunk
 // moves fast — on install, the add-raccoon skill re-verifies the wrapper
@@ -129,7 +130,8 @@ export interface ChannelAdapter {
  *  connector's factory stays sync, which remains assignable. */
 export type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter> | null;
 
-/** registerChannelAdapter's second argument (their channel-registry.ts).
+/** registerChannelAdapter's second argument (declared in their adapter.ts;
+ *  registerChannelAdapter itself lives in channel-registry.ts).
  *  Note: defaults are ALSO declared on the registration — resolvable without
  *  instantiating the adapter (offline creation paths read them from the
  *  registry); channel modules pass the same const in both places. */

@@ -96,11 +96,17 @@ Add a `postbuild` script to the fork's `package.json` — npm runs `postbuild`
 automatically after every `npm run build`:
 
 ```json
-"postbuild": "cp src/channels/raccoon.bundle.mjs dist/channels/ && cp -R src/channels/raccoon-app dist/channels/raccoon-app"
+"postbuild": "cp src/channels/raccoon.bundle.mjs dist/channels/ && rm -rf dist/channels/raccoon-app && cp -R src/channels/raccoon-app dist/channels/raccoon-app"
 ```
 
+The `rm -rf` before the directory copy is what makes rebuilds safe: their
+build never cleans `dist/`, and `cp -R` into an existing destination nests
+the source inside it (`dist/channels/raccoon-app/raccoon-app/`) while the
+served top-level files stay frozen at the first copy — a rebuild would
+silently serve a stale PWA.
+
 VERIFY first whether the fork's `package.json` already defines `postbuild`
-(current NanoClaw main does not). If it does, append the two copies to the
+(current NanoClaw main does not). If it does, append the copies to the
 existing command with `&&` instead of replacing it.
 
 ### 3. Register the channel in the barrel

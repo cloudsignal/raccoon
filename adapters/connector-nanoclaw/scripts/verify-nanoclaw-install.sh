@@ -100,7 +100,10 @@ node - "$NC/package.json" <<'EOF'
 const { readFileSync, writeFileSync } = require('node:fs');
 const path = process.argv[2];
 const pkg = JSON.parse(readFileSync(path, 'utf8'));
-const copies = 'cp src/channels/raccoon.bundle.mjs dist/channels/ && cp -R src/channels/raccoon-app dist/channels/raccoon-app';
+// rm -rf keeps the copy idempotent: their build never cleans dist/, and a
+// second cp -R into the existing dir would nest raccoon-app/raccoon-app/
+// while the served top-level files stayed frozen at the first copy.
+const copies = 'cp src/channels/raccoon.bundle.mjs dist/channels/ && rm -rf dist/channels/raccoon-app && cp -R src/channels/raccoon-app dist/channels/raccoon-app';
 pkg.scripts = pkg.scripts ?? {};
 if (pkg.scripts.postbuild && !pkg.scripts.postbuild.includes('raccoon.bundle.mjs')) {
   pkg.scripts.postbuild = `${pkg.scripts.postbuild} && ${copies}`;
