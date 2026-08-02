@@ -13,6 +13,7 @@ import { FakeTransport } from '../transport/fake.js';
 import { TransportProvider } from '../transport/context.js';
 import { Composer } from './composer.js';
 import { Thread } from './thread.js';
+import { ToastHost } from './ui/primitives.js';
 
 const P1 = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const CK = `${P1}/coordinator`;
@@ -55,18 +56,23 @@ afterEach(async () => {
   await closeDbForTests();
 });
 
-async function mount(opts: { thread?: boolean } = {}) {
+async function mount(opts: { thread?: boolean; url?: string; toastHost?: boolean } = {}) {
   const transport = new FakeTransport();
-  await savePairings([{ url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
+  await savePairings([{ url: opts.url ?? 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
       {opts.thread ? <Thread channel={CK} /> : null}
       <Composer channel={CK} />
+      {opts.toastHost ? <ToastHost /> : null}
     </TransportProvider>,
   );
   await waitFor(() => expect(transport.connected).toBe(true));
   return transport;
 }
+
+/** A pairing url on the SAME host the app is served from — servesThisApp
+ *  resolves true for it, so attach keeps its full behavior. */
+const servingUrl = () => `ws://${window.location.host}/`;
 
 const imageFile = (name: string, content = 'img-bytes') => new File([content], name, { type: 'image/png' });
 const textFile = (name: string, content = 'text-bytes') => new File([content], name, { type: 'text/plain' });
@@ -273,6 +279,34 @@ describe('Composer attachments', () => {
     expect(sent.payload.text).toBe('');
     expect(sent.payload.attachments).toEqual([ATT]);
     expect(screen.queryAllByTestId(/^chip-/)).toHaveLength(0);
+  });
+});
+
+describe('Composer degraded attach (non-serving platform)', () => {
+  it('keeps full attach behavior on the serving platform: tap opens the file dialog, no toast', async () => {
+    await mount({ url: servingUrl(), toastHost: true });
+    const clickSpy = vi.spyOn(HTMLInputElement.prototype, 'click');
+    const attach = screen.getByRole('button', { name: 'Attach files' });
+    expect(attach.className).not.toContain('opacity-35');
+    fireEvent.click(attach);
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Attachments aren’t available/)).toBeNull();
+  });
+
+  it('dims attach, opens no file dialog, and toasts on a platform that does not serve the app', async () => {
+    await mount({ toastHost: true }); // default 'ws://x/' — not this app's origin
+    const clickSpy = vi.spyOn(HTMLInputElement.prototype, 'click');
+    const attach = screen.getByRole('button', { name: 'Attachments unavailable' });
+    expect(attach.className).toContain('opacity-35');
+    // Module toast queue: fake timers from here so the toast can be drained
+    // before the test ends (the queue leaks across tests otherwise).
+    vi.useFakeTimers();
+    fireEvent.click(attach);
+    expect(clickSpy).not.toHaveBeenCalled();
+    expect(screen.getByText('Attachments aren’t available on i yet — text only')).toBeTruthy();
+    act(() => { vi.advanceTimersByTime(3000); }); // drain the toast queue
+    expect(screen.queryByText(/Attachments aren’t available/)).toBeNull();
+    vi.useRealTimers();
   });
 });
 

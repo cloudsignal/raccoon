@@ -76,6 +76,58 @@ describe('Thread', () => {
     await waitFor(() => expect(screen.getByText('bold').tagName).toBe('STRONG'));
   });
 
+  it('repeats the sender label when a new group starts after an outgoing message', async () => {
+    const transport = await mount();
+    act(() => {
+      transport.emit(createEnvelope('msg', { from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator', payload: { text: 'first' } }));
+      transport.emit(createEnvelope('msg', { from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator', payload: { text: 'second' } }));
+    });
+    act(() => { send(CK, 'interject'); });
+    act(() => {
+      transport.emit(createEnvelope('msg', { from: 'agent:coordinator', to: 'user:u1', channel: 'coordinator', payload: { text: 'third' } }));
+    });
+    expect(await screen.findByText('third')).toBeTruthy();
+    // First-of-group only: one label for the first-second group, one for third.
+    expect(screen.getAllByText('coordinator')).toHaveLength(2);
+  });
+
+  it('shows the offline pill only while the owning platform is closed', async () => {
+    const transport = await mount();
+    expect(screen.queryByText('Offline — messages will send when it reconnects')).toBeNull();
+    act(() => transport.setStatus('closed'));
+    expect(await screen.findByText('Offline — messages will send when it reconnects')).toBeTruthy();
+    act(() => transport.setStatus('open'));
+    expect(screen.queryByText('Offline — messages will send when it reconnects')).toBeNull();
+  });
+
+  it('captions a pending outgoing message as queued while the platform is offline', async () => {
+    const transport = await mount();
+    act(() => transport.setStatus('closed'));
+    act(() => { send(CK, 'while away'); });
+    expect(await screen.findByText('while away')).toBeTruthy();
+    expect(screen.getByTestId('tick-pending')).toBeTruthy();
+    // displayName falls back to the instance name ('i' in the test pairing).
+    expect(screen.getByText('Queued — sends when i reconnects')).toBeTruthy();
+    // Reconnect: the drain delivers and the caption goes away with 'pending'.
+    act(() => transport.setStatus('open'));
+    await waitFor(() => expect(screen.queryByText('Queued — sends when i reconnects')).toBeNull());
+  });
+
+  it('shows the unsupported-transport card for a pairing kind with no registered transport', async () => {
+    // A stored pairing whose transportKind has no factory stays listed but
+    // permanently closed (transport null) — the thread explains it instead of
+    // showing the generic offline pill.
+    await savePairings([{ url: 'ble://mesh-1/', sessionToken: 't', userId: 'u2', instance: 'kite', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ble-mesh' }]);
+    render(
+      <TransportProvider makeTransport={() => new FakeTransport()}>
+        <Thread channel={CK} />
+      </TransportProvider>,
+    );
+    expect(await screen.findByText(/was paired on another device/)).toBeTruthy();
+    expect(screen.getByText(/kite was paired on another device — this app can’t use its connection type\. Messages queue here\./)).toBeTruthy();
+    expect(screen.queryByText('Offline — messages will send when it reconnects')).toBeNull();
+  });
+
   it('offers Load earlier when a history cursor exists', async () => {
     const transport = await mount();
     act(() => {

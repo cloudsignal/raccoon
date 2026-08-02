@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { resolveConvKey } from '../lib/conv-key.js';
 import { buildThreadItems } from '../lib/grouping.js';
 import { useChat } from '../transport/context.js';
 import { ApprovalCard } from './approval-card.js';
@@ -22,11 +23,29 @@ function TypingDots() {
 }
 
 export function Thread(props: { channel: string }) {
-  const { state, loadOlder, retryMessage } = useChat();
+  const { state, loadOlder, retryMessage, pairings } = useChat();
   const messages = state.messages[props.channel] ?? [];
   const typing = state.typing[props.channel] ?? false;
   const hasMore = Boolean(state.nextBefore[props.channel]);
   const items = buildThreadItems(messages);
+  // The owning platform's connection state drives two calm (non-error)
+  // notices. Offline is per-platform — never an app-wide condition.
+  const r = resolveConvKey(props.channel, pairings.map((p) => p.pairingId));
+  const pairing = pairings.find((p) => p.pairingId === r?.pairingId);
+  const offline = pairing?.status === 'closed';
+  // Unsupported-kind derivation: PairingView carries no explicit flag, but the
+  // provider leaves a pairing whose transportKind has no registered factory
+  // permanently 'closed' (transport null — see context.tsx dialPairing #A3).
+  // This app registers only 'ws' ('host' is the always-wired override
+  // pairing), so kind outside {ws, host} while closed means "no transport
+  // here". A host-registered extra kind would show this card during a real
+  // disconnect too — acceptable until PairingView exposes the flag itself.
+  const unsupported = offline && pairing !== undefined
+    && pairing.transportKind !== 'ws' && pairing.transportKind !== 'host';
+  // Pending delivery while the platform is offline = queued (per-platform
+  // queue): the bubble captions it. Presentation only — delivery logic and
+  // the outbox drain are untouched.
+  const queuedFor = offline ? pairing?.displayName : undefined;
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastId = messages.at(-1)?.id;
   // Long-pressed message context menu (Copy / Share). One menu for the thread.
@@ -64,11 +83,25 @@ export function Thread(props: { channel: string }) {
               msg={item.msg}
               groupStart={item.groupStart}
               groupEnd={item.groupEnd}
+              queuedFor={queuedFor}
               onRetry={(id) => retryMessage(props.channel, id)}
               onLongPress={(msg, x, y) => setMenu({ text: msg.text, x, y })}
             />
           ),
         )}
+        {unsupported ? (
+          // README decision 13: an unsupported-kind platform is listed but
+          // permanently offline — readable history, sends queue, and this
+          // card (not an error) explains why.
+          <div className="mb-3 max-w-[86%] self-center rounded-[10px] bg-surface/80 px-3 py-1.5 text-center text-xs leading-relaxed text-ink-faint shadow-sm">
+            {pairing?.displayName} was paired on another device — this app can’t use its connection type. Messages queue here.
+          </div>
+        ) : offline ? (
+          // Calm, not an error: the platform stays readable and sends queue.
+          <div className="mb-3 max-w-[86%] self-center rounded-[10px] bg-surface/80 px-3 py-1.5 text-center text-xs leading-relaxed text-ink-faint shadow-sm">
+            Offline — messages will send when it reconnects
+          </div>
+        ) : null}
         {typing ? <TypingDots /> : null}
       </div>
       {menu ? <MessageMenu target={menu} onClose={() => setMenu(null)} /> : null}

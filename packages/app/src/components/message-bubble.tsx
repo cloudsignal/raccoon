@@ -4,7 +4,7 @@ import { formatTime } from '../lib/time.js';
 import { renderMarkdown } from '../lib/markdown.js';
 import { useLongPress } from '../lib/long-press.js';
 import type { ChatMessage } from '../state/messages.js';
-import { Ticks } from './ticks.js';
+import { Ticks } from './ui/primitives.js';
 
 const SHADOW = { boxShadow: '0 1px 2px 0 rgb(0 0 0 / 0.06)' };
 
@@ -19,6 +19,10 @@ export function MessageBubble(props: {
   msg: ChatMessage;
   groupStart: boolean;
   groupEnd: boolean;
+  /** Owning platform's displayName while it is offline — a pending outgoing
+   *  message is then "queued" (per-platform queue) and gets the caption.
+   *  Presentation only; delivery state itself is untouched. */
+  queuedFor?: string;
   onRetry?: (id: string) => void;
   /** Long-press (touch) / right-click (mouse) on the bubble — opens the
    *  message context menu (Copy / Share). Receives viewport coordinates. */
@@ -81,6 +85,11 @@ export function MessageBubble(props: {
         )}
         {msg.text ? renderMarkdown(msg.text) : null}
       </div>
+      {mine && msg.delivery === 'pending' && props.queuedFor ? (
+        <span className="mt-[3px] text-[11px] text-ink-faint" data-testid="queued-caption">
+          Queued — sends when {props.queuedFor} reconnects
+        </span>
+      ) : null}
       {mine && msg.delivery === 'failed' ? (
         msg.failureReason === 'attachments-expired' ? (
           // Terminal, NOT retryable: the media lease expired and the bytes

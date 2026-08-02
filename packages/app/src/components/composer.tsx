@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { Paperclip, SendHorizonal } from 'lucide-react';
 import { channelMeta } from '../config.js';
+import { servesThisApp } from '../lib/capabilities.js';
 import { resolveConvKey } from '../lib/conv-key.js';
 import { setUpdateHold } from '../lib/update-hold.js';
 import { deleteUpload, uploadFile, validateFiles } from '../lib/uploads.js';
 import { useChat } from '../transport/context.js';
 import { AttachmentChips, type PendingAttachment } from './attachment-chips.js';
+import { Icon, pushToast } from './ui/primitives.js';
 
 // Transient inline-notice copy per validateFiles rejection reason.
 const REJECT_LABEL: Record<string, string> = {
@@ -143,6 +144,12 @@ export function Composer(props: { channel: string }) {
 
   const uploading = pending.some((p) => p.status === 'uploading');
   const failed = pending.some((p) => p.status === 'failed');
+  // Attachments only work on the platform that serves the app (media is
+  // single-origin — capability URLs resolve against the serving origin).
+  // On any other platform the attach button stays visible but degraded:
+  // dimmed, and a tap explains via toast instead of opening the file dialog.
+  // An unresolved pairing (transient during load) counts as non-serving.
+  const canAttach = pairing !== undefined && servesThisApp(pairing);
 
   const send = (): void => {
     const text = value.trim();
@@ -167,11 +174,6 @@ export function Composer(props: { channel: string }) {
       onDragLeave={() => setDropActive(false)}
       onDrop={(e) => { e.preventDefault(); setDropActive(false); addFiles([...e.dataTransfer.files]); }}
     >
-      {pairing?.status !== 'open' ? (
-        <p className="px-4 pb-1 text-center text-xs text-ink-faint">
-          Offline — messages will send when the connection returns.
-        </p>
-      ) : null}
       {notice ? (
         <p className="px-4 pb-1 text-center text-xs text-ink-faint" data-testid="attach-notice">
           {notice}
@@ -189,11 +191,18 @@ export function Composer(props: { channel: string }) {
         />
         <button
           type="button"
-          aria-label="Attach files"
-          onClick={() => fileRef.current?.click()}
-          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-ink-soft"
+          aria-label={canAttach ? 'Attach files' : 'Attachments unavailable'}
+          onClick={() => {
+            if (!canAttach) {
+              // No file dialog on a non-serving platform — explain instead.
+              pushToast(`Attachments aren’t available on ${pairing?.displayName ?? 'this platform'} yet — text only`);
+              return;
+            }
+            fileRef.current?.click();
+          }}
+          className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-ink-soft ${canAttach ? '' : 'opacity-35'}`}
         >
-          <Paperclip size={20} strokeWidth={2} />
+          <Icon name="plus" />
         </button>
         <div
           className="flex min-h-11 min-w-0 flex-1 items-center rounded-3xl bg-surface px-4 py-1"
@@ -232,7 +241,7 @@ export function Composer(props: { channel: string }) {
           }`}
           style={{ boxShadow: '0 1px 3px 0 rgb(0 0 0 / 0.15)' }}
         >
-          <SendHorizonal size={18} strokeWidth={2} />
+          <Icon name="send" size={20} />
         </button>
       </div>
     </div>

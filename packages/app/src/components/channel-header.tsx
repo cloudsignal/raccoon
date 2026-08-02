@@ -40,7 +40,8 @@ export function ChannelHeader(props: { convKey: ConvKey; onBack: () => void; onS
           <div className="flex min-w-0 flex-col">
             <span className={multi ? 'truncate text-sm font-semibold leading-tight text-ink' : 'text-sm font-semibold leading-tight text-ink'}>
               {meta.label}
-              {multi ? <span className="text-ink-faint"> · {pairing?.displayName}</span> : null}
+              {/* Decision 6: muted, weight 500 — quieter than the agent name. */}
+              {multi ? <span className="font-medium text-ink-faint"> · {pairing?.displayName}</span> : null}
             </span>
             <span className="truncate text-xs leading-4 text-ink-faint">{meta.blurb}</span>
           </div>
