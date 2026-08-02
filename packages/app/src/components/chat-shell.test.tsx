@@ -107,6 +107,21 @@ describe('chat shell', () => {
     await waitFor(() => expect(screen.getByText(/pair your first platform/i)).toBeTruthy());
   });
 
+  it('surfaces the auth notice on the setup screen when the only platform is revoked', async () => {
+    const transport = await mount();
+    vi.useFakeTimers();
+    // The server terminally revokes the ONLY pairing: phase drops to 'setup',
+    // ChatScreen (and its ToastHost) unmounts — the notice must survive onto
+    // the first-run screen or the user never learns why their chats vanished.
+    act(() => { transport.authFail(4403); });
+    await flushFake(500);
+    expect(screen.getByText(/pair your first platform/i)).toBeTruthy();
+    expect(screen.getByText('i was unpaired by its server. Scan a new QR code to reconnect it.')).toBeTruthy();
+    // Drain the revoked toast's module-level queue entry (its ToastHost is
+    // already unmounted) so it can't leak into a later test's host.
+    await flushFake(3000);
+  });
+
   it('clears the composer draft when switching channels', async () => {
     const user = userEvent.setup();
     await mount();
@@ -238,14 +253,6 @@ describe('merged conversation list', () => {
     expect(screen.queryByRole('button', { name: /open settings/i })).toBeNull();
   });
 
-  it('shows connecting indicator when any pairing is not open', async () => {
-    const { tB } = await mountTwo();
-    // Both open after boot → indicator absent.
-    expect(screen.queryByText('connecting…')).toBeNull();
-    // B drops → indicator present even though A is still open.
-    act(() => tB.setStatus('closed'));
-    expect(await screen.findByText('connecting…')).toBeTruthy();
-  });
 });
 
 describe('grouped conversation list (default)', () => {
@@ -278,12 +285,22 @@ describe('grouped conversation list (default)', () => {
     expect(await screen.findByText('· Offline')).toBeTruthy();
   });
 
+  it('renders no aggregate connection hint when a platform is offline while another is open', async () => {
+    // Design decisions 6/7: no app-wide connection indicator anywhere — a
+    // permanently-offline platform must not pin a global "connecting…" hint
+    // over the header. Per-platform status lives on the group headers.
+    const { tB } = await mountTwo();
+    act(() => tB.setStatus('closed'));
+    await screen.findByText('· Offline'); // B's own group header carries the status
+    expect(screen.queryByText('connecting…')).toBeNull();
+  });
+
   it('discriminates duplicate platform display names by instance in the group header', async () => {
     const tA = new FakeTransport();
     const tB = new FakeTransport();
     await savePairings([
-      { url: 'ws://a/', sessionToken: 'ta', userId: 'u1', instance: 'alpha', channels: ['coordinator'], epoch: 'ea', pairingId: P1, transportKind: 'ws', displayName: 'studio' },
-      { url: 'ws://b/', sessionToken: 'tb', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eb', pairingId: P2, transportKind: 'ws', displayName: 'studio' },
+      { url: 'ws://a/', sessionToken: 'ta', userId: 'u1', instance: 'alpha', channels: ['coordinator'], epoch: 'ea', pairingId: P1, transportKind: 'ws', displayName: 'Workspace' },
+      { url: 'ws://b/', sessionToken: 'tb', userId: 'u2', instance: 'beta', channels: ['coordinator'], epoch: 'eb', pairingId: P2, transportKind: 'ws', displayName: 'Workspace' },
     ]);
     render(
       <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
@@ -291,8 +308,8 @@ describe('grouped conversation list (default)', () => {
       </TransportProvider>,
     );
     await waitFor(() => expect(screen.getAllByText('Coordinator')).toHaveLength(2));
-    expect(screen.getByText('studio · alpha')).toBeTruthy();
-    expect(screen.getByText('studio · beta')).toBeTruthy();
+    expect(screen.getByText('Workspace · alpha')).toBeTruthy();
+    expect(screen.getByText('Workspace · beta')).toBeTruthy();
   });
 
   it('marks a newly granted agent NEW and clears the mark on open', async () => {
@@ -434,8 +451,8 @@ describe('platforms navigation (push stack)', () => {
     const tA = new FakeTransport();
     const tB = new FakeTransport();
     await savePairings([
-      { url: 'ws://a/', sessionToken: 'ta', userId: 'u1', instance: 'alpha', displayName: 'Studio', channels: ['coordinator'], epoch: 'ea', pairingId: P1, transportKind: 'ws' },
-      { url: 'ws://b/', sessionToken: 'tb', userId: 'u2', instance: 'beta', displayName: 'Studio', channels: ['coordinator'], epoch: 'eb', pairingId: P2, transportKind: 'ws' },
+      { url: 'ws://a/', sessionToken: 'ta', userId: 'u1', instance: 'alpha', displayName: 'Workspace', channels: ['coordinator'], epoch: 'ea', pairingId: P1, transportKind: 'ws' },
+      { url: 'ws://b/', sessionToken: 'tb', userId: 'u2', instance: 'beta', displayName: 'Workspace', channels: ['coordinator'], epoch: 'eb', pairingId: P2, transportKind: 'ws' },
     ]);
     render(
       <TransportProvider makeTransport={(opts) => (opts.url === 'ws://a/' ? tA : tB)}>
@@ -449,10 +466,14 @@ describe('platforms navigation (push stack)', () => {
     await flushFake(500);
     // Drain the revoked toast so only the banner carries the copy below.
     await flushFake(3000);
+    // Timing-independence: the revoked pairing has already left the rendered
+    // list — the banner's instance discrimination comes from the event itself,
+    // not from a race against the shrinking pairings snapshot.
+    expect(screen.getAllByText('Coordinator')).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'Platforms' }));
     await flushFake(200);
     expect(screen.getByText(
-      'Studio · beta was disconnected by its owner — everything else keeps running.',
+      'Workspace · beta was disconnected by its owner — everything else keeps running.',
     )).toBeTruthy();
     // Dismissible.
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));

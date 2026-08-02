@@ -172,10 +172,12 @@ export function ChannelList(props: {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* No aggregate connection hint here (design decisions 6/7): there is
+          no app-wide connection indicator anywhere — per-platform status
+          lives on the group headers and the Platforms screens. */}
       <Bar
         big
         title={appConfig.name}
-        sub={pairings.some((p) => p.status !== 'open') ? 'connecting…' : undefined}
         right={
           <>
             {hostManaged ? null : (

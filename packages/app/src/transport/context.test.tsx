@@ -1801,7 +1801,9 @@ describe('TransportProvider', () => {
       const unsub = api.subscribeEvents((e) => events.push(e));
       act(() => { tA.authFail(4401); });
       await waitFor(() => expect(events.some((e) => e.type === 'revoked')).toBe(true));
-      expect(events.find((e) => e.type === 'revoked')).toMatchObject({ pairingId: P1, displayName: 'alpha' });
+      // The event names its own instance — banner surfaces must not have to
+      // race the shrinking pairings list to discriminate colliding names.
+      expect(events.find((e) => e.type === 'revoked')).toMatchObject({ pairingId: P1, instance: 'alpha', displayName: 'alpha' });
       expect(api.authError).toMatchObject({ kind: 'revoked' });
       unsub();
     });

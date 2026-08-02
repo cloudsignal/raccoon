@@ -26,10 +26,10 @@ export function ChatScreen() {
   // held here, not in the screen, so a revoke landing while the screen is
   // closed still surfaces on the next visit. Dismissible.
   const [revokeNotice, setRevokeNotice] = useState<string | null>(null);
-  // Last-rendered pairings, for the revoked handler: the event fires before
-  // React re-renders the shrunken list, so this snapshot still contains the
-  // revoked pairing — needed to discriminate colliding display names by
-  // instance (the event itself carries only pairingId + displayName).
+  // Last-rendered pairings, for the revoked handler's collision check: when a
+  // SURVIVING pairing shares the revoked platform's display name, the banner
+  // label discriminates by instance (carried on the event itself, so the check
+  // is independent of whether the revoked pairing has left this snapshot yet).
   const pairingsRef = useRef(pairings);
   pairingsRef.current = pairings;
 
@@ -42,10 +42,10 @@ export function ChatScreen() {
       pushToast(`${e.displayName} reconnected — ${e.sent} queued message${e.sent === 1 ? '' : 's'} sent`);
     } else if (e.type === 'revoked') {
       pushToast(`${e.displayName} was disconnected by its owner — everything else keeps running.`);
-      const known = pairingsRef.current;
-      const revoked = known.find((p) => p.pairingId === e.pairingId);
-      const collides = known.filter((p) => p.displayName === e.displayName).length > 1;
-      const label = collides && revoked ? `${e.displayName} · ${revoked.instance}` : e.displayName;
+      const collides = pairingsRef.current.some(
+        (p) => p.pairingId !== e.pairingId && p.displayName === e.displayName,
+      );
+      const label = collides ? `${e.displayName} · ${e.instance}` : e.displayName;
       setRevokeNotice(`${label} was disconnected by its owner — everything else keeps running.`);
     }
   }), [subscribeEvents]);

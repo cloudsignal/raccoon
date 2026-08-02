@@ -117,14 +117,14 @@ describe('Thread', () => {
     // A stored pairing whose transportKind has no factory stays listed but
     // permanently closed (transport null) — the thread explains it instead of
     // showing the generic offline pill.
-    await savePairings([{ url: 'ble://mesh-1/', sessionToken: 't', userId: 'u2', instance: 'kite', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ble-mesh' }]);
+    await savePairings([{ url: 'mesh://one/', sessionToken: 't', userId: 'u2', instance: 'gamma', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'mesh' }]);
     render(
       <TransportProvider makeTransport={() => new FakeTransport()}>
         <Thread channel={CK} />
       </TransportProvider>,
     );
     expect(await screen.findByText(/was paired on another device/)).toBeTruthy();
-    expect(screen.getByText(/kite was paired on another device — this app can’t use its connection type\. Messages queue here\./)).toBeTruthy();
+    expect(screen.getByText(/gamma was paired on another device — this app can’t use its connection type\. Messages queue here\./)).toBeTruthy();
     expect(screen.queryByText('Offline — messages will send when it reconnects')).toBeNull();
   });
 

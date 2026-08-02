@@ -85,7 +85,7 @@ describe('PlatformsScreen rows', () => {
 
   it('discriminates duplicate display names by instance', async () => {
     await mountScreen(
-      [{ ...pairingA, displayName: 'Studio' }, { ...pairingB, displayName: 'Studio' }],
+      [{ ...pairingA, displayName: 'Workspace' }, { ...pairingB, displayName: 'Workspace' }],
       () => new FakeTransport(),
     );
     expect(screen.getByText('· alpha')).toBeTruthy();
@@ -160,10 +160,10 @@ describe('PlatformsScreen remote revoke', () => {
   it('renders the dismissible revoke banner', async () => {
     const onDismissRevoke = vi.fn();
     await mountScreen([pairingA], () => new FakeTransport(), {
-      revokeNotice: 'Studio · kite was disconnected by its owner — everything else keeps running.',
+      revokeNotice: 'Workspace · delta was disconnected by its owner — everything else keeps running.',
       onDismissRevoke,
     });
-    expect(screen.getByText(/Studio · kite was disconnected by its owner/)).toBeTruthy();
+    expect(screen.getByText(/Workspace · delta was disconnected by its owner/)).toBeTruthy();
     await userEvent.setup().click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(onDismissRevoke).toHaveBeenCalledTimes(1);
   });

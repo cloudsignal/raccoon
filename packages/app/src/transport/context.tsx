@@ -107,7 +107,7 @@ export interface AuthNotice {
 export type PlatformEvent =
   | { type: 'new-agents'; pairingId: string; displayName: string; agents: string[] }
   | { type: 'reconnect-flush'; pairingId: string; displayName: string; sent: number }
-  | { type: 'revoked'; pairingId: string; displayName: string };
+  | { type: 'revoked'; pairingId: string; instance: string; displayName: string };
 
 export interface ChatApi {
   phase: 'loading' | 'setup' | 'ready' | 'storage-error';
@@ -1313,7 +1313,9 @@ export function TransportProvider(props: TransportProviderProps) {
         // Lifecycle event alongside the notice — same applied-gate, so a
         // superseding re-pair never toasts "revoked" for a pairing that just
         // came back.
-        emitEvent({ type: 'revoked', pairingId: pid, displayName });
+        // The event names its own instance: banner surfaces discriminate
+        // colliding display names without racing the shrinking pairings list.
+        emitEvent({ type: 'revoked', pairingId: pid, instance: wiped.instance, displayName });
       });
     });
     rt.unsubs = [u1, u2, u3];
