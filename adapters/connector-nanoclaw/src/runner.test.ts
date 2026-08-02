@@ -115,12 +115,16 @@ describe('buildNanoClawRunner', () => {
     await expect(next).resolves.toEqual(['ok']);
   });
 
-  it('fails closed when the approval value mapping is absent', async () => {
+  it('fails closed when the approval value mapping is absent, but tells the user', async () => {
     const host = createFakeHost();
     const d = deps(host, 50);
-    // nothing remembered for q-gone — restart/eviction scenario
+    // nothing remembered for q-gone — restart/eviction scenario. A silent
+    // empty iterator would be acked 'delivered' by the bridge; the runner
+    // must yield a visible failure instead of pretending the tap applied.
     await expect(collect(d.runner.run(ctx({ text: 'Yes', approval: { refId: 'q-gone', choice: 'Yes' } }))))
-      .resolves.toEqual([]);
+      .resolves.toEqual([
+        'This approval could not be applied - the connector lost the option mapping (it may have restarted). Ask the agent to send the question again.',
+      ]);
     expect(host.actions).toHaveLength(0); // onAction NOT called with a guessed value
   });
 

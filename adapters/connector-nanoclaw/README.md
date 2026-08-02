@@ -39,8 +39,9 @@ the published npm set only and never runs the bundle script.
   becomes an approval-card envelope; the option labels shown on the phone are
   remembered against their underlying values, and a tap resolves the label
   back to the VALUE before it reaches the agent. If the mapping is lost
-  (restart, eviction), the connector fails closed and answers nothing rather
-  than guessing.
+  (restart, eviction), the connector fails closed — it never guesses a value
+  — and replies with a visible notice asking the user to have the agent
+  re-send the question.
 - **Offline buffering.** Approval cards for a disconnected phone are buffered
   (capped per user) and replayed when the next inbound envelope proves the
   socket is live again — push fallback would degrade a card to notification
@@ -184,7 +185,8 @@ channels.
 - **In-memory message history.** The endpoint's message store does not
   survive a restart — pairing sessions persist (`sessions.json`), chat
   history does not. Buffered offline approval cards are also lost on
-  restart, in which case the approval fails closed on a later tap.
+  restart, in which case a later tap fails closed with a user-visible
+  notice.
 - **Single NanoClaw instance per adapter.** One adapter instance embeds one
   endpoint bound to one host process; there is no multi-instance fan-out.
 - **Outbound kinds.** Approval cards, text, and file attachments are

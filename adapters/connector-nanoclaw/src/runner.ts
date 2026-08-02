@@ -47,10 +47,14 @@ export function buildNanoClawRunner(deps: {
 
         if (ctx.approval) {
           // Fail closed on a lost mapping: never answer a card with a guessed
-          // value (wrong-action risk when values differ from labels).
+          // value (wrong-action risk when values differ from labels). But fail
+          // VISIBLY: a silent return completes the iterator normally, the
+          // bridge acks the tap 'delivered', and the user believes the choice
+          // was applied while NanoClaw's question stays unresolved.
           const value = deps.approvalValues.resolveValue(ctx.approval.refId, ctx.approval.choice);
           if (value === null) {
             console.error(`raccoon: approval ${ctx.approval.refId} has no value mapping (restart/eviction) — not answering`);
+            yield 'This approval could not be applied - the connector lost the option mapping (it may have restarted). Ask the agent to send the question again.';
             return;
           }
           // Open BEFORE forwarding: a host that delivers synchronously must

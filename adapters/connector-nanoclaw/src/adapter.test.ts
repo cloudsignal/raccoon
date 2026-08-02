@@ -154,6 +154,36 @@ describe('createRaccoonChannelAdapter', () => {
     await adapter.teardown();
   });
 
+  it('deliver sends an unrenderable-question notice when card extraction fails', async () => {
+    const f = fakeEndpointFactory();
+    const adapter = createRaccoonChannelAdapter({ env: ENV, createEndpoint: f.create })!;
+    const onAction = vi.fn();
+    await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction });
+
+    // Park a turn so the notice path's settle('') is observable.
+    const runP = collect(f.runner().run({ userId: 'u1', channel: 'assistant', text: 'go', messageId: 'm8' }));
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Duplicate labels make extractQuestionCard reject the card; the user
+    // must still see that a question exists rather than nothing at all.
+    const malformed = {
+      ...CARD_CONTENT,
+      options: [
+        { label: 'Yes', selectedLabel: 'Yes', value: 'a' },
+        { label: 'Yes', selectedLabel: 'Yes', value: 'b' },
+      ],
+    };
+    const id = await adapter.deliver('assistant:u1', null, { kind: 'chat', content: malformed });
+    expect(id).toBeTruthy();
+    await expect(runP).resolves.toEqual([]); // parked turn settled with '' first, as the card path does
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.kind).toBe('msg');
+    expect((f.sent[0]!.payload as { text: string }).text)
+      .toBe("The agent asked a question this chat cannot render. Answer it from the agent's own interface.");
+    expect(onAction).not.toHaveBeenCalled();
+    await adapter.teardown();
+  });
+
   it('deliver with files routes through the media path', async () => {
     const f = fakeEndpointFactory();
     const adapter = createRaccoonChannelAdapter({ env: ENV, createEndpoint: f.create })!;

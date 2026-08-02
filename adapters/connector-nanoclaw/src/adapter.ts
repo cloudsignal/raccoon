@@ -213,6 +213,23 @@ export function createRaccoonChannelAdapter(deps: AdapterDeps = {}): ChannelAdap
         return env.id;
       }
 
+      if (content['type'] === 'ask_question') {
+        // A question the extractor rejected (duplicate labels, missing
+        // fields): falling through to the contentless log would silently
+        // swallow the agent's question. Tell the user instead — the card
+        // cannot render here, but the question still exists on the host side.
+        turns.settle(platformId, ''); // as the card path does: this IS the turn's answer
+        const env = createEnvelope('msg', {
+          from: agentAddress(channel),
+          to: userAddress(userId),
+          channel,
+          payload: { text: "The agent asked a question this chat cannot render. Answer it from the agent's own interface." },
+        });
+        const live = await ep.sendAgentEnvelope(userId, env);
+        if (!live) console.error(`raccoon deliver: no live socket for ${userId}; unrenderable-question notice is in history`);
+        return env.id;
+      }
+
       const text = typeof content['text'] === 'string' ? (content['text'] as string) : '';
 
       const files = message.files ?? [];
