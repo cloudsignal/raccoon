@@ -47,6 +47,10 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // Degraded-attach tests run fake timers; restore real ones FIRST even when
+  // an assertion failed mid-test, or closeDbForTests below hangs and the
+  // stuck clock cascades timeouts into every later test in the file.
+  vi.useRealTimers();
   cleanup(); // unmount BEFORE the URL stubs disappear (unmount revokes previews)
   vi.mocked(uploadFile).mockReset();
   vi.mocked(deleteUpload).mockReset();
@@ -56,9 +60,18 @@ afterEach(async () => {
   await closeDbForTests();
 });
 
+/** A pairing url on the SAME host the app is served from — servesThisApp
+ *  resolves true for it, so attach keeps its full behavior. */
+const servingUrl = () => `ws://${window.location.host}/`;
+/** A pairing on a foreign host — attach is degraded there (all admission
+ *  paths gated). Only the degraded-attach tests mount this. */
+const FOREIGN_URL = 'ws://x/';
+
 async function mount(opts: { thread?: boolean; url?: string; toastHost?: boolean } = {}) {
   const transport = new FakeTransport();
-  await savePairings([{ url: opts.url ?? 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
+  // Default pairing lives on the app's own origin: attachment admission is
+  // origin-gated (servesThisApp), and most tests exercise admission itself.
+  await savePairings([{ url: opts.url ?? servingUrl(), sessionToken: 't', userId: 'u1', instance: 'i', channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'ws' }]);
   render(
     <TransportProvider makeTransport={() => transport}>
       {opts.thread ? <Thread channel={CK} /> : null}
@@ -69,10 +82,6 @@ async function mount(opts: { thread?: boolean; url?: string; toastHost?: boolean
   await waitFor(() => expect(transport.connected).toBe(true));
   return transport;
 }
-
-/** A pairing url on the SAME host the app is served from — servesThisApp
- *  resolves true for it, so attach keeps its full behavior. */
-const servingUrl = () => `ws://${window.location.host}/`;
 
 const imageFile = (name: string, content = 'img-bytes') => new File([content], name, { type: 'image/png' });
 const textFile = (name: string, content = 'text-bytes') => new File([content], name, { type: 'text/plain' });
@@ -294,7 +303,7 @@ describe('Composer degraded attach (non-serving platform)', () => {
   });
 
   it('dims attach, opens no file dialog, and toasts on a platform that does not serve the app', async () => {
-    await mount({ toastHost: true }); // default 'ws://x/' — not this app's origin
+    await mount({ url: FOREIGN_URL, toastHost: true });
     const clickSpy = vi.spyOn(HTMLInputElement.prototype, 'click');
     const attach = screen.getByRole('button', { name: 'Attachments unavailable' });
     expect(attach.className).toContain('opacity-35');
@@ -306,6 +315,28 @@ describe('Composer degraded attach (non-serving platform)', () => {
     expect(screen.getByText('Attachments aren’t available on i yet — text only')).toBeTruthy();
     act(() => { vi.advanceTimersByTime(3000); }); // drain the toast queue
     expect(screen.queryByText(/Attachments aren’t available/)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('gates drop on a non-serving platform: no chip, toast instead', async () => {
+    await mount({ url: FOREIGN_URL, toastHost: true });
+    vi.useFakeTimers();
+    fireEvent.drop(screen.getByTestId('composer-root'), { dataTransfer: { files: [imageFile('dropped.png')] } });
+    expect(screen.queryAllByTestId(/^chip-/)).toHaveLength(0);
+    expect(vi.mocked(uploadFile)).not.toHaveBeenCalled();
+    expect(screen.getByText('Attachments aren’t available on i yet — text only')).toBeTruthy();
+    act(() => { vi.advanceTimersByTime(3000); }); // drain the toast queue
+    vi.useRealTimers();
+  });
+
+  it('gates paste on a non-serving platform: no chip, toast instead', async () => {
+    await mount({ url: FOREIGN_URL, toastHost: true });
+    vi.useFakeTimers();
+    fireEvent.paste(composerBox(), { clipboardData: { files: [imageFile('pasted.png')] } });
+    expect(screen.queryAllByTestId(/^chip-/)).toHaveLength(0);
+    expect(vi.mocked(uploadFile)).not.toHaveBeenCalled();
+    expect(screen.getByText('Attachments aren’t available on i yet — text only')).toBeTruthy();
+    act(() => { vi.advanceTimersByTime(3000); }); // drain the toast queue
     vi.useRealTimers();
   });
 });

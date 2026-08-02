@@ -95,8 +95,23 @@ export function Composer(props: { channel: string }) {
     }, 4000);
   };
 
+  // Attachments only work on the platform that serves the app (media is
+  // single-origin — capability URLs resolve against the serving origin).
+  // On any other platform the attach button stays visible but degraded:
+  // dimmed, and a tap explains via toast instead of opening the file dialog.
+  // An unresolved pairing (transient during load) counts as non-serving.
+  const canAttach = pairing !== undefined && servesThisApp(pairing);
+
+  const notifyAttachUnavailable = (): void => {
+    pushToast(`Attachments aren’t available on ${pairing?.displayName ?? 'this platform'} yet — text only`);
+  };
+
   const addFiles = (files: File[]): void => {
     if (files.length === 0) return;
+    // ALL admission paths (attach button, drag-drop, paste) funnel through
+    // here — gate the degraded platform at the source so drop/paste cannot
+    // bypass the disabled file dialog.
+    if (!canAttach) { notifyAttachUnavailable(); return; }
     // Admission via the synchronous ref: event handlers run to completion on
     // one thread, so validate-against-count + reserve here is race-free even
     // for a simultaneous paste + drop (see pendingCountRef above).
@@ -144,12 +159,6 @@ export function Composer(props: { channel: string }) {
 
   const uploading = pending.some((p) => p.status === 'uploading');
   const failed = pending.some((p) => p.status === 'failed');
-  // Attachments only work on the platform that serves the app (media is
-  // single-origin — capability URLs resolve against the serving origin).
-  // On any other platform the attach button stays visible but degraded:
-  // dimmed, and a tap explains via toast instead of opening the file dialog.
-  // An unresolved pairing (transient during load) counts as non-serving.
-  const canAttach = pairing !== undefined && servesThisApp(pairing);
 
   const send = (): void => {
     const text = value.trim();
@@ -193,11 +202,9 @@ export function Composer(props: { channel: string }) {
           type="button"
           aria-label={canAttach ? 'Attach files' : 'Attachments unavailable'}
           onClick={() => {
-            if (!canAttach) {
-              // No file dialog on a non-serving platform — explain instead.
-              pushToast(`Attachments aren’t available on ${pairing?.displayName ?? 'this platform'} yet — text only`);
-              return;
-            }
+            // No file dialog on a non-serving platform — explain instead
+            // (addFiles gates too; this avoids even opening the dialog).
+            if (!canAttach) { notifyAttachUnavailable(); return; }
             fileRef.current?.click();
           }}
           className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-ink-soft ${canAttach ? '' : 'opacity-35'}`}
