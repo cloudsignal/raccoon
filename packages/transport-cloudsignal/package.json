@@ -6,7 +6,9 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "dependencies": {
-    "@raccoon/protocol": "0.1.0"
+    "@raccoon/protocol": "0.1.0",
+    "@raccoon/transport-mqtt": "0.1.0",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

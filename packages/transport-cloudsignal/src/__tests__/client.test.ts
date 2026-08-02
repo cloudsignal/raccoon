@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { CloudSignalTransport } from '../client.js';
+import { CloudSignalTransport, cloudSignalFromPairing } from '../client.js';
 import type { CloudSignalTransportOptions, TokenProvider } from '../client.js';
 import { raccoonCodec } from '@raccoon/transport-mqtt';
 import { createEnvelope } from '@raccoon/protocol';
@@ -762,6 +762,224 @@ describe('CloudSignalTransport', () => {
 
       expect(fake.destroyCalled).toBe(true);
       expect(statuses).toContain('closed');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cloudSignalFromPairing — dial-from-pairing construction path
+// ---------------------------------------------------------------------------
+
+type FetchCall = { url: string; init?: { method?: string; headers?: Record<string, string> } };
+
+/** Fake fetch for the tokenUrl exchange. Serves `responses` in order, sticking
+ *  on the last one once exhausted. */
+function createFakeFetch(responses: Array<{ status: number; body?: unknown }>) {
+  const calls: FetchCall[] = [];
+  let i = 0;
+  const impl = async (url: string, init?: { method?: string; headers?: Record<string, string> }) => {
+    calls.push({ url, init });
+    const r = responses[Math.min(i, responses.length - 1)]!;
+    i++;
+    return {
+      ok: r.status >= 200 && r.status < 300,
+      status: r.status,
+      json: async () => r.body ?? {},
+    };
+  };
+  return { impl, calls };
+}
+
+const PAIRING_CONFIG = {
+  host: 'wss://mqtt.cloudsignal.example',
+  organizationId: 'org-42',
+  tokenServiceUrl: 'https://api.cloudsignal.example/v2/tokens',
+  tokenUrl: 'https://instance.example/api/raccoon/token',
+};
+
+const IDENTITY = { userId: 'u1', instance: 'inst-a', sessionToken: 'sess-tok' };
+
+describe('cloudSignalFromPairing()', () => {
+  describe('transportConfig validation', () => {
+    it('throws a descriptive error when required fields are missing', () => {
+      expect(() =>
+        cloudSignalFromPairing({
+          transportConfig: { host: 'wss://x', organizationId: 'o', tokenServiceUrl: 'https://t' },
+          ...IDENTITY,
+        }),
+      ).toThrow(/tokenUrl/);
+    });
+
+    it('throws a descriptive error on a non-object blob', () => {
+      expect(() =>
+        cloudSignalFromPairing({ transportConfig: 'not-an-object', ...IDENTITY }),
+      ).toThrow(/malformed/);
+    });
+
+    it('throws on empty-string fields', () => {
+      expect(() =>
+        cloudSignalFromPairing({ transportConfig: { ...PAIRING_CONFIG, host: '' }, ...IDENTITY }),
+      ).toThrow(/host/);
+    });
+  });
+
+  describe('token exchange + connect', () => {
+    it('POSTs tokenUrl with Authorization: Bearer <sessionToken> and connects with the returned token', async () => {
+      const fake = createFakeCloudSignalClient();
+      const { impl, calls } = createFakeFetch([{ status: 200, body: { token: 'ext-tok-1' } }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        fetchImpl: impl,
+      });
+
+      await transport.connect();
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe(PAIRING_CONFIG.tokenUrl);
+      expect(calls[0]!.init?.method).toBe('POST');
+      expect(calls[0]!.init?.headers?.['Authorization']).toBe('Bearer sess-tok');
+      expect(fake.connectOpts['externalToken']).toBe('ext-tok-1');
+      expect(fake.connectOpts['host']).toBe(PAIRING_CONFIG.host);
+      expect(fake.connectOpts['organizationId']).toBe(PAIRING_CONFIG.organizationId);
+    });
+
+    it('uses the standard raccoon codec (subscribes to the raccoon outbox topic)', async () => {
+      const fake = createFakeCloudSignalClient();
+      const { impl } = createFakeFetch([{ status: 200, body: { token: 'ext-tok-1' } }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        fetchImpl: impl,
+      });
+
+      await transport.connect();
+
+      const expected = raccoonCodec
+        .subscriptions({ instance: IDENTITY.instance, userId: IDENTITY.userId })
+        .map((s) => s.topic);
+      expect(expected.length).toBeGreaterThan(0);
+      for (const topic of expected) {
+        expect(fake.subscribed).toContain(topic);
+      }
+    });
+
+    it('fires onAuthError(401) and rejects connect() when the token endpoint returns 401', async () => {
+      const fake = createFakeCloudSignalClient();
+      const { impl } = createFakeFetch([{ status: 401 }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        fetchImpl: impl,
+      });
+
+      const authErrors: number[] = [];
+      transport.onAuthError((code) => authErrors.push(code));
+
+      await expect(transport.connect()).rejects.toThrow(/401/);
+      expect(authErrors).toEqual([401]);
+      expect(fake.connectCalled).toBe(false); // never reached the broker
+    });
+
+    it('treats 403 as an auth rejection too (fires onAuthError(401))', async () => {
+      const fake = createFakeCloudSignalClient();
+      const { impl } = createFakeFetch([{ status: 403 }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        fetchImpl: impl,
+      });
+
+      const authErrors: number[] = [];
+      transport.onAuthError((code) => authErrors.push(code));
+
+      await expect(transport.connect()).rejects.toThrow(/403/);
+      expect(authErrors).toEqual([401]);
+    });
+
+    it('rejects plainly on other token endpoint failures without firing onAuthError', async () => {
+      const fake = createFakeCloudSignalClient();
+      const { impl } = createFakeFetch([{ status: 500 }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        fetchImpl: impl,
+      });
+
+      const authErrors: number[] = [];
+      transport.onAuthError((code) => authErrors.push(code));
+
+      await expect(transport.connect()).rejects.toThrow(/500/);
+      expect(authErrors).toEqual([]);
+    });
+
+    it('rejects when the token endpoint returns 2xx without a token string', async () => {
+      const fake = createFakeCloudSignalClient();
+      const { impl } = createFakeFetch([{ status: 200, body: {} }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        fetchImpl: impl,
+      });
+
+      await expect(transport.connect()).rejects.toThrow(/token/);
+    });
+
+    it('fires onAuthError exactly once when a refresh attempt hits a 401 (no double-notify)', async () => {
+      // Connect succeeds; the grant is then revoked (tokenUrl starts returning
+      // 401); a broker auth error triggers the transport's refresh, whose token
+      // exchange 401s. The handler must observe 401 exactly once.
+      const fakes: FakeClient[] = [];
+      const { impl } = createFakeFetch([{ status: 200, body: { token: 'ext-tok-1' } }, { status: 401 }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: PAIRING_CONFIG,
+        ...IDENTITY,
+        ClientImpl: () => {
+          const fake = createFakeCloudSignalClient();
+          fakes.push(fake);
+          return fake;
+        },
+        fetchImpl: impl,
+      });
+
+      await transport.connect();
+
+      const authErrors: number[] = [];
+      transport.onAuthError((code) => authErrors.push(code));
+
+      fakes[0]!.fireAuthError(new Error('401 not authorized'));
+      await flushMicrotasks(20);
+
+      expect(authErrors).toEqual([401]);
+    });
+  });
+
+  describe('push passthrough', () => {
+    it('forwards the push block so enablePush() works', async () => {
+      const fake = createFakeCloudSignalClient();
+      const fakePwa = createFakePwa('reg-777');
+      const { impl } = createFakeFetch([{ status: 200, body: { token: 'ext-tok-1' } }]);
+      const transport = cloudSignalFromPairing({
+        transportConfig: {
+          ...PAIRING_CONFIG,
+          push: { serviceUrl: 'https://pwa.cloudsignal.example', serviceId: 'svc-1', publishableKey: 'pk-1' },
+        },
+        ...IDENTITY,
+        ClientImpl: () => fake,
+        PwaImpl: () => fakePwa,
+        fetchImpl: impl,
+      });
+
+      await transport.connect();
+      const result = await transport.enablePush();
+
+      expect(result).toBe('reg-777');
     });
   });
 });

@@ -1,2 +1,2 @@
-export type { TokenProvider, CloudSignalTransportOptions } from './client.js';
-export { CloudSignalTransport } from './client.js';
+export type { TokenProvider, CloudSignalTransportOptions, CloudSignalPairingConfig } from './client.js';
+export { CloudSignalTransport, cloudSignalFromPairing, TokenAuthRejectedError } from './client.js';

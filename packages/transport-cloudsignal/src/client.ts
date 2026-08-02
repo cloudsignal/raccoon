@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { raccoonCodec } from '@raccoon/transport-mqtt';
 import type { AnyEnvelope, Transport, TransportStatus, Codec, CodecContext } from '@raccoon/protocol';
 
 // ---------------------------------------------------------------------------
@@ -243,8 +245,22 @@ export class CloudSignalTransport implements Transport {
       }
     };
 
-    // Obtain token
-    const token = await this.opts.tokens.getExternalToken();
+    // Obtain token. A TokenProvider that can distinguish credential rejection
+    // (its token endpoint answered 401/403) from transient failure throws
+    // TokenAuthRejectedError — surface that through the transport's existing
+    // onAuthError path, the same signal a broker auth rejection produces, so
+    // the app can mark the pairing revoked. Any other error rejects plainly;
+    // the caller's retry/backoff owns it. Existing TokenProviders never throw
+    // the tagged error, so their behavior is unchanged.
+    let token: string;
+    try {
+      token = await this.opts.tokens.getExternalToken();
+    } catch (err) {
+      if (err instanceof TokenAuthRejectedError) {
+        for (const h of this.authErrorHandlers) h(401);
+      }
+      throw err;
+    }
 
     // Build will params from codec
     const willMsg = this.opts.codec.will?.(ctx) ?? null;
@@ -316,10 +332,138 @@ export class CloudSignalTransport implements Transport {
     try {
       await this.dial();
       // Reconnect succeeded — the error was recoverable; do NOT fire handlers.
-    } catch {
-      // Retry also failed — surface the error to callers now.
-      for (const h of this.authErrorHandlers) h(401);
+    } catch (err) {
+      // Retry also failed — surface the error to callers now. Skip the fire
+      // when dial() already surfaced a TokenAuthRejectedError (avoid notifying
+      // handlers twice for the same rejection).
+      if (!(err instanceof TokenAuthRejectedError)) {
+        for (const h of this.authErrorHandlers) h(401);
+      }
       this.setStatus('closed');
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Dial-from-pairing — universal pairing construction path
+// ---------------------------------------------------------------------------
+
+/** The token endpoint rejected the session grant (HTTP 401/403). Thrown by the
+ *  pairing-built TokenProvider; dial() recognises it and fires the transport's
+ *  onAuthError(401) handlers before rejecting. */
+export class TokenAuthRejectedError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`token exchange rejected with HTTP ${status} - session grant is no longer valid`);
+    this.name = 'TokenAuthRejectedError';
+    this.status = status;
+  }
+}
+
+/** The per-kind `transportConfig` blob a cloudsignal pair.grant carries — the
+ *  runtime dial inputs for this transport. */
+export interface CloudSignalPairingConfig {
+  host: string;
+  organizationId: string;
+  tokenServiceUrl: string;
+  /** The platform's credential exchange endpoint — POSTed with the pairing's
+   *  session token (Bearer) to mint a broker connection token. */
+  tokenUrl: string;
+  push?: { serviceUrl: string; serviceId: string; publishableKey?: string };
+}
+
+const pairingConfigSchema = z.object({
+  host: z.string().min(1),
+  organizationId: z.string().min(1),
+  tokenServiceUrl: z.string().min(1),
+  tokenUrl: z.string().min(1),
+  push: z
+    .object({
+      serviceUrl: z.string().min(1),
+      serviceId: z.string().min(1),
+      publishableKey: z.string().min(1).optional(),
+    })
+    .optional(),
+});
+
+/** Minimal structural fetch type — lets tests inject a fake without pulling in
+ *  DOM lib types; the runtime default is the global fetch. */
+type FetchLike = (
+  url: string,
+  init?: { method?: string; headers?: Record<string, string> },
+) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+
+/** Construct a CloudSignalTransport from a stored pairing's opaque
+ *  `transportConfig` blob plus the pairing's identity. This is the registry
+ *  factory path for universal pairing — additive; the plain constructor is
+ *  unchanged.
+ *
+ *  Throws on a malformed blob. That is the designed degradation: the app's
+ *  dialPairing never throws — it catches this and lists the pairing offline
+ *  instead of failing pairing or boot. */
+export function cloudSignalFromPairing(opts: {
+  transportConfig: unknown;
+  userId: string;
+  instance: string;
+  sessionToken: string;
+  /** Inject a factory for the CloudSignalClient — used in tests. */
+  ClientImpl?: unknown;
+  /** Inject a factory for the CloudSignalPWA — used in tests. */
+  PwaImpl?: unknown;
+  /** Inject a fetch for the tokenUrl exchange — used in tests. */
+  fetchImpl?: FetchLike;
+}): CloudSignalTransport {
+  const parsed = pairingConfigSchema.safeParse(opts.transportConfig);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((i) => `${i.path.map(String).join('.') || '(config)'}: ${i.message}`)
+      .join('; ');
+    throw new Error(`cloudsignal transportConfig is malformed - ${detail}`);
+  }
+  const cfg = parsed.data;
+  const doFetch: FetchLike = opts.fetchImpl ?? (fetch as unknown as FetchLike);
+
+  const tokens: TokenProvider = {
+    async getExternalToken() {
+      const res = await doFetch(cfg.tokenUrl, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${opts.sessionToken}` },
+      });
+      if (res.status === 401 || res.status === 403) {
+        // Grant revoked/expired — the tagged error makes dial() fire the
+        // transport's onAuthError(401) handlers on this connect/refresh
+        // attempt, then the attempt rejects.
+        throw new TokenAuthRejectedError(res.status);
+      }
+      if (!res.ok) {
+        // Transient/other failure — reject plainly; the transport's existing
+        // retry (and the app's reconnect) own it.
+        throw new Error(`token exchange failed with HTTP ${res.status}`);
+      }
+      const body = (await res.json()) as { token?: unknown } | null;
+      if (typeof body?.token !== 'string' || body.token.length === 0) {
+        throw new Error('token exchange returned 2xx without a token string');
+      }
+      return body.token;
+    },
+  };
+
+  // SessionMeta: not wired — no reconnect hook here carries the server-side
+  // channel list; hosted channel refresh arrives via re-scan/Rescan until a
+  // channels.update envelope exists.
+  return new CloudSignalTransport({
+    host: cfg.host,
+    organizationId: cfg.organizationId,
+    tokenServiceUrl: cfg.tokenServiceUrl,
+    instance: opts.instance,
+    userId: opts.userId,
+    // The protocol-standard codec (raccoon topic shape) — the pairing blob
+    // carries no codec choice.
+    codec: raccoonCodec,
+    tokens,
+    ...(cfg.push ? { push: cfg.push } : {}),
+    ...(opts.ClientImpl ? { ClientImpl: opts.ClientImpl } : {}),
+    ...(opts.PwaImpl ? { PwaImpl: opts.PwaImpl } : {}),
+  });
 }
