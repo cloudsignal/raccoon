@@ -112,15 +112,86 @@ that path as `staticDir` to the hub. See [`packages/app/README.md`](../packages/
 
 The app holds any number of pairings at once — two instances of your own
 agent, or your agent plus a second platform entirely. Conversations from
-every pairing appear in one merged list, and each pairing keeps its own
-connection status (the chat header shows which instance a conversation
-belongs to).
+every pairing appear in one list, grouped into per-platform sections by
+default (a flat merged layout is available — see the config section below),
+and each pairing keeps its own connection status (the chat header shows
+which instance a conversation belongs to).
 
 Manage pairings in **Settings → Platforms**: each one is listed with its
-live status and can be renamed or unpaired, and **Add platform** starts the
-same QR/paste flow used for the first pairing. Installs that embed the app
-with a host-managed transport hide "Add platform" — the host application
-owns identity there.
+live status and can be renamed, given its own accent color and marker,
+rescanned, or unpaired, and **Add platform** starts the same QR/paste flow
+used for the first pairing. A successful scan lands on a confirmation
+screen that says what actually happened — a **new** pairing, or an existing
+one **reconnected** (re-scanning a platform you already have refreshes its
+credentials in place instead of duplicating it); failures get a typed
+explanation with a retry. Installs that embed the app with a host-managed
+transport hide "Add platform" — the host application owns identity there.
+
+### Tune the multi-platform surface (raccoon.config.json)
+
+The app's build-time config (`raccoon.config.json` in `@raccoon/app`) has
+four optional fields for multi-platform installs. All of them are optional —
+the defaults are what most installs want:
+
+```json
+{
+  "listLayout": "grouped",
+  "mergedSuffix": "collision",
+  "platformBranding": {
+    "alpha": { "glyph": "sparkle", "label": "Alpha" }
+  },
+  "hostManaged": {
+    "banner": "Managed by the host application",
+    "renameNote": "Set by the host application",
+    "logoutLabel": "Log out"
+  }
+}
+```
+
+- `listLayout` — `"grouped"` (default) renders per-platform sections in the
+  conversation list; `"merged"` renders one flat, recency-sorted list with a
+  per-platform accent dot on each avatar.
+- `mergedSuffix` — when a merged-list row also carries the platform name
+  after the agent label: `"collision"` (default) only when two platforms
+  expose a same-named channel, `"always"` on every row, `"badge"` never (the
+  accent dot alone distinguishes platforms). Ignored in grouped layout.
+- `platformBranding` — per-instance glyph overrides, keyed by the instance
+  name from the pairing grant. `glyph` is a built-in marker id (`bot`,
+  `server`, `home`, `sparkle`) or an inline SVG path d-string; `label` is an
+  optional display name. A branded instance hides the user-facing marker
+  picker on its detail screen.
+- `hostManaged` — copy overrides for installs embedding the app with a
+  host-managed transport, where the host owns identity: the banner shown on
+  the Platforms screen, the note explaining why rename is disabled, and the
+  label on the logout action. Unset fields fall back to the neutral defaults
+  shown above.
+
+Like the rest of the config, these are baked at build time — rebuild the app
+after editing.
+
+### Grant changes reach paired devices automatically
+
+When your hub's channel grant changes — you add an agent, retire one, or
+start advertising a web-push key — paired devices pick the change up without
+re-pairing. The transport's session-resume acknowledgment re-delivers the
+same grant fields a pairing delivers (instance name, channels, optional
+`vapidPublicKey`), and the app applies them to the stored pairing on every
+successful reconnect.
+
+For hub implementers: hubs upgrading `@raccoon/transport-ws` automatically
+advertise channel changes on reconnect — the extended resume acknowledgment
+is built into the hub, with no code changes on your side. A device talking
+to an older hub (bare `{ ok, userId }` resume reply) simply keeps its stored
+grant until it pairs again.
+
+On the device this produces the **new-agent moment**: a channel granted
+since the last connection surfaces at the top of the conversation list with
+a NEW badge (and a one-line notice) until it is first opened; channels
+removed from the grant leave the list. Users can also force a refresh
+without waiting for a reconnect — **Rescan** on a platform's detail screen
+bounces that platform's connection and re-applies the current grant on the
+spot. Rescan is refused while the platform is offline, and is not offered on
+host-managed installs (the host owns the connection lifecycle).
 
 Known v1 limitation: attachments are single-instance. The app has one upload
 origin — the instance that serves it — and uploads authenticate with the
