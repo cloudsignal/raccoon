@@ -7,10 +7,26 @@ import { ChannelList } from './channel-list.js';
 import { Composer } from './composer.js';
 import { SettingsSheet } from './settings-sheet.js';
 import { Thread } from './thread.js';
+import { pushToast, ToastHost } from './ui/primitives.js';
 
 export function ChatScreen() {
-  const { activeChannel, openChannel, pairings } = useChat();
+  const { activeChannel, openChannel, pairings, subscribeEvents } = useChat();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // "+" opens the settings sheet directly on its Add-platform panel — the
+  // minimal seam until the dedicated pairing screen (Task 11) takes it over.
+  const [settingsStartOnAdd, setSettingsStartOnAdd] = useState(false);
+
+  // Platform lifecycle events → transient toasts. Fire-and-forget (no
+  // replay); ToastHost below renders the queue.
+  useEffect(() => subscribeEvents((e) => {
+    if (e.type === 'new-agents') {
+      pushToast(`New agent${e.agents.length === 1 ? '' : 's'} granted on ${e.displayName}`);
+    } else if (e.type === 'reconnect-flush') {
+      pushToast(`${e.displayName} reconnected — ${e.sent} queued message${e.sent === 1 ? '' : 's'} sent`);
+    } else if (e.type === 'revoked') {
+      pushToast(`${e.displayName} was disconnected by its owner — everything else keeps running.`);
+    }
+  }), [subscribeEvents]);
 
   // URL sync. `?c=<ConvKey>` opens a conversation directly; `?pi=&pu=&pc=`
   // (push tap-routing — the SW encodes the pushing hub's instanceUrl, userId,
@@ -78,7 +94,11 @@ export function ChatScreen() {
   return (
     <div className="flex h-full bg-surface">
       <aside className={`${activeChannel ? 'hidden md:flex' : 'flex'} w-full flex-col border-r border-line md:w-80 md:shrink-0`}>
-        <ChannelList onOpen={open} />
+        <ChannelList
+          onOpen={open}
+          onAddPlatform={() => { setSettingsStartOnAdd(true); setSettingsOpen(true); }}
+          onSettings={() => { setSettingsStartOnAdd(false); setSettingsOpen(true); }}
+        />
       </aside>
       <main className={`${activeChannel ? 'flex' : 'hidden md:flex'} min-w-0 flex-1 flex-col`}>
         {activeChannel ? (
@@ -95,7 +115,12 @@ export function ChatScreen() {
           </div>
         )}
       </main>
-      <SettingsSheet open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsSheet
+        open={settingsOpen}
+        startOnAdd={settingsStartOnAdd}
+        onClose={() => setSettingsOpen(false)}
+      />
+      <ToastHost />
     </div>
   );
 }

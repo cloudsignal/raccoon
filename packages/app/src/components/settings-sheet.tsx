@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { TransportStatus } from '@raccoon/protocol';
 import { useChat } from '../transport/context.js';
 import type { PairingView } from '../transport/context.js';
@@ -98,9 +98,21 @@ function PlatformRow(props: {
   );
 }
 
-export function SettingsSheet(props: { open: boolean; onClose: () => void }) {
+export function SettingsSheet(props: {
+  open: boolean;
+  onClose: () => void;
+  /** When the sheet opens with this set, the Add-platform panel starts
+   *  expanded — the chat list's "+" entry routes here until the dedicated
+   *  pairing screen (Task 11) replaces the seam. */
+  startOnAdd?: boolean;
+}) {
   const { pairings, unpair, renamePairing } = useChat();
   const [addOpen, setAddOpen] = useState(false);
+  // Reset the panel to the caller's intent on every open (the component stays
+  // mounted while closed, so initial state alone cannot express this).
+  useEffect(() => {
+    if (props.open) setAddOpen(props.startOnAdd ?? false);
+  }, [props.open, props.startOnAdd]);
   if (!props.open) return null;
   // A host-managed session owns pairing entirely — never offer "Add platform"
   // next to it.
