@@ -1,5 +1,5 @@
 // Vendored STRUCTURAL types for NanoClaw's channel-adapter surface,
-// transcribed 2026-08-01 from github.com/nanocoai/nanoclaw main:
+// transcribed 2026-08-02 from github.com/nanocoai/nanoclaw main:
 //   src/channels/adapter.ts        (ChannelAdapter, ChannelSetup, messages, defaults)
 //   src/channels/ask-question.ts   (AskQuestionContent, NormalizedOption)
 //   src/channels/channel-registry.ts (ChannelRegistration)
@@ -118,13 +118,23 @@ export interface ChannelAdapter {
   resolveChannelName?(platformId: string): Promise<string | null>;
   subscribe?(platformId: string, threadId: string): Promise<void>;
   openDM?(userHandle: string): Promise<string>;
+  /** Declared wiring-time defaults for this channel (their adapter.ts).
+   *  Optional for backward compatibility with stale adapter copies; absent
+   *  means the core falls back to fallbackChannelDefaults(supportsThreads). */
+  defaults?: ChannelDefaults;
 }
 
+/** Factory function that creates a channel adapter (returns null if
+ *  credentials missing). Their trunk allows async factories; this
+ *  connector's factory stays sync, which remains assignable. */
+export type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter> | null;
+
 /** registerChannelAdapter's second argument (their channel-registry.ts).
- *  Note: defaults live on the REGISTRATION (readable without instantiating
- *  the adapter), not on the ChannelAdapter object. */
+ *  Note: defaults are ALSO declared on the registration — resolvable without
+ *  instantiating the adapter (offline creation paths read them from the
+ *  registry); channel modules pass the same const in both places. */
 export interface ChannelRegistration {
-  factory: () => ChannelAdapter | null;
+  factory: ChannelAdapterFactory;
   defaults?: ChannelDefaults;
   containerConfig?: {
     mounts?: Array<{ hostPath: string; containerPath: string; readonly: boolean }>;

@@ -204,7 +204,10 @@ isolated so a mismatch stays cheap to fix:
   `src/channels/raccoon.ts`) and the declared types in
   `templates/raccoon.bundle.d.mts` / `src/nanoclaw-types.ts` — a drift shows
   up as a compile failure in the wrapper, and the fix lives there, not in
-  the bundle.
+  the bundle. Note the check's honest scope: structural compilation catches
+  incompatible changes to required members, not optional additions or
+  semantic drift, so the vendored types still need periodic re-transcription
+  against their trunk.
 - **Port-binding adapter under their host supervision.** The adapter owns
   two listening sockets (hub + admin) inside NanoClaw's process; how their
   supervisor treats a channel that binds ports (restart ordering, crash
