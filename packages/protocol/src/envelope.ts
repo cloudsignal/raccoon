@@ -122,6 +122,10 @@ const pairGrantPayload = z.object({
   instance: z.string().min(1),
   channels: z.array(z.string()),
   vapidPublicKey: z.string().optional(),
+  // Opaque transport dial config for hosted platforms. The protocol does not
+  // interpret it — the pairing transport hands it to the client's transport
+  // layer as-is (JSON-safe blob only, which the wire format already implies).
+  transportConfig: z.unknown().optional(),
 });
 
 const pushSubscribePayload = z.object({

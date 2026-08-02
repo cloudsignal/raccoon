@@ -66,6 +66,43 @@ describe('protocol extensions (Plan C)', () => {
     expect(env.payload.vapidPublicKey).toBe('BPubKey');
   });
 
+  it('accepts an optional opaque transportConfig on pair.grant', () => {
+    const env = createEnvelope('pair.grant', {
+      from: 'system',
+      to: 'user:u1',
+      channel: 'pairing',
+      payload: {
+        sessionToken: 's',
+        userId: 'u1',
+        instance: 'i',
+        channels: ['coordinator'],
+        transportConfig: { host: 'x', anything: 1 },
+      },
+    });
+    expect(env.payload.transportConfig).toEqual({ host: 'x', anything: 1 });
+    // Opaque blob round-trips through serialize/parse untouched.
+    const parsed = tryParseEnvelope(JSON.parse(JSON.stringify(env)));
+    expect(parsed).not.toBeNull();
+    if (parsed?.kind !== 'pair.grant') throw new Error('expected pair.grant');
+    expect(parsed.payload.transportConfig).toEqual({ host: 'x', anything: 1 });
+  });
+
+  it('still parses a pair.grant without transportConfig (backward compatible)', () => {
+    const legacy = tryParseEnvelope({
+      raccoon: '0.1',
+      id: 'e1',
+      ts: new Date().toISOString(),
+      from: 'system',
+      to: 'user:u1',
+      channel: 'pairing',
+      kind: 'pair.grant',
+      payload: { sessionToken: 's', userId: 'u1', instance: 'i', channels: ['coordinator'] },
+    });
+    expect(legacy).not.toBeNull();
+    if (legacy?.kind !== 'pair.grant') throw new Error('expected pair.grant');
+    expect(legacy.payload.transportConfig).toBeUndefined();
+  });
+
   it('parses pairing payloads from protocol', () => {
     const parsed = parsePairingPayload(
       JSON.stringify({ v: 1, instanceUrl: 'ws://127.0.0.1:8790/', transport: 'ws', token: 't0k' }),
