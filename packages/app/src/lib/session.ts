@@ -97,10 +97,9 @@ export async function savePairings(list: PairedSession[]): Promise<void> {
  * Append a pairing, or — duplicate guard — refresh in place when an entry for
  * the same (url, userId) already exists: same instance re-scanned as the same
  * user. The refresh keeps the existing pairingId (all scoped state stays
- * attached), displayName and color (local user choices), and takes the fresh
- * sessionToken/channels/vapidPublicKey/epoch/transportConfig. Atomic via
- * kvUpdate so two tabs
- * pairing concurrently cannot drop each other's entry.
+ * attached), displayName, color and icon (local user choices), and takes the
+ * fresh sessionToken/channels/vapidPublicKey/epoch/transportConfig. Atomic via
+ * kvUpdate so two tabs pairing concurrently cannot drop each other's entry.
  */
 export async function upsertPairing(p: PairedSession): Promise<PairedSession> {
   let stored: PairedSession = p;
@@ -116,6 +115,7 @@ export async function upsertPairing(p: PairedSession): Promise<PairedSession> {
       pairingId: prior.pairingId,
       ...(prior.displayName !== undefined ? { displayName: prior.displayName } : {}),
       ...(prior.color !== undefined ? { color: prior.color } : {}),
+      ...(prior.icon !== undefined ? { icon: prior.icon } : {}),
     };
     const next = [...list];
     next[i] = stored;

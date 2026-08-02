@@ -52,8 +52,8 @@ describe('pairings store', () => {
     expect(await loadPairingsRaw()).toEqual([pairingA, pairingB]);
   });
 
-  it('upsertPairing refreshes in place on (url, userId) match, preserving pairingId/displayName/color', async () => {
-    await savePairings([{ ...pairingA, displayName: 'Home', color: '#10b981' }]);
+  it('upsertPairing refreshes in place on (url, userId) match, preserving pairingId/displayName/color/icon', async () => {
+    await savePairings([{ ...pairingA, displayName: 'Home', color: '#10b981', icon: 'bot' }]);
     const rescanned: PairedSession = {
       ...pairingA, pairingId: '01SHOULDNOTREPLACETHEOLDID', sessionToken: 'tokA2',
       channels: ['coordinator', 'newchan'], epoch: 'eA2',
@@ -62,6 +62,7 @@ describe('pairings store', () => {
     expect(stored.pairingId).toBe(pairingA.pairingId);   // preserved
     expect(stored.displayName).toBe('Home');              // preserved
     expect(stored.color).toBe('#10b981');                 // preserved
+    expect(stored.icon).toBe('bot');                      // preserved
     expect(stored.sessionToken).toBe('tokA2');            // refreshed
     expect(stored.epoch).toBe('eA2');                     // refreshed
     expect((await loadPairingsRaw()).length).toBe(1);
@@ -148,6 +149,18 @@ describe('pairings store', () => {
     expect(stored.displayName).toBe('Home');                              // preserved
     expect(stored.color).toBe('#10b981');                                 // preserved
     expect((await loadPairingsRaw())[0]!.transportConfig).toEqual({ host: 'new.example', n: 2 });
+  });
+
+  it('upsertPairing refresh without a transportConfig clears a previously stored blob', async () => {
+    await savePairings([{ ...pairingA, transportConfig: { host: 'old.example', n: 1 } }]);
+    const rescanned: PairedSession = {
+      ...pairingA, pairingId: '01SHOULDNOTREPLACETHEOLDID', sessionToken: 'tokA2', epoch: 'eA2',
+    };
+    const stored = await upsertPairing(rescanned);
+    // The blob is replaced-from-candidate, never preserved: a grant that
+    // stopped carrying one clears it rather than resurrecting stale endpoints.
+    expect('transportConfig' in stored).toBe(false);
+    expect('transportConfig' in (await loadPairingsRaw())[0]!).toBe(false);
   });
 
   it('absent transportConfig stays absent through a round-trip', async () => {
