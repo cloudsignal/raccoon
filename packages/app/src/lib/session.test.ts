@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { closeDbForTests } from './idb.js';
 import {
   hostIdentityKey, loadPairingsRaw, removePairingIfMatches, savePairings,
-  sessionSchema, updatePairingMeta, upsertPairing, type PairedSession, type Session,
+  sessionSchema, updatePairingGrant, updatePairingMeta, upsertPairing,
+  type PairedSession, type Session,
 } from './session.js';
 
 afterEach(async () => { await closeDbForTests(); });
@@ -103,6 +104,26 @@ describe('pairings store', () => {
     const list = await updatePairingMeta('01NOSUCHPAIRINGIDANYWHERE0', { displayName: 'X' });
     expect(list).toEqual([pairingA, pairingB]);
     expect(await loadPairingsRaw()).toEqual([pairingA, pairingB]);
+  });
+
+  it('updatePairingGrant applies channels + vapid when epoch matches', async () => {
+    await savePairings([pairingA]); // epoch 'eA'
+    const updated = await updatePairingGrant(pairingA.pairingId, 'eA', { channels: ['coordinator', 'courier'], vapidPublicKey: 'BNew' });
+    expect(updated?.channels).toEqual(['coordinator', 'courier']);
+    expect(updated?.vapidPublicKey).toBe('BNew');
+    expect((await loadPairingsRaw())[0]!.channels).toEqual(['coordinator', 'courier']);
+  });
+
+  it('updatePairingGrant is a no-op returning null on a stale epoch', async () => {
+    await savePairings([pairingA]);
+    expect(await updatePairingGrant(pairingA.pairingId, 'STALE', { channels: ['x'] })).toBeNull();
+    expect((await loadPairingsRaw())[0]!.channels).toEqual(pairingA.channels);
+  });
+
+  it('updatePairingMeta stores and clears the icon override', async () => {
+    await savePairings([pairingA]);
+    expect((await updatePairingMeta(pairingA.pairingId, { icon: 'bot' }))[0]!.icon).toBe('bot');
+    expect((await updatePairingMeta(pairingA.pairingId, { icon: '' }))[0]!.icon).toBeUndefined();
   });
 
   it('hostIdentityKey matches the legacy identity-key format', () => {

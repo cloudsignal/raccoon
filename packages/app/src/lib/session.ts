@@ -55,6 +55,10 @@ export const pairedSessionSchema = sessionSchema.extend({
    *  accentColor(pairingId); never sent anywhere. */
   displayName: z.string().min(1).optional(),
   color: z.string().min(1).optional(),
+  /** Local icon override — a marker id ('bot' | 'server' | 'home' |
+   *  'sparkle'); kept as an open string so the marker set can grow without a
+   *  schema change. Same never-sent-anywhere local override as displayName. */
+  icon: z.string().min(1).optional(),
 });
 export type PairedSession = z.infer<typeof pairedSessionSchema>;
 
@@ -128,9 +132,48 @@ export async function removePairingIfMatches(pairingId: string, expectedEpoch: s
   return removed;
 }
 
+/**
+ * Atomic compare-and-update of a pairing's grant (channels + vapidPublicKey),
+ * epoch-gated like removePairingIfMatches: a delayed grant update from a
+ * previous session generation must not clobber a since-refreshed pairing.
+ * Returns the updated entry, or null (NO write) when no entry matches
+ * (pairingId, expectedEpoch) — the caller is stale. Omitting vapidPublicKey
+ * leaves the stored value untouched.
+ */
+export async function updatePairingGrant(
+  pairingId: string,
+  expectedEpoch: string,
+  grant: { channels: string[]; vapidPublicKey?: string },
+): Promise<PairedSession | null> {
+  let updated: PairedSession | null = null;
+  await kvUpdate<unknown>(PAIRINGS_KEY, (current) => {
+    const parsed = pairingsListSchema.safeParse(current);
+    if (!parsed.success) return undefined;
+    const next = parsed.data.map((e) => {
+      if (e.pairingId !== pairingId || e.epoch !== expectedEpoch) return e;
+      updated = {
+        ...e,
+        channels: [...grant.channels],
+        ...(grant.vapidPublicKey !== undefined ? { vapidPublicKey: grant.vapidPublicKey } : {}),
+      };
+      return updated;
+    });
+    if (updated === null) return undefined;
+    // Belt-and-braces: never persist a list the schema rejects. A bad grant
+    // must fail this one call, not brick every stored pairing.
+    const validated = pairingsListSchema.safeParse(next);
+    if (!validated.success) {
+      updated = null;
+      return undefined;
+    }
+    return next;
+  });
+  return updated;
+}
+
 export async function updatePairingMeta(
   pairingId: string,
-  patch: { displayName?: string; color?: string },
+  patch: { displayName?: string; color?: string; icon?: string },
 ): Promise<PairedSession[]> {
   let result: PairedSession[] = [];
   await kvUpdate<unknown>(PAIRINGS_KEY, (current) => {
@@ -143,7 +186,7 @@ export async function updatePairingMeta(
       // back to the UI default), NOT "store an empty string" — '' type-checks
       // but fails the schema's min(1), and an invalid entry would make the
       // all-or-nothing list parse in loadPairingsRaw() drop the WHOLE store.
-      for (const field of ['displayName', 'color'] as const) {
+      for (const field of ['displayName', 'color', 'icon'] as const) {
         if (!(field in patch)) continue;
         const value = patch[field];
         if (value === undefined || value.trim() === '') delete next[field];
