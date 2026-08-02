@@ -33,15 +33,13 @@ export function Thread(props: { channel: string }) {
   const r = resolveConvKey(props.channel, pairings.map((p) => p.pairingId));
   const pairing = pairings.find((p) => p.pairingId === r?.pairingId);
   const offline = pairing?.status === 'closed';
-  // Unsupported-kind derivation: PairingView carries no explicit flag, but the
-  // provider leaves a pairing whose transportKind has no registered factory
-  // permanently 'closed' (transport null — see context.tsx dialPairing #A3).
-  // This app registers only 'ws' ('host' is the always-wired override
-  // pairing), so kind outside {ws, host} while closed means "no transport
-  // here". A host-registered extra kind would show this card during a real
-  // disconnect too — acceptable until PairingView exposes the flag itself.
-  const unsupported = offline && pairing !== undefined
-    && pairing.transportKind !== 'ws' && pairing.transportKind !== 'host';
+  // Registry truth (PairingView.supported, Task 5): no factory for this
+  // pairing's kind on this device = permanently offline here ("paired
+  // elsewhere"). A supported kind that is merely disconnected renders the
+  // plain offline pill instead — the old kind-not-in-{ws,host} heuristic
+  // misfiled every registered extra kind (e.g. cloudsignal) during a real
+  // disconnect.
+  const unsupported = pairing !== undefined && pairing.supported === false;
   // Pending delivery while the platform is offline = queued (per-platform
   // queue): the bubble captions it. Presentation only — delivery logic and
   // the outbox drain are untouched.

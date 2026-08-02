@@ -6,6 +6,7 @@ import {
   agentAddress, createEnvelope, parsePairingPayload, userAddress,
   type AnyEnvelope, type Attachment, type TransportStatus,
 } from '@raccoon/protocol';
+import { cloudSignalFromPairing } from '@raccoon/transport-cloudsignal';
 import { WsClientTransport } from '@raccoon/transport-ws';
 import { ulid } from 'ulid';
 import { kvDel, kvGet, kvSet, probeStorageWritable, wipeKvByPrefix } from '../lib/idb.js';
@@ -77,6 +78,13 @@ export interface PairingView {
   icon?: string;
   status: TransportStatus;
   transportKind: string;        // 'ws' | 'host' | a registered kind
+  /** Registry truth (Task 5): the effective registry holds a factory for
+   *  this pairing's kind (or the kind is 'host', whose transport is
+   *  host-wired, never registry-dialed). false = permanently offline on THIS
+   *  device — "paired elsewhere" UI. Replaces the per-screen
+   *  kind-not-in-{ws,host} heuristics, which broke the moment a kind (like
+   *  the built-in 'cloudsignal') was actually registered. */
+  supported: boolean;
   url?: string;
 }
 
@@ -211,6 +219,35 @@ function settleWithinCall(fn: () => unknown, ms: number): Promise<void> {
 }
 
 const defaultMakeTransport: MakeTransport = (opts) => new WsClientTransport(opts) as AppTransport;
+
+/** Built-in registry factory for the 'cloudsignal' kind — hosted platforms
+ *  pair out of the box, no `transports` prop needed. Wraps
+ *  cloudSignalFromPairing with the stored pairing's dial inputs (the opaque
+ *  transportConfig blob from the pair.grant plus the session identity).
+ *
+ *  THROWS on a missing identity field here, and (inside
+ *  cloudSignalFromPairing) on a malformed blob. That is the designed
+ *  degradation, not a crash path: dialPairing's never-throw catch lists the
+ *  platform offline (#A3) instead of failing pairing or boot, and this
+ *  message is the only diagnostic that surfaces (console.warn there) — so it
+ *  names exactly what was missing. Exported for unit tests: unlike an
+ *  injected `transports` factory, the built-in slot cannot take fakes. */
+export const cloudSignalDefaultFactory: MakeTransport = (opts) => {
+  const missing = [
+    ...(opts.userId ? [] : ['userId']),
+    ...(opts.instance ? [] : ['instance']),
+    ...(opts.session ? [] : ['session']),
+  ];
+  if (missing.length > 0) {
+    throw new Error(`cloudsignal pairing cannot dial - stored pairing is missing ${missing.join(', ')}`);
+  }
+  return cloudSignalFromPairing({
+    transportConfig: opts.transportConfig,
+    userId: opts.userId!,
+    instance: opts.instance!,
+    sessionToken: opts.session!,
+  });
+};
 
 /** Default upload auth for the standalone app: present the LIVE token of the
  *  relevant pairing, read from the ref at CALL time (not captured at build
@@ -431,6 +468,24 @@ export function TransportProvider(props: TransportProviderProps) {
   stateRef.current = state;
   activeRef.current = activeChannel;
 
+  // Effective registry: built-in ws (overridable via the legacy makeTransport
+  // prop) + the built-in cloudsignal slot (hosted platforms pair out of the
+  // box) + host-registered kinds, which override both built-ins per key. A
+  // stored pairing whose kind has no factory stays LISTED but offline
+  // (transport null, status 'closed') — its history remains readable and
+  // sends queue in its outbox. Defined above refreshViews, which consults it
+  // for PairingView.supported.
+  const registry = useMemo<TransportRegistry>(() => ({
+    ws: props.makeTransport ?? defaultMakeTransport,
+    cloudsignal: cloudSignalDefaultFactory,
+    ...props.transports,
+  }), [props.makeTransport, props.transports]);
+  // Read at CALL time by refreshViews: the boot effect captures refreshViews
+  // ONCE (empty deps), so the supported flag must consult the live registry,
+  // never a closed-over first-render snapshot.
+  const registryRef = useRef<TransportRegistry>(registry);
+  registryRef.current = registry;
+
   /** Rebuild the PairingView list from the live runtimes. Called after every
    *  runtime mutation (install, status change, meta update, teardown). */
   const refreshViews = useCallback(() => {
@@ -445,6 +500,10 @@ export function TransportProvider(props: TransportProviderProps) {
       ...(r.pairing.icon ? { icon: r.pairing.icon } : {}),
       status: r.statusNow,
       transportKind: r.pairing.transportKind,
+      // Registry truth — see the PairingView.supported doc comment. 'host'
+      // never appears in the registry (its transport is the wired override).
+      supported: r.pairing.transportKind === 'host'
+        || registryRef.current[r.pairing.transportKind] !== undefined,
       ...(r.pairing.url ? { url: r.pairing.url } : {}),
     })));
   }, []);
@@ -490,15 +549,6 @@ export function TransportProvider(props: TransportProviderProps) {
       emitEvent({ type: 'new-agents', pairingId: pid, displayName: rt.pairing.displayName ?? rt.pairing.instance, agents: added });
     }
   }, [emitEvent]);
-
-  // Effective registry: built-in ws (overridable via the legacy makeTransport
-  // prop) + host-registered kinds. A stored pairing whose kind has no factory
-  // stays LISTED but offline (transport null, status 'closed') — its history
-  // remains readable and sends queue in its outbox.
-  const registry = useMemo<TransportRegistry>(() => ({
-    ws: props.makeTransport ?? defaultMakeTransport,
-    ...props.transports,
-  }), [props.makeTransport, props.transports]);
 
   // Ref-like session source for the default upload provider: resolves the
   // pairing that owns the ACTIVE conversation at CALL time (uploads

@@ -128,6 +128,28 @@ describe('Thread', () => {
     expect(screen.queryByText('Offline — messages will send when it reconnects')).toBeNull();
   });
 
+  it('a cloudsignal pairing (registered kind) shows the plain offline pill, never the paired-elsewhere card', async () => {
+    // Task 5: the unsupported derivation is registry truth (view.supported),
+    // not a kind allowlist. The old {ws, host} heuristic would have flagged a
+    // disconnected cloudsignal pairing as "paired elsewhere" — with the kind
+    // registered (built-in slot; overridden here so a fake can stand in), a
+    // real disconnect must render the ordinary offline pill instead.
+    await savePairings([{
+      url: 'wss://pairhost/', sessionToken: 't', userId: 'u2', instance: 'gamma',
+      channels: ['coordinator'], epoch: 'e1', pairingId: P1, transportKind: 'cloudsignal',
+    }]);
+    const fake = new FakeTransport();
+    render(
+      <TransportProvider transports={{ cloudsignal: () => fake }}>
+        <Thread channel={CK} />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(fake.connected).toBe(true));
+    act(() => fake.setStatus('closed'));
+    expect(await screen.findByText('Offline — messages will send when it reconnects')).toBeTruthy();
+    expect(screen.queryByText(/was paired on another device/)).toBeNull();
+  });
+
   it('offers Load earlier when a history cursor exists', async () => {
     const transport = await mount();
     act(() => {

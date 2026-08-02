@@ -1,3 +1,10 @@
+// Ambient module shims for the two dynamically-imported vendor SDKs. Triple-
+// slash references (not tsconfig include) so any OUTSIDE program that pulls
+// this file in as an imported source — e.g. the app package, which registers
+// the cloudsignal factory in its built-in registry — sees the declarations
+// too; a consumer's tsconfig never includes this package's `src/types`.
+/// <reference path="./types/cloudsignal-mqtt-client.d.ts" />
+/// <reference path="./types/pwa-sdk.d.ts" />
 import { z } from 'zod';
 import { raccoonCodec } from '@raccoon/transport-mqtt';
 import type { AnyEnvelope, Transport, TransportStatus, Codec, CodecContext } from '@raccoon/protocol';

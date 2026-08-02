@@ -6,19 +6,12 @@ import { useState } from 'react';
 import { channelMeta, hostManagedCopy, platformGlyph, TONES } from '../config.js';
 import { ACCENTS } from '../lib/conv-key.js';
 import { useChat } from '../transport/context.js';
-import type { PairingView } from '../transport/context.js';
 import { Bar, Btn, Icon, MARKERS, PlatformMark, pushToast, Sheet } from './ui/primitives.js';
 
 /** Palette hue names, index-matched to ACCENTS — the swatches' aria-labels. */
 const ACCENT_NAMES = ['Blue', 'Rust', 'Moss', 'Violet', 'Amber', 'Rose', 'Cyan', 'Olive'] as const;
 
 const MARKER_KEYS = Object.keys(MARKERS) as Array<keyof typeof MARKERS>;
-
-/** Same heuristic as PlatformsScreen/Thread (Task 9): non-{ws,host} kind
- *  stuck 'closed' = paired on a device this app can't connect from. */
-function isUnsupported(p: PairingView): boolean {
-  return p.status === 'closed' && p.transportKind !== 'ws' && p.transportKind !== 'host';
-}
 
 function SectionLabel(props: { children: string }) {
   return (
@@ -48,6 +41,9 @@ export function PlatformDetail(props: { pairingId: string; onBack: () => void })
   // nav stack pops itself when the pairing disappears (chat-screen effect).
   if (!p) return null;
 
+  // Registry truth (PairingView.supported, Task 5): no factory for this kind
+  // on this device = paired elsewhere, permanently offline here.
+  const unsupported = p.supported === false;
   const hostManaged = p.transportKind === 'host';
   const host = hostManagedCopy();
   const branded = platformGlyph(p.instance) !== null;
@@ -74,11 +70,11 @@ export function PlatformDetail(props: { pairingId: string; onBack: () => void })
       <Bar
         onBack={props.onBack}
         title={p.displayName}
-        sub={isUnsupported(p) ? 'Paired elsewhere' : status}
+        sub={unsupported ? 'Paired elsewhere' : status}
         avatar={<PlatformMark instance={p.instance} color={p.color} icon={p.icon} size={36} />}
       />
       <div className="min-h-0 flex-1 overflow-y-auto pb-11">
-        {isUnsupported(p) ? (
+        {unsupported ? (
           <div className="mx-4 mt-3.5 rounded-[12px] bg-surface-dim px-3 py-2.5 text-[13px] leading-relaxed text-ink-soft">
             Paired on another device. This app doesn’t support its connection type ({p.transportKind}), so it stays offline here — history is readable and sends queue.
           </div>
@@ -163,7 +159,7 @@ export function PlatformDetail(props: { pairingId: string; onBack: () => void })
           <IdentityRow k="You" v={p.userId} />
           <IdentityRow k="Address" v={p.url ?? '—'} />
           <IdentityRow k="Server name" v={p.instance} />
-          <IdentityRow k="Transport" v={isUnsupported(p) ? `${p.transportKind} — unsupported` : p.transportKind} last />
+          <IdentityRow k="Transport" v={unsupported ? `${p.transportKind} — unsupported` : p.transportKind} last />
         </div>
 
         <SectionLabel>{`Agents · ${p.channels.length}`}</SectionLabel>

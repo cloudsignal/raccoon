@@ -204,9 +204,10 @@ export function ChannelList(props: {
                   </span>
                   {p.status !== 'open' ? (
                     <span className="text-[11px] text-ink-faint">
-                      {/* Prototype casing; unsupported kinds read "Can't connect here". */}
-                      · {p.status !== 'closed' ? 'Connecting'
-                        : p.transportKind !== 'ws' && p.transportKind !== 'host' ? 'Can’t connect here'
+                      {/* Prototype casing; unsupported kinds (registry truth,
+                          PairingView.supported — Task 5) read "Can't connect here". */}
+                      · {p.supported === false ? 'Can’t connect here'
+                        : p.status !== 'closed' ? 'Connecting'
                         : 'Offline'}
                     </span>
                   ) : null}

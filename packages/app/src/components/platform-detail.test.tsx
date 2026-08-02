@@ -62,6 +62,23 @@ describe('PlatformDetail identity', () => {
     await mountDetail([{ ...pairingA, transportKind: 'ble-mesh' }], () => new FakeTransport());
     expect(screen.getByText('ble-mesh — unsupported')).toBeTruthy();
   });
+
+  it('a cloudsignal pairing (registered kind) never reads unsupported or paired elsewhere', async () => {
+    // Task 5: registry truth, not a {ws, host} kind allowlist — the
+    // registered cloudsignal slot (overridden so a fake can stand in)
+    // renders the plain transport row and the ordinary status subtitle.
+    await savePairings([{ ...pairingA, transportKind: 'cloudsignal' }]);
+    render(
+      <TransportProvider transports={{ cloudsignal: () => new FakeTransport() }}>
+        <PlatformDetail pairingId={P1} onBack={() => {}} />
+        <ToastHost />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('You')).toBeTruthy());
+    expect(screen.getByText('cloudsignal')).toBeTruthy();
+    expect(screen.queryByText(/unsupported/)).toBeNull();
+    expect(screen.queryByText('Paired elsewhere')).toBeNull();
+  });
 });
 
 describe('PlatformDetail rename', () => {

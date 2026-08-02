@@ -10,7 +10,7 @@ import * as outbox from '../lib/outbox.js';
 import { FakeTransport } from './fake.js';
 import type { MakeTransport } from './types.js';
 import {
-  __setSendAttemptTimeoutForTests, TransportProvider, TYPING_AUTO_CLEAR_MS, useChat,
+  __setSendAttemptTimeoutForTests, cloudSignalDefaultFactory, TransportProvider, TYPING_AUTO_CLEAR_MS, useChat,
   type ChatApi, type PairSuccess, type PlatformEvent,
 } from './context.js';
 
@@ -1104,6 +1104,9 @@ describe('TransportProvider', () => {
       expect(p.userId).toBe('u-host');
       expect(p.instance).toBe('host-instance');
       expect(p.transportKind).toBe('host');
+      // 'host' is always supported — its transport is host-wired, never
+      // registry-dialed (PairingView.supported registry truth, Task 5).
+      expect(p.supported).toBe(true);
       // pairingId === the legacy identity key bytes, so a host install's
       // existing IDB outbox/approvals scopes are unchanged.
       expect(p.pairingId).toBe(JSON.stringify({ i: 'host-instance', u: 'u-host', e: 'host-epoch' }));
@@ -2086,6 +2089,148 @@ describe('TransportProvider', () => {
         expect(await pair).toMatchObject({ kind: 'new' }); // object-truthy success
       });
       await waitFor(() => expect(pushSubs(t2)).toHaveLength(1));
+    });
+  });
+
+  describe('cloudsignal built-in registry (universal pairing Task 5)', () => {
+    afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+    /** A structurally valid cloudsignal pair.grant transportConfig blob. */
+    const CS_CONFIG = {
+      host: 'wss://broker.example',
+      organizationId: 'org1',
+      tokenServiceUrl: 'https://tokens.example',
+      tokenUrl: 'https://platform.example/raccoon/token',
+    };
+
+    const csPairing = {
+      url: 'wss://pairhost/', sessionToken: 'cs-tok', userId: 'u1', instance: 'hosted',
+      channels: ['coordinator'], epoch: EPOCH, pairingId: P1, transportKind: 'cloudsignal',
+      transportConfig: CS_CONFIG,
+    };
+
+    it('a stored cloudsignal pairing dials at boot and is SUPPORTED — a transports override replaces the built-in slot', async () => {
+      await savePairings([csPairing]);
+      const csFake = new FakeTransport();
+      const calls: Array<Parameters<MakeTransport>[0]> = [];
+      render(
+        <TransportProvider transports={{ cloudsignal: (opts) => { calls.push(opts); return csFake; } }}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      await waitFor(() => expect(csFake.connected).toBe(true));
+      // The override factory (which CAN take fakes) received the stored dial
+      // inputs — blob + identity — exactly like any registry kind.
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ transportConfig: CS_CONFIG, userId: 'u1', instance: 'hosted', session: 'cs-tok' });
+      // Registry truth: no longer an "unsupported kind".
+      expect(api.pairings[0]!.supported).toBe(true);
+      expect(api.pairings[0]!.status).toBe('open');
+    });
+
+    it('the BUILT-IN slot exists: with NO transports prop a stored cloudsignal pairing is supported and a connect is ATTEMPTED', async () => {
+      // The built-in factory constructs the REAL CloudSignalTransport, which
+      // cannot take injected fakes — so the observables are:
+      //  1. supported === true straight from the default registry,
+      //  2. dialPairing's factory-threw warn is ABSENT (a transport was
+      //     constructed from the valid blob), and
+      //  3. the connect attempt is real: the transport's token exchange POSTs
+      //     the pairing's sessionToken to the blob's tokenUrl.
+      // No live broker needed — the stubbed fetch rejects, the connect
+      // attempt fails, and the pairing stays LISTED (status 'closed'), which
+      // is the normal offline shape, not the paired-elsewhere one.
+      const fetchCalls: Array<{ url: string; init?: { method?: string; headers?: Record<string, string> } }> = [];
+      vi.stubGlobal('fetch', async (url: string, init?: { method?: string; headers?: Record<string, string> }) => {
+        fetchCalls.push({ url, init });
+        throw new Error('no network in tests');
+      });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await savePairings([csPairing]);
+      render(
+        <TransportProvider>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(api.pairings[0]!.supported).toBe(true);
+      // The factory ran and the constructed transport dialed: token exchange.
+      await waitFor(() => expect(fetchCalls.some((c) => c.url === CS_CONFIG.tokenUrl)).toBe(true));
+      const call = fetchCalls.find((c) => c.url === CS_CONFIG.tokenUrl)!;
+      expect(call.init?.method).toBe('POST');
+      expect(call.init?.headers?.Authorization).toBe('Bearer cs-tok');
+      // The built-in slot handled the kind — dialPairing never warned.
+      expect(warn.mock.calls.some((args) => String(args[0]).includes('transport factory for kind'))).toBe(false);
+      // Failed connect = plain offline; the pairing is listed and supported.
+      expect(api.pairings[0]!.status).toBe('closed');
+      expect(api.authError).toBeNull();
+    });
+
+    it('cloudSignalDefaultFactory throws a DESCRIPTIVE error on missing identity fields (dialPairing degrades it to listed-offline)', () => {
+      // The guard names what is missing — the throw is caught by dialPairing's
+      // never-throw catch and the platform lists offline (the designed #A3
+      // degradation), so the message is the only diagnostic that surfaces.
+      expect(() => cloudSignalDefaultFactory({ url: 'wss://x/', transportConfig: CS_CONFIG, userId: 'u1', instance: 'i' }))
+        .toThrow(/session/);
+      expect(() => cloudSignalDefaultFactory({ url: 'wss://x/', transportConfig: CS_CONFIG, session: 's' }))
+        .toThrow(/userId, instance/);
+      // With everything present a real transport comes back.
+      const t = cloudSignalDefaultFactory({ url: 'wss://x/', transportConfig: CS_CONFIG, session: 's', userId: 'u1', instance: 'i' });
+      expect(typeof t.connect).toBe('function');
+      expect(typeof t.onAuthError).toBe('function');
+    });
+
+    it('a MALFORMED cloudsignal blob lists the platform offline (factory throws, dialPairing catches) — supported stays true', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await savePairings([{ ...csPairing, transportConfig: { host: '' } }]);
+      render(
+        <TransportProvider>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(api.pairings[0]!.status).toBe('closed');
+      // Registry truth: the KIND is supported here — the blob is what is bad,
+      // so this is the offline shape, never "paired elsewhere".
+      expect(api.pairings[0]!.supported).toBe(true);
+      expect(warn.mock.calls.some((args) => String(args[0]).includes('transport factory for kind "cloudsignal"'))).toBe(true);
+      expect(api.authError).toBeNull();
+    });
+
+    it('PairingView.supported is registry truth: an unregistered kind is false, ws is true', async () => {
+      await savePairings([
+        {
+          url: 'ws://x/', sessionToken: 't', userId: 'u1', instance: 'alpha',
+          channels: ['coordinator'], epoch: 'eA', pairingId: P1, transportKind: 'ws',
+        },
+        {
+          url: 'mesh://y/', sessionToken: 't2', userId: 'u2', instance: 'beta',
+          channels: ['coordinator'], epoch: 'eB', pairingId: P2, transportKind: 'ble-mesh',
+        },
+      ]);
+      render(
+        <TransportProvider makeTransport={() => new FakeTransport()}>
+          <Probe />
+        </TransportProvider>,
+      );
+      await waitFor(() => expect(api.phase).toBe('ready'));
+      expect(api.pairings.find((p) => p.pairingId === P1)!.supported).toBe(true);
+      expect(api.pairings.find((p) => p.pairingId === P2)!.supported).toBe(false);
+    });
+
+    it('a second auth-error fire after the terminal teardown is a no-op — listeners detach on the FIRST fire', async () => {
+      // A revoked cloudsignal grant fires onAuthError(401) per connect
+      // attempt. The FIRST fire's handler runs the synchronous-kill preamble
+      // and wipePairing detaches the transport listeners before its first
+      // await — so a re-fire (same tick or later) reaches zero handlers and
+      // cannot start a second competing teardown.
+      const transport = new FakeTransport();
+      await mountPaired(transport);
+      act(() => { transport.authFail(401); transport.authFail(401); });
+      await waitFor(() => expect(api.phase).toBe('setup'));
+      expect(api.pairings).toHaveLength(0);
+      expect(api.authError).toMatchObject({ kind: 'revoked' });
+      expect(await loadPairingsRaw()).toHaveLength(0);
     });
   });
 });

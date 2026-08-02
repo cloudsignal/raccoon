@@ -136,6 +136,21 @@ describe('PlatformsScreen rows', () => {
     ).toBeTruthy());
   });
 
+  it('a cloudsignal pairing (registered kind) is never labeled paired elsewhere', async () => {
+    // Task 5: the flag is registry truth, not a {ws, host} kind allowlist —
+    // a kind with a registered factory (here the cloudsignal slot, overridden
+    // so a fake can stand in) renders the ordinary status line.
+    await savePairings([{ ...pairingA, transportKind: 'cloudsignal' }]);
+    render(
+      <TransportProvider transports={{ cloudsignal: () => new FakeTransport() }}>
+        <PlatformsScreen onBack={() => {}} onOpenDetail={() => {}} onAddPlatform={() => {}} revokeNotice={null} onDismissRevoke={() => {}} />
+      </TransportProvider>,
+    );
+    await waitFor(() => expect(screen.getAllByTestId('platform-row')).toHaveLength(1));
+    await waitFor(() => expect(screen.getByText('u1 on alpha · Connected')).toBeTruthy());
+    expect(screen.queryByText(/Paired elsewhere/)).toBeNull();
+  });
+
   it('offers Add platform as a row and a bar action', async () => {
     const onAddPlatform = vi.fn();
     await mountScreen([pairingA], () => new FakeTransport(), { onAddPlatform });

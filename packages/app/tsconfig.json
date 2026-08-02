@@ -15,6 +15,7 @@
     "baseUrl": ".",
     "paths": {
       "@raccoon/protocol": ["../protocol/src/index.ts"],
+      "@raccoon/transport-cloudsignal": ["../transport-cloudsignal/src/index.ts"],
       "@raccoon/transport-ws": ["../transport-ws/src/index.ts"]
     }
   },

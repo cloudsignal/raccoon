@@ -9,20 +9,13 @@ import { useChat } from '../transport/context.js';
 import type { PairingView } from '../transport/context.js';
 import { Bar, Icon, IconBtn, PlatformMark, StatusDot } from './ui/primitives.js';
 
-/** Unsupported-kind derivation — same heuristic as Thread (Task 9): the
- *  provider leaves a pairing whose transportKind has no registered factory
- *  permanently 'closed'; this app registers only 'ws' ('host' is the wired
- *  override pairing), so kind outside {ws, host} while closed means "paired
- *  on a device that supports it, not this one". */
-function isUnsupported(p: PairingView): boolean {
-  return p.status === 'closed' && p.transportKind !== 'ws' && p.transportKind !== 'host';
-}
-
 /** Subtitle status segment: Connected/Connecting/Offline, `· n queued` only
  *  when n > 0 (README decision 7 — queues are per-platform), or the
- *  paired-elsewhere line for unsupported kinds (README decision 13). */
+ *  paired-elsewhere line for unsupported kinds (README decision 13; registry
+ *  truth via PairingView.supported — Task 5 replaced the old local
+ *  kind-not-in-{ws,host} heuristic). */
 function statusLine(p: PairingView, queued: number): string {
-  if (isUnsupported(p)) return 'Paired elsewhere · can’t connect on this device';
+  if (p.supported === false) return 'Paired elsewhere · can’t connect on this device';
   const status = p.status === 'open' ? 'Connected' : p.status === 'connecting' ? 'Connecting' : 'Offline';
   return queued > 0 ? `${status} · ${queued} queued` : status;
 }
