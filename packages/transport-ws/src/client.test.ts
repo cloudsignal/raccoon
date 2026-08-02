@@ -165,6 +165,58 @@ describe('WsClientTransport', () => {
     }
   });
 
+  it('re-emits SessionMeta on EVERY successful resume, with the hub state current at that resume', async () => {
+    // Regression lock: emission must be per-resume, not latched once per
+    // transport instance (the adoptedGrant fires-once pattern nearby is NOT
+    // the template for this). A reconnect after a drop must deliver a second
+    // SessionMeta — after the second 'open' — carrying the channels the hub
+    // has THEN, so consumers can diff grant changes across reconnects.
+    const first = new WsHub({ instance: 'test', channels: ['coordinator'] });
+    const { port } = await first.start();
+    const token = first.issuePairingToken('u1');
+
+    const pairer = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest' });
+    let session = '';
+    pairer.onGrant((g) => { session = g.payload.sessionToken; });
+    await pairer.connect();
+    await pairer.close();
+
+    client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session, maxBackoffMs: 500 });
+    const events: string[] = [];
+    const metas: SessionMeta[] = [];
+    client.onStatus((s) => events.push(`status:${s}`));
+    const secondMeta = new Promise<SessionMeta>((resolve) => {
+      client.onSessionMeta!((m) => {
+        metas.push(m);
+        events.push(`meta:${metas.length}`);
+        if (metas.length === 2) resolve(m);
+      });
+    });
+    await client.connect();
+    expect(metas).toEqual([{ instance: 'test', channels: ['coordinator'] }]);
+
+    // Drop the connection server-side and restart on the same port with a
+    // CHANGED channel grant and a store that recognizes the session.
+    await first.stop();
+    hub = new WsHub({
+      instance: 'test', channels: ['coordinator', 'scout'], port,
+      store: {
+        createSession: async () => { throw new Error('unused'); },
+        verifySession: async (t) => (t === session ? 'u1' : null),
+        confirmSession: async () => true,
+        revokeUser: async () => {},
+      },
+    });
+    await hub.start();
+
+    // The client's backoff re-dials and resumes; the SECOND meta must arrive,
+    // after the SECOND open, carrying the hub's current channels.
+    expect(await secondMeta).toEqual({ instance: 'test', channels: ['coordinator', 'scout'] });
+    const secondOpen = events.indexOf('status:open', events.indexOf('status:open') + 1);
+    expect(secondOpen).toBeGreaterThan(-1);
+    expect(events.indexOf('meta:2')).toBeGreaterThan(secondOpen);
+  });
+
   it('onSessionMeta supports multiple subscribers and unsubscribe', async () => {
     hub = new WsHub({ instance: 'test', channels: ['coordinator'] });
     const { port } = await hub.start();
