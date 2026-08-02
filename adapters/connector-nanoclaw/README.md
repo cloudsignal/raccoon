@@ -10,6 +10,15 @@ the open-source agent host at [github.com/nanocoai/nanoclaw](https://github.com/
 this connector targets its channel-adapter surface and never writes its
 database.
 
+## Distribution status
+
+The fork-droppable artifacts (`dist/raccoon.bundle.mjs`,
+`dist/raccoon.bundle.d.mts`, `dist/raccoon-app/`) are built from a source
+checkout of this repo: `npm run bundle:nanoclaw` at the repo root (shorthand
+for `npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw`).
+They are NOT part of the release-pack tarballs — the release pipeline packs
+the published npm set only and never runs the bundle script.
+
 ## Architecture
 
 - **Per-conversation serialized turns.** Each inbound phone message opens a
@@ -135,7 +144,7 @@ channels.
 1. Clone `github.com/nanocoai/nanoclaw` and get it running per its README
    (at least one agent, owner approval channel working).
 2. Build the connector deliverables in a raccoon checkout
-   (`npm install && npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw`),
+   (`npm install && npm run bundle:nanoclaw`),
    then run the `add-raccoon` skill in the NanoClaw checkout. The skill also
    wires a `postbuild` copy step into the fork's `package.json` — NanoClaw's
    bare-`tsc` build does not copy the bundle or the PWA into `dist/`, so

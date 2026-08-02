@@ -24,8 +24,13 @@ indicators, approval cards for agent questions, and media in both directions.
   From a fresh raccoon checkout, build them with:
 
   ```bash
-  npm install && npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw
+  npm install && npm run bundle:nanoclaw
   ```
+
+  (`bundle:nanoclaw` is the root shorthand for
+  `npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw`.
+  These artifacts are not part of release-pack tarballs — they are built
+  from a source checkout.)
 
 - A running NanoClaw checkout (cloned, dependencies installed, at least one
   agent configured, and an owner approval channel working — for example their

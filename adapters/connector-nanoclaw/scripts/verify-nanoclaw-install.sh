@@ -45,8 +45,8 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 # --- 0. Connector deliverables (build them if absent) ------------------------
 if [ ! -f "$PKG_ROOT/dist/raccoon.bundle.mjs" ] || [ ! -f "$PKG_ROOT/dist/raccoon-app/index.html" ]; then
-  log "building connector deliverables at the repo root"
-  (cd "$REPO_ROOT" && npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw)
+  log "building connector deliverables (npm run bundle:nanoclaw at repo root)"
+  (cd "$REPO_ROOT" && npm run bundle:nanoclaw)
 fi
 [ -f "$PKG_ROOT/dist/raccoon.bundle.mjs" ] || fail "dist/raccoon.bundle.mjs missing after build"
 [ -f "$PKG_ROOT/dist/raccoon.bundle.d.mts" ] || fail "dist/raccoon.bundle.d.mts missing after build"
