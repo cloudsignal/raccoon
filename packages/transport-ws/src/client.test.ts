@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type { AddressInfo } from 'node:net';
 import { createEnvelope, type AnyEnvelope, type TransportStatus } from '@raccoon/protocol';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { WsHub } from './hub.js';
-import { WsClientTransport, type WsClientOptions } from './client.js';
+import { WsClientTransport, type SessionMeta, type WsClientOptions } from './client.js';
 
 let hub: WsHub;
 let client: WsClientTransport;
@@ -119,6 +120,72 @@ describe('WsClientTransport', () => {
     client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session });
     await client.connect();
     await client.send(msgTo('coordinator', 'resumed'));
+  });
+
+  it('surfaces resume-ok grant fields as SessionMeta, AFTER the open status emission', async () => {
+    hub = new WsHub({ instance: 'test', channels: ['coordinator'], vapidPublicKey: 'BKey' });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    const first = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest' });
+    let session = '';
+    first.onGrant((g) => { session = g.payload.sessionToken; });
+    await first.connect();
+    await first.close();
+
+    client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session });
+    const events: string[] = [];
+    client.onStatus((s) => events.push(`status:${s}`));
+    let meta: SessionMeta | null = null;
+    client.onSessionMeta!((m) => { meta = m; events.push('meta'); });
+    await client.connect();
+
+    expect(meta).toEqual({ instance: 'test', channels: ['coordinator'], vapidPublicKey: 'BKey' });
+    // Ordering is contractual: consumers diff the meta against state they
+    // update when the transport reports open.
+    expect(events.indexOf('meta')).toBeGreaterThan(events.indexOf('status:open'));
+  });
+
+  it('a bare {ok,userId} resume-ok from an old hub emits NO SessionMeta', async () => {
+    const wss = new WebSocketServer({ port: 0 });
+    wss.on('connection', (ws) => {
+      ws.on('message', () => ws.send(JSON.stringify({ ok: true, userId: 'u1' })));
+    });
+    const port = (wss.address() as AddressInfo).port;
+    try {
+      client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session: 'tok' });
+      let calls = 0;
+      client.onSessionMeta!(() => { calls += 1; });
+      await client.connect();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(calls).toBe(0);
+      await client.close();
+    } finally {
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it('onSessionMeta supports multiple subscribers and unsubscribe', async () => {
+    hub = new WsHub({ instance: 'test', channels: ['coordinator'] });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+
+    const first = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, pairingToken: token, device: 'vitest' });
+    let session = '';
+    first.onGrant((g) => { session = g.payload.sessionToken; });
+    await first.connect();
+    await first.close();
+
+    client = new WsClientTransport({ url: `ws://127.0.0.1:${port}/`, session });
+    let a = 0;
+    let b = 0;
+    const offA = client.onSessionMeta!(() => { a += 1; });
+    client.onSessionMeta!(() => { b += 1; });
+    offA();
+    await client.connect();
+
+    expect(a).toBe(0);
+    expect(b).toBe(1);
   });
 
   it('does not reconnect after 4401', async () => {

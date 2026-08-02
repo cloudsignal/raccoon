@@ -51,6 +51,19 @@ export interface WsClientOptions {
   onAdoptGrant?: (grant: Envelope<'pair.grant'>) => Promise<void>;
 }
 
+/**
+ * Session grant fields carried by an extended resume acknowledgment — the same
+ * values a pair.grant delivers (instance branding, channel grants, optional
+ * web-push key), refreshed on every successful session resume. An old hub that
+ * replies with a bare `{ ok, userId }` provides none of these, and no
+ * SessionMeta is emitted for that connection.
+ */
+export interface SessionMeta {
+  instance: string;
+  channels: string[];
+  vapidPublicKey?: string;
+}
+
 export class WsClientTransport implements Transport {
   private opts: WsClientOptions;
   private ws: WsLike | null = null;
@@ -71,6 +84,7 @@ export class WsClientTransport implements Transport {
   private envelopeHandlers = new Set<(env: AnyEnvelope) => void>();
   private statusHandlers = new Set<(s: TransportStatus) => void>();
   private grantHandlers = new Set<(g: Envelope<'pair.grant'>) => void>();
+  private sessionMetaHandlers = new Set<(meta: SessionMeta) => void>();
   private wsCtor: WsCtor | null = null;
   private authHandlers = new Set<(code: number) => void>();
 
@@ -94,6 +108,11 @@ export class WsClientTransport implements Transport {
   onGrant(h: (g: Envelope<'pair.grant'>) => void): () => void {
     this.grantHandlers.add(h);
     return () => this.grantHandlers.delete(h);
+  }
+
+  onSessionMeta(h: (meta: SessionMeta) => void): () => void {
+    this.sessionMetaHandlers.add(h);
+    return () => this.sessionMetaHandlers.delete(h);
   }
 
   onAuthError(h: (code: number) => void): () => void {
@@ -162,6 +181,23 @@ export class WsClientTransport implements Transport {
           // Hello phase: resume-ok or pair.grant establishes the session.
           if (typeof parsed === 'object' && parsed !== null && 'ok' in parsed) {
             this.established();
+            // SessionMeta ordering is contractual: it is emitted AFTER the
+            // 'open' status emission for this connection (established() above
+            // flips to open) — consumers diff the meta against state they
+            // update on 'open', so meta-before-open would diff against the
+            // previous connection's state. Emitted only when the resume-ok
+            // actually carries the grant fields: an old hub's bare
+            // { ok, userId } emits NOTHING.
+            const ok = parsed as { instance?: unknown; channels?: unknown; vapidPublicKey?: unknown };
+            if (typeof ok.instance === 'string' && Array.isArray(ok.channels)
+              && ok.channels.every((c): c is string => typeof c === 'string')) {
+              const meta: SessionMeta = {
+                instance: ok.instance,
+                channels: ok.channels,
+                ...(typeof ok.vapidPublicKey === 'string' ? { vapidPublicKey: ok.vapidPublicKey } : {}),
+              };
+              for (const h of this.sessionMetaHandlers) h(meta);
+            }
             if (!settled) { settled = true; resolve(); }
             return;
           }

@@ -1,5 +1,15 @@
 import type { Envelope, Transport } from '@raccoon/protocol';
 
+/** Session grant fields a transport re-delivers on session resume — the same
+ *  values a pair.grant carries (instance branding, channel grants, optional
+ *  web-push key). Emitted AFTER the 'open' status for the connection that
+ *  produced it, so consumers can diff against state they update on open. */
+export interface SessionMeta {
+  instance: string;
+  channels: string[];
+  vapidPublicKey?: string;
+}
+
 export interface AppTransport extends Transport {
   // #A1/#A2 (vendor-neutral): onGrant is OPTIONAL — it is the WS interactive-
   // pairing capability. A transport that authenticates out-of-band (e.g. via a
@@ -9,6 +19,13 @@ export interface AppTransport extends Transport {
   // non-pairing transport satisfy AppTransport WITHOUT the
   // `as unknown as AppTransport` cast a managed-host wiring previously needed.
   onGrant?(h: (g: Envelope<'pair.grant'>) => void): () => void;
+  // onSessionMeta is OPTIONAL for the same vendor-neutral reason as onGrant —
+  // it is the capability of a transport whose resume acknowledgment re-delivers
+  // the session grant fields (the WS transport does). A transport that never
+  // resumes, or authenticates out-of-band, simply omits it; consumers feature-
+  // detect. Handlers are called AFTER the 'open' status emission for that
+  // connection; the returned function unsubscribes.
+  onSessionMeta?(h: (meta: SessionMeta) => void): () => void;
   // onAuthError is NOT WS-specific — every transport surfaces auth failures
   // (revoked/expired). It stays required.
   onAuthError(h: (code: number) => void): () => void;

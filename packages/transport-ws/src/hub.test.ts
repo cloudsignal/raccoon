@@ -99,7 +99,33 @@ describe('WsHub pairing', () => {
     resumed.send(JSON.stringify({ session: grant.payload.sessionToken }));
     const hello = await new Promise<{ ok: boolean; userId: string }>((resolve) =>
       resumed.once('message', (d) => resolve(JSON.parse(d.toString()))));
-    expect(hello).toEqual({ ok: true, userId: 'u1' });
+    // The resume ack carries the same session grant fields as pair.grant (no
+    // vapidPublicKey key at all when the hub has none configured).
+    expect(hello).toEqual({ ok: true, userId: 'u1', instance: 'test', channels: [] });
+    resumed.close();
+  });
+
+  it('resume ack carries instance/channels/vapidPublicKey, matching pair.grant', async () => {
+    hub = new WsHub({ instance: 'prod', channels: ['coordinator', 'scout'], vapidPublicKey: 'BTestVapidKey' });
+    const { port } = await hub.start();
+    const token = hub.issuePairingToken('u1');
+    const ws = await connect(port);
+    ws.send(pairRequest(token));
+    const grant = await nextMessage(ws);
+    if (grant.kind !== 'pair.grant') throw new Error('expected grant');
+    confirmGrant(ws, grant.payload.sessionToken);
+    await tick();
+    ws.close();
+
+    const resumed = await connect(port);
+    resumed.send(JSON.stringify({ session: grant.payload.sessionToken }));
+    expect(await nextRaw(resumed)).toEqual({
+      ok: true,
+      userId: 'u1',
+      instance: 'prod',
+      channels: ['coordinator', 'scout'],
+      vapidPublicKey: 'BTestVapidKey',
+    });
     resumed.close();
   });
 
@@ -650,7 +676,7 @@ describe('WsHub pairing', () => {
     h3.send(JSON.stringify({ session: s2 }));
     const ok = await new Promise<{ ok: boolean; userId: string }>((resolve) =>
       h3.once('message', (d) => resolve(JSON.parse(d.toString()))));
-    expect(ok).toEqual({ ok: true, userId: 'u1' });
+    expect(ok).toMatchObject({ ok: true, userId: 'u1' });
   });
 
   it('a frame arriving after revokeUser is never dispatched as the revoked user (#R5-6)', async () => {

@@ -515,7 +515,17 @@ export class WsHub {
       // — and the unguarded ws.send() right after would throw synchronously.
       if (ws.readyState !== ws.OPEN) return;
       this.attach(ws, userId);
-      ws.send(JSON.stringify({ ok: true, userId }));
+      // The resume ack carries the same session grant fields as pair.grant
+      // (same value sources — keep the two payloads consistent), so a client
+      // resuming a stored session learns the current instance branding,
+      // channel grants, and push key without re-pairing.
+      ws.send(JSON.stringify({
+        ok: true,
+        userId,
+        instance: this.instance,
+        channels: this.channels,
+        ...(this.vapidPublicKey ? { vapidPublicKey: this.vapidPublicKey } : {}),
+      }));
       return;
     }
 
