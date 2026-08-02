@@ -171,6 +171,14 @@ describe('PlatformDetail unpair', () => {
     await user.click(screen.getByRole('button', { name: 'Unpair alpha' }));
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Unpair' }));
     await waitFor(async () => expect(await loadPairingsRaw()).toHaveLength(0));
+    // The durable removal above is unpair()'s HOISTED clear — the async tail
+    // (bounded cleanups + the per-pairing IDB slice wipe) is still in flight
+    // behind it, fired as `void unpair(...)` with nothing awaiting it. Wait
+    // for the detail view to leave the tree (it renders null only AFTER the
+    // awaited wipe + refreshViews) so afterEach's closeDbForTests() cannot
+    // close IDB under those transactions — that race rejected the void-ed
+    // promise post-teardown as an unhandled error.
+    await waitFor(() => expect(screen.queryByText('You')).toBeNull());
   });
 });
 
@@ -196,5 +204,8 @@ describe('PlatformDetail host-managed mode', () => {
     const dialog = screen.getByRole('dialog');
     await user.click(within(dialog).getByRole('button', { name: 'Log out' }));
     await waitFor(async () => expect(await loadPairingsRaw()).toHaveLength(0));
+    // Same teardown discipline as the unpair test above: wait out the async
+    // unpair tail before afterEach closes IDB.
+    await waitFor(() => expect(screen.queryByText('You')).toBeNull());
   });
 });
