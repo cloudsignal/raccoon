@@ -155,7 +155,7 @@ export function ChannelList(props: {
     .sort(byRecency);
 
   // Duplicate platform display names discriminate by instance name in group
-  // headers ("studio · alpha" vs "studio · beta").
+  // headers ("Workspace · alpha" vs "Workspace · beta").
   const nameCount = new Map<string, number>();
   for (const p of pairings) nameCount.set(p.displayName, (nameCount.get(p.displayName) ?? 0) + 1);
 
