@@ -521,6 +521,32 @@ describe('outbox', () => {
     }
   });
 
+  it('countByScope counts only pending+sending rows for the given scope', async () => {
+    // In-queue for SCOPE: one pending + one sending → count 2.
+    await outbox.enqueue(msg('pending'), SCOPE);
+    const sending = await outbox.enqueue(msg('sending'), SCOPE);
+    await outbox.markSending(sending.id, TAB, SCOPE);
+    // Excluded: another scope's pending row (counted under ITS scope only).
+    await outbox.enqueue(msg('foreign'), 'other-scope');
+    // Excluded: processing (server acked receipt, awaiting terminal outcome).
+    const processing = await outbox.enqueue(approvalResp(), SCOPE);
+    await outbox.markSending(processing.id, TAB, SCOPE);
+    await outbox.acknowledgeReceipt(processing.id);
+    // Excluded: terminal failed and stalled rows.
+    const failed = await outbox.enqueue(msg('failed'), SCOPE);
+    const failedToken = await outbox.markSending(failed.id, TAB, SCOPE);
+    await outbox.markFailed(failed.id, 'no ack', failedToken!);
+    const stalled = await outbox.enqueue(msg('stalled'), SCOPE);
+    await outbox.markStalled(stalled.id);
+    // Excluded: settled (deleted) row.
+    const settled = await outbox.enqueue(msg('settled'), SCOPE);
+    await outbox.settle(settled.id);
+
+    expect(await outbox.countByScope(SCOPE)).toBe(2);
+    expect(await outbox.countByScope('other-scope')).toBe(1);
+    expect(await outbox.countByScope('no-such-scope')).toBe(0);
+  });
+
   it('notifies subscribers with the touched channel', async () => {
     const touched: string[] = [];
     const unsub = outbox.subscribe((c) => touched.push(c));

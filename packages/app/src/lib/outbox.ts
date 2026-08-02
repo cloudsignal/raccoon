@@ -143,6 +143,15 @@ export async function listPending(): Promise<OutboxEntry[]> {
   return all.filter((e) => e.status === 'pending').sort(byCreatedAt);
 }
 
+/** How many of `scope`'s rows are still IN the queue — status 'pending' or
+ *  'sending' only. Everything else is not "queued work": 'processing' left
+ *  the client (server acked receipt), 'failed'/'stalled' are terminal, and
+ *  settled rows are deleted. Single read-only transaction like listPending. */
+export async function countByScope(scope: string): Promise<number> {
+  const all = await getAll();
+  return all.filter((e) => e.scope === scope && (e.status === 'pending' || e.status === 'sending')).length;
+}
+
 /** One entry by id, or undefined. Read-only. */
 export async function getEntry(id: string): Promise<OutboxEntry | undefined> {
   return withStore<OutboxEntry | undefined>('outbox', 'readonly', (s) => s.get(id) as IDBRequest<OutboxEntry | undefined>);
