@@ -75,11 +75,35 @@ describe('deliverFilesAsAttachments', () => {
     expect((sent[1]!.payload as { text: string }).text).toBe('');
   });
 
-  it('skips failed saves; sends nothing when all fail and text is empty', async () => {
+  it('all saves fail with no text: still sends one msg carrying the failure notice', async () => {
     const { sent, send } = fakes();
     const media = { save: vi.fn(async () => ({ ok: false as const, error: 'too-large' as const })) };
     const n = await deliverFilesAsAttachments({ media, send }, 'assistant', 'u1', [{ filename: 'a.png', data: Buffer.from('x') }], '');
-    expect(n).toBe(0);
-    expect(sent).toHaveLength(0);
+    expect(n).toBe(1);
+    expect(sent).toHaveLength(1);
+    expect((sent[0]!.payload as { text: string }).text).toBe('[1 attachment(s) could not be transferred]');
+    expect((sent[0]!.payload as { attachments?: unknown[] }).attachments).toBeUndefined();
+  });
+
+  it('partial failure: appends the failure notice to the first envelope text', async () => {
+    const { sent, send } = fakes();
+    // ok.png saves; broken.png fails.
+    const media = {
+      save: vi.fn(async (_body: NodeJS.ReadableStream, opts: { mime: string; name: string }) =>
+        opts.name === 'broken.png'
+          ? { ok: false as const, error: 'too-large' as const }
+          : {
+              ok: true as const,
+              attachment: { url: `/media/01ARZ3NDEKTSV4RRFFQ69G5FAV/${opts.name}`, mime: opts.mime, name: opts.name },
+            }),
+    };
+    const n = await deliverFilesAsAttachments({ media, send }, 'assistant', 'u1', [
+      { filename: 'ok.png', data: Buffer.from('x') },
+      { filename: 'broken.png', data: Buffer.from('y') },
+    ], 'here you go');
+    expect(n).toBe(1);
+    expect((sent[0]!.payload as { text: string }).text)
+      .toBe('here you go\n[1 of 2 attachments could not be transferred]');
+    expect((sent[0]!.payload as { attachments: unknown[] }).attachments).toHaveLength(1);
   });
 });

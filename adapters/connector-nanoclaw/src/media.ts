@@ -32,7 +32,11 @@ export function absolutizeMediaPaths(text: string, publicOrigin: string): string
  *  native msg attachments through the endpoint's outbound seam (which records
  *  history, references media, and applies push fallback — never raw
  *  hub.sendToUser). Protocol caps attachments at 4 per envelope; text rides
- *  the first. Returns the number of envelopes sent. */
+ *  the first. Save failures are NEVER silent to the user: a partial failure
+ *  appends a "[N of M attachments could not be transferred]" line to the
+ *  first envelope's text, and when every save fails with no text to ride on,
+ *  one msg carrying only the failure notice is still sent. Returns the
+ *  number of envelopes sent. */
 export async function deliverFilesAsAttachments(
   deps: { media: Pick<MediaStore, 'save'>; send: (userId: string, env: AnyEnvelope) => Promise<boolean> },
   channel: string,
@@ -41,6 +45,7 @@ export async function deliverFilesAsAttachments(
   text: string,
 ): Promise<number> {
   const saved: Attachment[] = [];
+  let failedCount = 0;
   for (const f of files) {
     const res = await deps.media.save(Readable.from(f.data), {
       mime: mimeFor(f.filename),
@@ -49,9 +54,22 @@ export async function deliverFilesAsAttachments(
       declaredLength: f.data.length,
     });
     if (res.ok) saved.push(res.attachment);
-    else console.error(`raccoon: outbound media save failed for ${f.filename}: ${res.error}`);
+    else {
+      failedCount += 1;
+      console.error(`raccoon: outbound media save failed for ${f.filename}: ${res.error}`);
+    }
   }
-  if (saved.length === 0 && text.length === 0) return 0;
+
+  // Explicit partial-failure policy: the user must see that files went
+  // missing, whether or not anything else survived to deliver.
+  let firstText = text;
+  if (failedCount > 0) {
+    const notice = saved.length > 0
+      ? `[${failedCount} of ${files.length} attachments could not be transferred]`
+      : `[${failedCount} attachment(s) could not be transferred]`;
+    firstText = firstText.length > 0 ? `${firstText}\n${notice}` : notice;
+  }
+  if (saved.length === 0 && firstText.length === 0) return 0; // nothing to say and nothing failed
 
   let sentCount = 0;
   const chunks: Attachment[][] = [];
@@ -64,7 +82,7 @@ export async function deliverFilesAsAttachments(
       to: userAddress(userId),
       channel,
       payload: {
-        text: i === 0 ? text : '',
+        text: i === 0 ? firstText : '',
         ...(chunk.length > 0 ? { attachments: chunk } : {}),
       },
     });
