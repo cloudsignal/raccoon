@@ -236,6 +236,119 @@ labeling and routing hint, not an authenticated identity, so an instance can
 mislabel its notifications — do not treat notification titles as trust
 signals.
 
+## Hosted platforms — the universal pairing contract
+
+Everything above assumes the runtime connection is a plain WebSocket to the
+hub that issued the QR. A hosted platform is different: its runtime transport
+is a managed messaging service that needs per-session credentials the QR
+cannot carry. Universal pairing keeps the user experience identical — scan a
+QR, chat — by splitting pairing from the runtime dial. This section is the
+contract a platform implements.
+
+### Pairing is always the WebSocket handshake
+
+Whatever the pairing payload's `transport` field says, the app pairs by
+dialing the payload's `instanceUrl` over WebSocket and running the standard
+Raccoon handshake (`pair.request` → `pair.grant` → `pair.confirm` →
+`pair.confirmed`). The `transport` kind selects only the **runtime**
+transport, dialed after the handshake completes. Consequences:
+
+- A platform whose runtime transport is not a raw WebSocket still exposes a
+  **WS pairing endpoint** — a small HTTPS/WSS endpoint that speaks the
+  handshake, validates the one-time token, and issues the grant. The
+  `@raccoon/transport-ws` hub already implements the handshake; a platform
+  can also speak the four envelopes directly (see
+  [connector-authoring.md](connector-authoring.md) for the envelope schemas).
+- For the built-in `ws` kind nothing changes: the pairing socket **is** the
+  runtime connection.
+- For any other kind, the app closes the handshake socket after
+  `pair.confirmed` and dials the runtime transport from the stored pairing.
+- A pairing whose kind has no registered runtime factory still pairs
+  successfully — it is listed offline until a build that registers the kind
+  loads. A missing runtime is not a pairing error.
+
+### The grant's `transportConfig` blob
+
+`pair.grant` carries an optional `transportConfig` field: an opaque,
+JSON-safe blob the protocol does not interpret. Its shape is defined
+entirely by the transport kind. The app persists it with the pairing and
+hands it — untouched — to the kind's registry factory on every dial (both
+the post-pairing dial and every later boot). Rules:
+
+- The blob is **per-kind**: the factory registered for the pairing's
+  `transport` kind is the only consumer, and it validates the shape itself.
+- Re-pairing (or a refresh grant) replaces the stored blob; a refresh grant
+  **without** a `transportConfig` clears a stale one.
+- A malformed blob must never break pairing or boot: the factory throws, the
+  app catches, and the platform is listed offline. Degrade, don't fail.
+
+### The built-in `cloudsignal` kind
+
+The app registers one hosted kind out of the box: `cloudsignal`
+(`@raccoon/transport-cloudsignal`, an MQTT-over-WSS transport backed by a
+token service). Its `transportConfig` shape:
+
+```jsonc
+{
+  "host": "broker.platform.example",        // MQTT-over-WSS broker host
+  "organizationId": "org_abc123",           // tenant scope on the platform
+  "tokenServiceUrl": "https://tokens.platform.example",
+  "tokenUrl": "https://api.platform.example/raccoon/token",
+  "push": {                                  // optional — enables platform push
+    "serviceUrl": "https://push.platform.example",
+    "serviceId": "svc_xyz",
+    "publishableKey": "pk_..."               // optional
+  }
+}
+```
+
+A pairing endpoint for this kind issues a normal grant plus this blob; the
+runtime messages use the protocol-standard codec and topic shape — the blob
+carries no codec choice.
+
+### The `tokenUrl` credential exchange
+
+The pairing's long-lived credential is the grant's `sessionToken`. The
+runtime transport never puts it on the wire to the broker; instead it mints
+short-lived connection tokens through the platform's exchange endpoint:
+
+```
+POST <tokenUrl>
+Authorization: Bearer <sessionToken>
+
+200 → { "token": "<connection token>", "expiresAt": "<ISO timestamp>" }
+```
+
+Contract for the platform implementing `tokenUrl`:
+
+- Authenticate the request by the bearer session token alone. Only `token`
+  is required in the 200 body (`expiresAt` and other fields are tolerated
+  and currently ignored by the client — the transport re-exchanges when the
+  broker rejects an expired token).
+- Return **401 (or 403) only when the session grant itself is revoked or
+  expired.** The app treats it as terminal: the platform is removed from the
+  device and the user is told to scan a new QR code.
+- Any other failure (5xx, timeouts) is treated as transient — the transport
+  retries and the platform shows as reconnecting, not unpaired.
+
+Revoking a pairing server-side therefore requires no push channel: the next
+exchange returns 401 and the device cleans itself up.
+
+### Registering additional kinds
+
+`ws` and `cloudsignal` are built in. A platform with its own transport ships
+a factory and registers it under its kind via the provider's `transports`
+prop (see the embedding section above):
+
+```tsx
+<TransportProvider transports={{ mykind: (opts) => myTransportFrom(opts) }}>
+```
+
+The factory receives the stored pairing's `transportConfig`, `userId`,
+`instance`, and session token — everything a credentialed transport needs at
+construction. Kinds are additive: registering one never changes the behavior
+of `ws` pairings, and unknown kinds keep the list-offline degradation above.
+
 ## Path B — an existing OpenClaw agent
 
 If your agent runs on [OpenClaw](https://openclaw.ai), install the first-party
