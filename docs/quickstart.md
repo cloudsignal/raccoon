@@ -257,8 +257,10 @@ transport, dialed after the handshake completes. Consequences:
   **WS pairing endpoint** — a small HTTPS/WSS endpoint that speaks the
   handshake, validates the one-time token, and issues the grant. The
   `@raccoon/transport-ws` hub already implements the handshake; a platform
-  can also speak the four envelopes directly (see
-  [connector-authoring.md](connector-authoring.md) for the envelope schemas).
+  can also speak the four envelopes directly — the pairing payload schemas
+  live in `@raccoon/protocol`'s `envelope.ts`. For where a pairing endpoint
+  sits in the package architecture, see
+  [connector-authoring.md](connector-authoring.md).
 - For the built-in `ws` kind nothing changes: the pairing socket **is** the
   runtime connection.
 - For any other kind, the app closes the handshake socket after
@@ -329,7 +331,8 @@ Contract for the platform implementing `tokenUrl`:
   expired.** The app treats it as terminal: the platform is removed from the
   device and the user is told to scan a new QR code.
 - Any other failure (5xx, timeouts) is treated as transient — the transport
-  retries and the platform shows as reconnecting, not unpaired.
+  retries and the platform is listed as "Connecting" (or "Offline"), not
+  unpaired.
 
 Revoking a pairing server-side therefore requires no push channel: the next
 exchange returns 401 and the device cleans itself up.
