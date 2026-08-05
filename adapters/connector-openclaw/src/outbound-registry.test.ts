@@ -50,8 +50,10 @@ function makeCtx(to: string, accountId?: string, text = 'hello') {
 }
 
 // A RunningAccount whose hub is a fake OutboundHub (structurally narrower than
-// WsHub — the registry only ever passes the hub to createRaccoonOutbound,
-// which wants OutboundHub, so the cast is sound for these tests).
+// WsHub — the registry never hands the raw hub to the outbound adapter, so
+// the cast is sound for these tests). The entry's sendAgentEnvelope seam —
+// the path createRegistryOutbound actually delivers through — forwards to the
+// fake hub, so the suite's envelope assertions observe seam-routed sends.
 function makeEntry(hub: OutboundHub, channel: string): RunningAccount {
   return {
     hub: hub as unknown as RunningAccount['hub'],
@@ -59,6 +61,7 @@ function makeEntry(hub: OutboundHub, channel: string): RunningAccount {
     instanceUrl: 'ws://127.0.0.1:8790/',
     stop: async () => {},
     revoke: async () => {}, // not exercised by this suite (outbound delivery only)
+    sendAgentEnvelope: async (userId, env) => hub.sendToUser(userId, env),
   };
 }
 
@@ -119,6 +122,31 @@ describe('createRegistryOutbound (outbound↔hub seam)', () => {
       /no running raccoon account/i,
     );
     expect(hub.envelopes).toHaveLength(0);
+  });
+
+  it('delivers through the entry sendAgentEnvelope seam, never entry.hub.sendToUser (recording, push-aware path)', async () => {
+    // The old wiring passed entry.hub raw to createRaccoonOutbound, bypassing
+    // the channel's recording/push-aware seam entirely. Prove the send now
+    // routes through sendAgentEnvelope and the raw hub is untouched.
+    const seamSends: Array<{ userId: string; env: AnyEnvelope }> = [];
+    const entry: RunningAccount = {
+      hub: makeFakeHub() as unknown as RunningAccount['hub'],
+      channel: 'coordinator',
+      instanceUrl: 'ws://127.0.0.1:8790/',
+      stop: async () => {},
+      revoke: async () => {},
+      sendAgentEnvelope: async (userId, env) => { seamSends.push({ userId, env }); return true; },
+    };
+    running.set('default', entry);
+    const adapter = createRegistryOutbound(resolveRunning);
+
+    await adapter.sendText!(makeCtx('user:alice', 'default') as any);
+
+    expect(seamSends).toHaveLength(1);
+    expect(seamSends[0]!.userId).toBe('alice');
+    expect(seamSends[0]!.env.kind).toBe('msg');
+    // The raw hub saw NOTHING — the seam is the one blessed outbound path.
+    expect((entry.hub as unknown as { envelopes: AnyEnvelope[] }).envelopes).toHaveLength(0);
   });
 
   it('sendPayload also resolves the hub from the registry', async () => {

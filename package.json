@@ -7,9 +7,10 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit -p packages/protocol && tsc --noEmit -p packages/transport-ws && tsc --noEmit -p packages/transport-mqtt && tsc --noEmit -p packages/transport-cloudsignal && tsc --noEmit -p packages/bridge && tsc --noEmit -p packages/pairing && tsc --noEmit -p packages/push && tsc --noEmit -p examples/echo && tsc --noEmit -p adapters/connector-openclaw && tsc --noEmit -p packages/app",
-    "build": "npm run build -w @raccoon/protocol && npm run build -w @raccoon/transport-ws && npm run build -w @raccoon/pairing && npm run build -w @raccoon/push && npm run build -w @raccoon/bridge && npm run build -w @raccoon/connector-openclaw && npm run build -w @raccoon/app",
+    "typecheck": "tsc --noEmit -p packages/protocol && tsc --noEmit -p packages/transport-ws && tsc --noEmit -p packages/transport-mqtt && tsc --noEmit -p packages/transport-cloudsignal && tsc --noEmit -p packages/bridge && tsc --noEmit -p packages/pairing && tsc --noEmit -p packages/push && tsc --noEmit -p examples/echo && tsc --noEmit -p adapters/connector-openclaw && tsc --noEmit -p adapters/connector-nanoclaw && tsc --noEmit -p packages/app",
+    "build": "npm run build -w @raccoon/protocol && npm run build -w @raccoon/transport-ws && npm run build -w @raccoon/pairing && npm run build -w @raccoon/push && npm run build -w @raccoon/bridge && npm run build -w @raccoon/connector-openclaw && npm run build -w @raccoon/connector-nanoclaw && npm run build -w @raccoon/app",
     "build:app": "npm run build:standalone -w @raccoon/app",
+    "bundle:nanoclaw": "npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw",
     "gate:neutrality": "bash scripts/gate-neutrality.sh",
     "gate:deps": "node scripts/gate-deps.mjs",
     "release:pack": "bash scripts/release-pack.sh",

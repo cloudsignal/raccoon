@@ -14,6 +14,7 @@ import { browserPushEnv, enablePushFlow, unsubscribeInstanceOnly } from '../lib/
 import * as outbox from '../lib/outbox.js';
 import * as approvals from '../lib/approvals.js';
 import * as adopt from '../lib/adopt.js';
+import { uuid } from '../lib/uuid.js';
 import {
   hostIdentityKey, loadPairingsRaw, removePairingIfMatches, updatePairingGrant, updatePairingMeta, upsertPairing,
   type PairedSession, type Session,
@@ -193,7 +194,7 @@ const ChatContext = createContext<ChatApi | null>(null);
  */
 type ActiveSession = Session & { epoch: string };
 function withEpoch(s: Session): ActiveSession {
-  return { ...s, epoch: s.epoch ?? crypto.randomUUID() };
+  return { ...s, epoch: s.epoch ?? uuid() };
 }
 
 // #P1-F3 (adv-hardened): how long unpair() waits on a best-effort cleanup step
@@ -426,7 +427,7 @@ export function TransportProvider(props: TransportProviderProps) {
   // tab is actively sending" (only safe to requeue once its lease expires) —
   // see outbox.ts's releaseOwnedSending()/recoverExpiredSending().
   const tabIdRef = useRef<string | undefined>(undefined);
-  if (!tabIdRef.current) tabIdRef.current = crypto.randomUUID();
+  if (!tabIdRef.current) tabIdRef.current = uuid();
   // R5-3: cross-tab identity coordination. IndexedDB rows are shared
   // per-origin but every tab's in-memory pairing identities (validUserId,
   // runtimes) are its own — so a wipe/unpair in one tab left other
@@ -1796,7 +1797,7 @@ export function TransportProvider(props: TransportProviderProps) {
           transportConfig: g.payload.transportConfig,
           // #R7-3: fresh NON-SECRET epoch so a re-pair is distinguishable from
           // a prior pairing (the wipe broadcasts use it, never the token).
-          epoch: crypto.randomUUID(),
+          epoch: uuid(),
           pairingId,
           transportKind: kind,
           color: nextAccentColor(usedColors) || accentColor(pairingId),

@@ -3,7 +3,7 @@
 Read this before deploying Raccoon anywhere real. It states plainly what
 Raccoon protects, what it does not, and who can read message content.
 
-## Transport security — you must terminate TLS
+## Transport security - you must terminate TLS
 
 Raccoon's WebSocket hub speaks **plain `ws://` in development**. In production
 you **must** put it behind TLS (`wss://`), for example by terminating HTTPS at a
@@ -33,20 +33,23 @@ With TLS in front of the hub:
 - **Revocation.** Unpairing a user closes their live sockets and invalidates
   their session immediately; a subsequent reconnect with the old session is
   rejected.
-- **DM gating (OpenClaw connector).** The connector enforces an allowlist /
-  DM policy before an agent turn runs.
+- **DM gating (connectors).** The OpenClaw connector enforces an allowlist /
+  DM policy before an agent turn runs. The NanoClaw connector routes messages
+  from paired-but-unwired senders into NanoClaw's own owner-approval
+  registration flow instead of running an agent turn.
 
 ## What Raccoon does NOT provide
 
 - **This is not end-to-end encryption.** Raccoon is **not** WhatsApp/Signal-style
-  E2EE. "Encrypted in transit" means TLS between client and hub — the same
+  E2EE. "Encrypted in transit" means TLS between client and hub - the same
   guarantee as visiting an HTTPS website. It is **not** a guarantee that only
   the two human/agent endpoints can read the content.
-- **The server sees plaintext.** The hub, the bridge, and — critically — the
-  **agent framework (OpenClaw) and the model provider** all receive message
-  content as **plaintext**. Your prompts and the agent's replies are visible to:
+- **The server sees plaintext.** The hub, the bridge, and, critically, the
+  **agent framework (OpenClaw or NanoClaw) and the model provider** all
+  receive message content as **plaintext**. Your prompts and the agent's
+  replies are visible to:
   - the process running the hub/connector,
-  - the OpenClaw runtime handling the turn,
+  - the agent framework runtime (OpenClaw or NanoClaw) handling the turn,
   - the model provider you configured (e.g. your LLM vendor), under their data
     policies.
 
@@ -67,7 +70,7 @@ chat platforms use for media). What bounds this:
 
 - Uploading requires an authenticated session; anonymous clients cannot write.
 - The id space is unguessable in practice and there is no listing endpoint;
-  the filename segment is decorative — content resolves by id only.
+  the filename segment is decorative - content resolves by id only.
 - Deployments are TLS-only, so links do not transit in the clear.
 - Unreferenced uploads are swept automatically; an uploader can delete their
   own pending upload before a message references it.
@@ -75,8 +78,8 @@ chat platforms use for media). What bounds this:
 The consequence to understand: anyone a media link is forwarded to (or any
 system that logs full URLs) can fetch that file. Do not treat a media URL as
 a secret-keeping boundary stronger than the conversation it belongs to.
-Uploaded HTML/SVG and other active content is never served inline — it is
-forced to download as `application/octet-stream` — so a capability URL
+Uploaded HTML/SVG and other active content is never served inline - it is
+forced to download as `application/octet-stream` - so a capability URL
 cannot be used to run script on the hub origin.
 
 ## Deployment checklist

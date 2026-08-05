@@ -348,6 +348,7 @@ describe('raccoonPairDeps', () => {
         stop: vi.fn(async () => {}),
         // Mirrors createRaccoonChannel's real revoke (plugin.ts).
         revoke: (userId: string) => revokePairing(hub as any, userId),
+        sendAgentEnvelope: vi.fn(async () => true), // not exercised (pair/revoke only)
       };
     });
     await startAccount(makeCtx(account), { createChannel: factory });
@@ -398,6 +399,7 @@ describe('raccoonPairDeps', () => {
       start: vi.fn(async () => ({ port: 8790 })),
       stop: vi.fn(async () => {}),
       revoke: channelRevoke,
+      sendAgentEnvelope: vi.fn(async () => true), // not exercised (revoke only)
     }));
     await startAccount(makeCtx(makeAccount()), { createChannel: factory });
 
@@ -460,6 +462,7 @@ function runningEntry(hub: RunningAccount['hub']): RunningAccount {
     // against the hub. These fakes have no push store, so there's nothing
     // else to clear — the point of these tests is the hub-level revocation.
     revoke: (userId: string) => revokePairing(hub as unknown as Parameters<typeof revokePairing>[0], userId),
+    sendAgentEnvelope: async () => true, // not exercised by the pair/revoke handlers
   };
 }
 
@@ -573,6 +576,7 @@ describe('makeRaccoonRevokeHandler (POST /raccoon/revoke)', () => {
       instanceUrl: 'ws://127.0.0.1:8790/',
       stop: async () => {},
       revoke: channelRevoke,
+      sendAgentEnvelope: async () => true, // not exercised (revoke only)
     };
     const handler = makeRaccoonRevokeHandler(() => entry);
     const { res } = fakeRes();

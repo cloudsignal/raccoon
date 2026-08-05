@@ -4,6 +4,7 @@ import { servesThisApp } from '../lib/capabilities.js';
 import { resolveConvKey } from '../lib/conv-key.js';
 import { setUpdateHold } from '../lib/update-hold.js';
 import { deleteUpload, uploadFile, validateFiles } from '../lib/uploads.js';
+import { uuid } from '../lib/uuid.js';
 import { useChat } from '../transport/context.js';
 import { AttachmentChips, type PendingAttachment } from './attachment-chips.js';
 import { Icon, pushToast } from './ui/primitives.js';
@@ -125,7 +126,7 @@ export function Composer(props: { channel: string }) {
     // Controllers, preview URLs, and uploads are created exactly ONCE, here
     // in the handler — never during render, never inside a state updater.
     const chips: PendingAttachment[] = accepted.map((file) => ({
-      key: crypto.randomUUID(),
+      key: uuid(),
       file,
       previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
       controller: new AbortController(),

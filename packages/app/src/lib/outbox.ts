@@ -1,6 +1,7 @@
 import type { AnyEnvelope } from '@raccoon/protocol';
 import { promisifyRequest, withStore, withStores, withTransaction } from './idb.js';
 import { keyOf as approvalKeyOf } from './approvals.js';
+import { uuid } from './uuid.js';
 
 // 'processing' (#R6-2b): the server acked RECEIPT of this envelope but its
 // turn's terminal outcome (success/failure) has not arrived yet. Durable and
@@ -211,7 +212,7 @@ async function mutate(
  * touch a newer claim (#R5-5).
  */
 export async function markSending(id: string, ownerId: string, expectedScope: string): Promise<string | null> {
-  const claimToken = crypto.randomUUID();
+  const claimToken = uuid();
   const entry = await mutate(id, (entry) => (
     entry.status === 'pending' && entry.scope === expectedScope
       ? { ...entry, attempts: entry.attempts + 1, status: 'sending', ownerId, claimToken, leaseExpiresAt: Date.now() + SEND_LEASE_MS }

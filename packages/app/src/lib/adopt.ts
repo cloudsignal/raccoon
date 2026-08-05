@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ulid } from 'ulid';
 import { accentColor, nextAccentColor } from './conv-key.js';
 import { promisifyRequest, withStores } from './idb.js';
+import { uuid } from './uuid.js';
 import {
   PAIRINGS_KEY, hostIdentityKey, pairedSessionSchema, sessionSchema,
   type PairedSession,
@@ -45,7 +46,7 @@ export async function loadPairings(): Promise<PairedSession[]> {
     if (!legacy.success) return []; // fresh install — nothing stored at all
 
     const pairingId = ulid();
-    const epoch = legacy.data.epoch ?? crypto.randomUUID();
+    const epoch = legacy.data.epoch ?? uuid();
     const adopted: PairedSession = {
       ...legacy.data, epoch, pairingId, transportKind: 'ws',
       // First-unused-hue policy: the adopted session is pairing #1, so it gets

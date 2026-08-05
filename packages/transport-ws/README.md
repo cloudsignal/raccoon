@@ -1,7 +1,7 @@
 # @raccoon/transport-ws
 
 [Raccoon](https://github.com/cloudsignal/raccoon)'s built-in WebSocket
-transport — broker-free: no external message broker or cloud service, just a
+transport - broker-free: no external message broker or cloud service, just a
 Node server. One package carries both sides:
 
 - **`WsHub`** (server): WebSocket hub + plain-HTTP static serving for the
@@ -13,7 +13,7 @@ Node server. One package carries both sides:
   interface the Raccoon app consumes.
 
 ```bash
-# repo-first (not yet on the public npm registry) — install the packed tarball:
+# repo-first (not yet on the public npm registry) - install the packed tarball:
 #   git clone https://github.com/cloudsignal/raccoon && cd raccoon && npm ci && npm run release:pack
 npm i /path/to/raccoon/release-artifacts/raccoon-transport-ws-0.1.0.tgz
 ```
@@ -40,7 +40,7 @@ await client.connect();
 Sessions persist across restarts with a pluggable `CredentialStore`:
 `MemoryCredentialStore` (default) or `FileCredentialStore` (atomic writes,
 single-writer lock). Production requires TLS termination in front of the hub
-(`wss://`) — see the repo's
+(`wss://`) - see the repo's
 [security notes](https://github.com/cloudsignal/raccoon/blob/main/docs/security.md)
 and [hosting examples](https://github.com/cloudsignal/raccoon/tree/main/examples/hosting).
 
