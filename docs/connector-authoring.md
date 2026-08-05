@@ -2,8 +2,8 @@
 
 A **connector** joins an agent framework to Raccoon. It implements a small set
 of public ports and never reaches into another package's `src/`. This is how
-the first-party OpenClaw connector is built, and how a second connector — or a
-managed transport like a hosted identity/push service — plugs in **without any
+the first-party OpenClaw connector is built, and how a second connector - or a
+managed transport like a hosted identity/push service - plugs in **without any
 change to the core packages**.
 
 ## Package boundaries
@@ -37,7 +37,7 @@ change to the core packages**.
 Rules the boundary enforces (checked in CI by `scripts/gate-neutrality.sh`):
 
 - **Core never names a vendor.** No downstream-vendor identifier appears
-  anywhere in core runtime source, comments included — CI enforces a denylist
+  anywhere in core runtime source, comments included - CI enforces a denylist
   (`scripts/gate-neutrality.sh`). Core builds, tests, and releases with no
   vendor package installed.
 - **No package imports another via `/src`.** Consumers import package roots
@@ -54,7 +54,7 @@ Rules the boundary enforces (checked in CI by `scripts/gate-neutrality.sh`):
 
 Everything a connector needs is exported from a package root.
 
-### `AgentRunner` — the framework seam (`@raccoon/bridge`)
+### `AgentRunner` - the framework seam (`@raccoon/bridge`)
 
 The one interface every connector implements:
 
@@ -98,7 +98,7 @@ interface MessageStore {
 
 > **Honest limitation:** the bridge's dedup is **process-local**. It guarantees
 > at-most-once turn execution within one running process. It does **not** claim
-> cross-restart exactly-once — a redelivery after a restart with a fresh
+> cross-restart exactly-once - a redelivery after a restart with a fresh
 > in-memory store can re-run a turn. Supply a durable `MessageStore` (and, if
 > you need it, a durable dedup layer) to harden this. v0.1 does not ship one.
 
@@ -107,7 +107,7 @@ interface MessageStore {
 `Transport` (protocol) is the client-side contract the PWA speaks. `WsHub` is
 the zero-dependency server; `WsClientTransport` is its client. A connector that
 uses a different wire (a broker, a managed service) implements `Transport` and
-a compatible hub — the bridge and app don't care which.
+a compatible hub - the bridge and app don't care which.
 
 ### `CredentialStore` (`@raccoon/transport-ws`)
 
@@ -131,7 +131,7 @@ pairing flow via `makeTransport`. The reusable provider/UI surface is separate
 from the standalone WebSocket composition, so an embedded host does not inherit
 server-only or unconditional-WS exports.
 
-## Worked example — the OpenClaw connector
+## Worked example - the OpenClaw connector
 
 `@raccoon/connector-openclaw` implements exactly the ports above:
 
@@ -176,7 +176,7 @@ export function createMyChannel(opts: { port: number }) {
 
 The same shape is how a **managed transport** (a hosted identity + ACL + push +
 NAT-relay service) plugs in:
-it implements the same public ports — `Transport`, `OutboundHub`, a durable
-`MessageStore` and `CredentialStore`, and (optionally) a push registrar — from
+it implements the same public ports - `Transport`, `OutboundHub`, a durable
+`MessageStore` and `CredentialStore`, and (optionally) a push registrar - from
 its own repository. Core exports the ports; the managed build implements them.
 Nothing about that build lives in, or is referenced by, the released core.

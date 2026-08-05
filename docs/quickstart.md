@@ -1,7 +1,7 @@
 # Raccoon quickstart (5 minutes)
 
 Stand up a self-hosted chat backend for an AI agent: an installable PWA, QR
-pairing, and a WebSocket transport — with **zero external services**. This
+pairing, and a WebSocket transport - with **zero external services**. This
 walks the two paths: bring your own agent (framework-neutral), or plug in an
 existing OpenClaw agent.
 
@@ -10,7 +10,7 @@ service or message broker is required (or referenced) anywhere in this guide.
 
 ## Install
 
-v0.1 is distributed repo-first — the packages are not yet on the public npm
+v0.1 is distributed repo-first - the packages are not yet on the public npm
 registry, and nothing here needs a registry account or token. Pack the gated
 tarballs once, then install them in your own project (installed together they
 resolve each other):
@@ -24,7 +24,7 @@ npm i /path/to/raccoon/release-artifacts/raccoon-{protocol,transport-ws,bridge,p
 
 Node ≥ 20.19 (or ≥ 22.12). All packages are ESM with emitted types.
 
-## Path A — bring your own agent (framework-neutral)
+## Path A - bring your own agent (framework-neutral)
 
 The only thing you implement is an **`AgentRunner`**: run one user turn, yield
 the reply as text deltas. Everything else (typing indicators, history, dedup,
@@ -59,7 +59,7 @@ console.log(token, payload); // or paste the payload manually
 
 That is a complete, working backend. Point the PWA (below) at the URL, pair,
 and chat. A `ws://127.0.0.1` instance URL only pairs a browser **on the same
-machine** — to pair a real phone you need HTTPS/WSS on a reachable host; set
+machine** - to pair a real phone you need HTTPS/WSS on a reachable host; set
 `instanceUrl` to your public `wss://` URL and see
 [`examples/hosting/`](../examples/hosting/) for Railway / Cloudflare / Vercel
 walkthroughs.
@@ -99,21 +99,21 @@ per-kind factories with the `transports` prop:
 
 The pairing QR's `transport` field selects the factory at scan time; `ws` is
 built in. A stored pairing whose kind has no registered factory stays listed
-but offline — its history remains readable and its sends queue until a build
+but offline - its history remains readable and its sends queue until a build
 that registers the kind loads.
 
 For the standalone, self-serving build (the hub serves the PWA on its own port),
 either install `@raccoon/app` and serve its prebuilt `dist-standalone/`
-(published in the package — no clone needed), or, from a monorepo clone, run
+(published in the package - no clone needed), or, from a monorepo clone, run
 `npm run build:app` and serve the generated `packages/app/dist-standalone/`. Pass
 that path as `staticDir` to the hub. See [`packages/app/README.md`](../packages/app/README.md).
 
 ### Pair a second platform
 
-The app holds any number of pairings at once — two instances of your own
+The app holds any number of pairings at once - two instances of your own
 agent, or your agent plus a second platform entirely. Conversations from
 every pairing appear in one list, grouped into per-platform sections by
-default (a flat merged layout is available — see the config section below),
+default (a flat merged layout is available - see the config section below),
 and each pairing keeps its own connection status (the chat header shows
 which instance a conversation belongs to).
 
@@ -121,16 +121,16 @@ Manage pairings in **Settings → Platforms**: each one is listed with its
 live status and can be renamed, given its own accent color and marker,
 rescanned, or unpaired, and **Add platform** starts the same QR/paste flow
 used for the first pairing. A successful scan lands on a confirmation
-screen that says what actually happened — a **new** pairing, or an existing
+screen that says what actually happened - a **new** pairing, or an existing
 one **reconnected** (re-scanning a platform you already have refreshes its
 credentials in place instead of duplicating it); failures get a typed
 explanation with a retry. Installs that embed the app with a host-managed
-transport hide "Add platform" — the host application owns identity there.
+transport hide "Add platform" - the host application owns identity there.
 
 ### Tune the multi-platform surface (raccoon.config.json)
 
 The app's build-time config (`raccoon.config.json` in `@raccoon/app`) has
-four optional fields for multi-platform installs. All of them are optional —
+four optional fields for multi-platform installs. All of them are optional -
 the defaults are what most installs want:
 
 ```json
@@ -148,38 +148,38 @@ the defaults are what most installs want:
 }
 ```
 
-- `listLayout` — `"grouped"` (default) renders per-platform sections in the
+- `listLayout` - `"grouped"` (default) renders per-platform sections in the
   conversation list; `"merged"` renders one flat, recency-sorted list with a
   per-platform accent dot on each avatar.
-- `mergedSuffix` — when a merged-list row also carries the platform name
+- `mergedSuffix` - when a merged-list row also carries the platform name
   after the agent label: `"collision"` (default) only when two platforms
   expose a same-named channel, `"always"` on every row, `"badge"` never (the
   accent dot alone distinguishes platforms). Ignored in grouped layout.
-- `platformBranding` — per-instance glyph overrides, keyed by the instance
+- `platformBranding` - per-instance glyph overrides, keyed by the instance
   name from the pairing grant. `glyph` is a built-in marker id (`bot`,
   `server`, `home`, `sparkle`) or an inline SVG path d-string; `label` is an
   optional display name. A branded instance hides the user-facing marker
   picker on its detail screen.
-- `hostManaged` — copy overrides for installs embedding the app with a
+- `hostManaged` - copy overrides for installs embedding the app with a
   host-managed transport, where the host owns identity: the banner shown on
   the Platforms screen, the note explaining why rename is disabled, and the
   label on the logout action. Unset fields fall back to the neutral defaults
   shown above.
 
-Like the rest of the config, these are baked at build time — rebuild the app
+Like the rest of the config, these are baked at build time - rebuild the app
 after editing.
 
 ### Grant changes reach paired devices automatically
 
-When your hub's channel grant changes — you add an agent, retire one, or
-start advertising a web-push key — paired devices pick the change up without
+When your hub's channel grant changes - you add an agent, retire one, or
+start advertising a web-push key - paired devices pick the change up without
 re-pairing. The transport's session-resume acknowledgment re-delivers the
 same grant fields a pairing delivers (instance name, channels, optional
 `vapidPublicKey`), and the app applies them to the stored pairing on every
 successful reconnect.
 
 For hub implementers: hubs upgrading `@raccoon/transport-ws` automatically
-advertise channel changes on reconnect — the extended resume acknowledgment
+advertise channel changes on reconnect - the extended resume acknowledgment
 is built into the hub, with no code changes on your side. A device talking
 to an older hub (bare `{ ok, userId }` resume reply) simply keeps its stored
 grant until it pairs again.
@@ -188,13 +188,13 @@ On the device this produces the **new-agent moment**: a channel granted
 since the last connection surfaces at the top of the conversation list with
 a NEW badge (and a one-line notice) until it is first opened; channels
 removed from the grant leave the list. Users can also force a refresh
-without waiting for a reconnect — **Rescan** on a platform's detail screen
+without waiting for a reconnect - **Rescan** on a platform's detail screen
 bounces that platform's connection and re-applies the current grant on the
 spot. Rescan is refused while the platform is offline, and is not offered on
 host-managed installs (the host owns the connection lifecycle).
 
 Known v1 limitation: attachments are single-instance. The app has one upload
-origin — the instance that serves it — and uploads authenticate with the
+origin - the instance that serves it - and uploads authenticate with the
 active conversation's pairing token, so sending files only works in
 conversations belonging to that pairing. In a secondary pairing's
 conversations uploads fail, and inbound attachments that use relative
@@ -222,24 +222,24 @@ The app titles the notification "Atlas · alpha", keeps a per-pairing
 collapse key (so two instances exposing same-named channels do not replace
 each other's notifications), and routes the tap to the matching
 conversation. `userId` is required inside `instance` for unambiguous
-routing — two pairings may point at the same instance URL as different
+routing - two pairings may point at the same instance URL as different
 users. Payloads that omit `instance` degrade gracefully: un-suffixed title,
 and a tap opens the app's conversation list.
 
 Echo the pairing QR's `instanceUrl` **verbatim** in `instance.instanceUrl`:
 the client matches it byte-for-byte against the stored pairing when routing
-a tap, and any difference — even an added trailing slash — silently falls
+a tap, and any difference (even an added trailing slash) silently falls
 back to opening the merged conversation list instead of the conversation.
 
 Note that `instance` is self-declared by the pushing instance: it is a
 labeling and routing hint, not an authenticated identity, so an instance can
-mislabel its notifications — do not treat notification titles as trust
+mislabel its notifications - do not treat notification titles as trust
 signals.
 
-## Path B — an existing OpenClaw agent
+## Path B - an existing OpenClaw agent
 
 If your agent runs on [OpenClaw](https://openclaw.ai), install the first-party
-connector as an OpenClaw plugin — no `AgentRunner` to write. v0.1 installs from
+connector as an OpenClaw plugin - no `AgentRunner` to write. v0.1 installs from
 a clone:
 
 ```bash
@@ -266,7 +266,7 @@ for configuration and the setup wizard, and
 ### Approve agent commands from your phone
 
 Two switches make exec-approval cards live. `openclaw raccoon setup` flips the
-first one for you (`approvals.exec` in `openclaw.json` — it forwards pending
+first one for you (`approvals.exec` in `openclaw.json` - it forwards pending
 approvals to the conversation that started the turn); if you configured the
 channel by hand, add:
 
@@ -300,7 +300,7 @@ specific senders with OpenClaw's own `commands.allowFrom.raccoon` allowlist.
 
 The composer's paperclip (plus paste and desktop drag-drop) attaches up to 4
 files of 25MB each per message. Files upload to your hub and are served back
-as unguessable capability URLs — see the media section of
+as unguessable capability URLs - see the media section of
 [security.md](security.md) for exactly what that model does and does not
 protect. On OpenClaw, images you send are fetched by the gateway's media
 pipeline, so the agent genuinely sees them.
@@ -317,17 +317,17 @@ npm run demo           # echo hub on http://127.0.0.1:8790/
 # setup screen, send "/draft" to see an approval card
 ```
 
-The demo advertises a `ws://127.0.0.1` URL, so a phone can't reach it — it's a
+The demo advertises a `ws://127.0.0.1` URL, so a phone can't reach it - it's a
 same-machine demo. To pair a real phone, deploy behind HTTPS/WSS:
 [`examples/hosting/`](../examples/hosting/) has Railway, Cloudflare, and
 Vercel walkthroughs.
 
 ## Next
 
-- [`examples/hosting/`](../examples/hosting/) — deploy with HTTPS/WSS on
+- [`examples/hosting/`](../examples/hosting/) - deploy with HTTPS/WSS on
   Railway, Cloudflare (Tunnel/Pages), or Vercel, and pair a real phone.
-- [connector-authoring.md](connector-authoring.md) — the public ports a
+- [connector-authoring.md](connector-authoring.md) - the public ports a
   connector implements, the package-boundary diagram, and how a second
   connector (or a managed transport) plugs in without touching core.
-- [security.md](security.md) — what Raccoon does and does **not** protect
+- [security.md](security.md) - what Raccoon does and does **not** protect
   (TLS/WSS, transit encryption, and why this is not end-to-end encryption).

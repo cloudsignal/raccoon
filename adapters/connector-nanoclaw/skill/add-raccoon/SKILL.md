@@ -12,8 +12,8 @@ self-contained Raccoon adapter bundle (WebSocket hub, device pairing, and the
 Raccoon PWA) into `src/channels/`, registers it through NanoClaw's channel
 registry, appends the required environment variables to `.env`, wires the
 owner's conversations to an agent group, and pairs the first phone. Once
-installed, paired phones chat with NanoClaw agents through the Raccoon PWA —
-a browser-installable messenger served by the channel itself — with typing
+installed, paired phones chat with NanoClaw agents through the Raccoon PWA -
+a browser-installable messenger served by the channel itself - with typing
 indicators, approval cards for agent questions, and media in both directions.
 
 ## Prerequisites
@@ -29,12 +29,12 @@ indicators, approval cards for agent questions, and media in both directions.
 
   (`bundle:nanoclaw` is the root shorthand for
   `npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw`.
-  These artifacts are not part of release-pack tarballs — they are built
+  These artifacts are not part of release-pack tarballs - they are built
   from a source checkout.)
 
 - A running NanoClaw checkout (cloned, dependencies installed, at least one
-  agent configured, and an owner approval channel working — for example their
-  CLI channel — so registration approvals have somewhere to land).
+  agent configured, and an owner approval channel working - for example their
+  CLI channel - so registration approvals have somewhere to land).
 
 An opt-in end-to-end rehearsal of these file steps against a throwaway
 NanoClaw checkout exists at
@@ -55,7 +55,7 @@ cp -r <raccoon-checkout>/adapters/connector-nanoclaw/skill/add-raccoon <nanoclaw
 After the copy, `/add-raccoon` is invocable in a Claude Code session inside
 the NanoClaw checkout, matching their `/add-<channel>` convention.
 Alternatively, a session can execute this SKILL.md directly from the raccoon
-checkout path without copying — the copy just makes it discoverable like
+checkout path without copying - the copy just makes it discoverable like
 their other channel skills.
 
 For the steps below, set:
@@ -77,7 +77,7 @@ cp -r "$RACCOON_SRC/dist/raccoon-app"       src/channels/raccoon-app
 cp "$RACCOON_SRC/templates/raccoon.channel.ts" src/channels/raccoon.ts
 ```
 
-The `.d.mts` declaration must sit adjacent to the bundle — the wrapper's
+The `.d.mts` declaration must sit adjacent to the bundle - the wrapper's
 install-time type check resolves the bundle's types from it. `raccoon-app/`
 is the built PWA the channel serves; without it there is nothing for a phone
 to open.
@@ -85,14 +85,14 @@ to open.
 ### 2. Wire the asset copy into the fork's build
 
 NanoClaw's production flow is `npm run build` (bare `tsc`, outDir `dist/`)
-then `node dist/index.js`. `tsc` compiles `.ts` files only — it does NOT copy
+then `node dist/index.js`. `tsc` compiles `.ts` files only - it does NOT copy
 `raccoon.bundle.mjs`, `raccoon.bundle.d.mts`, or the `raccoon-app/` static
 directory into `dist/`. Without this step the compiled
 `dist/channels/raccoon.js` fails at startup with `ERR_MODULE_NOT_FOUND` on
 `./raccoon.bundle.mjs` (dev mode via `tsx src/index.ts` is unaffected, which
 makes the breakage easy to miss).
 
-Add a `postbuild` script to the fork's `package.json` — npm runs `postbuild`
+Add a `postbuild` script to the fork's `package.json` - npm runs `postbuild`
 automatically after every `npm run build`:
 
 ```json
@@ -102,7 +102,7 @@ automatically after every `npm run build`:
 The `rm -rf` before the directory copy is what makes rebuilds safe: their
 build never cleans `dist/`, and `cp -R` into an existing destination nests
 the source inside it (`dist/channels/raccoon-app/raccoon-app/`) while the
-served top-level files stay frozen at the first copy — a rebuild would
+served top-level files stay frozen at the first copy - a rebuild would
 silently serve a stale PWA.
 
 VERIFY first whether the fork's `package.json` already defines `postbuild`
@@ -112,7 +112,7 @@ existing command with `&&` instead of replacing it.
 ### 3. Register the channel in the barrel
 
 Append to `src/channels/index.ts` (follow the barrel's existing comment
-convention — the other channels each have a one-line import with a comment):
+convention - the other channels each have a one-line import with a comment):
 
 ```ts
 import './raccoon.js';
@@ -123,7 +123,7 @@ import './raccoon.js';
 Run the fork's type check (typically `npx tsc --noEmit`). The explicit
 `ChannelRegistration` annotation in `src/channels/raccoon.ts` is the
 install-time structural check: the bundle's declared shapes must remain
-assignable to THIS fork's adapter contract — `registerChannelAdapter` option
+assignable to THIS fork's adapter contract - `registerChannelAdapter` option
 names and the `ChannelDefaults` shape (`dm` / `group` / `mentions`). If
 NanoClaw's interface has moved, this file fails to compile; adjust the thin
 wrapper in `src/channels/raccoon.ts` to match their current names (do not
@@ -149,7 +149,7 @@ RACCOON_ADMIN_SECRET=<random-secret>
 # RACCOON_HOST=0.0.0.0
 # Admin API port (optional; default RACCOON_PORT + 1)
 # RACCOON_ADMIN_PORT=4821
-# Admin API bind host (optional; default 127.0.0.1 — loopback only; never inherits RACCOON_HOST)
+# Admin API bind host (optional; default 127.0.0.1 - loopback only; never inherits RACCOON_HOST)
 # RACCOON_ADMIN_HOST=127.0.0.1
 # Instance name shown to paired devices (optional; default nanoclaw)
 # RACCOON_INSTANCE=nanoclaw
@@ -166,12 +166,12 @@ RACCOON_ADMIN_SECRET=<random-secret>
 `RACCOON_PUBLIC_ORIGIN` must be reachable FROM INSIDE the agent containers,
 not just from the host: on Docker Desktop or Apple Container use
 `http://host.docker.internal:<port>`; on Linux use the host's LAN IP.
-Getting this wrong does not break chat — it breaks agents fetching
+Getting this wrong does not break chat - it breaks agents fetching
 phone-uploaded media.
 
 If any of the five required vars is missing, the factory returns null and
 NanoClaw skips the channel (their graceful-skip convention). A present but
-malformed value throws at startup instead — misconfiguration is loud.
+malformed value throws at startup instead - misconfiguration is loud.
 
 ### 6. Rebuild, verify the layout, and restart the host
 
@@ -183,11 +183,11 @@ npm run build
 ls dist/channels/raccoon.bundle.mjs dist/channels/raccoon-app/index.html
 ```
 
-Both paths must exist — if either is missing, revisit step 2 (the
+Both paths must exist - if either is missing, revisit step 2 (the
 `postbuild` wiring did not run or did not copy).
 
 Restart the NanoClaw host process. Confirm from the logs that the `raccoon`
-channel registered and its hub is listening on `RACCOON_PORT` — or, if it
+channel registered and its hub is listening on `RACCOON_PORT` - or, if it
 was skipped, which required variable was missing.
 
 ### 7. Pair the first device
@@ -202,13 +202,13 @@ curl -X POST \
 
 The response contains `token`, `payload`, and `qr`. The QR encodes a raw
 JSON pairing payload (the instance URL plus the one-time token), NOT an http
-link — a phone camera cannot "open" it. The flow is app-first:
+link - a phone camera cannot "open" it. The flow is app-first:
 
 1. On the phone, open the served PWA in the browser:
    `http(s)://<host>:<RACCOON_PORT>/`. (Phones other than localhost need
-   HTTPS — see the deployment note in the connector README.)
+   HTTPS - see the deployment note in the connector README.)
 2. In the app's pairing screen, either scan the QR (`qr` is a
-   terminal-renderable string — print it, or render `payload` with any QR
+   terminal-renderable string - print it, or render `payload` with any QR
    tool) or tap "Enter code manually" and paste the `payload` string.
 
 The app then connects to `RACCOON_INSTANCE_URL` with the token and stores
@@ -216,9 +216,9 @@ the granted session.
 
 ### 8. Wire the owner's conversations
 
-Adapters never write NanoClaw's database — use NanoClaw's own surfaces.
+Adapters never write NanoClaw's database - use NanoClaw's own surfaces.
 
-**Deterministic primary path** — for each `channel=agent-group` pair in
+**Deterministic primary path** - for each `channel=agent-group` pair in
 `RACCOON_CHANNELS`, run NanoClaw's wiring surface to create the
 `messaging_group` bound to that agent group, with:
 
@@ -228,12 +228,12 @@ Adapters never write NanoClaw's database — use NanoClaw's own surfaces.
   `nanoclaw`)
 
 Locate the current wiring command by reading the fork's `src/cli/` (`ncl`)
-and `scripts/init-first-agent.ts` — their trunk moves, so this skill
+and `scripts/init-first-agent.ts` - their trunk moves, so this skill
 instructs finding it rather than hardcoding a stale invocation. Once found,
 record the exact invocation you used in your install notes so future
 channel additions can pin it.
 
-**Fallback path** — when no wiring CLI fits the fork you are on: send a
+**Fallback path** - when no wiring CLI fits the fork you are on: send a
 first message from the paired phone and approve the owner registration card
 NanoClaw raises. The adapter flags DMs as mentions (`mentions: 'dm-only'`),
 so the router escalates unwired conversations to the owner instead of
@@ -256,4 +256,4 @@ paired identity has owner privileges.
 5. If you copied the skill: remove `.claude/skills/add-raccoon/`.
 
 Pairing sessions and media live under `RACCOON_DATA_DIR` (default
-`./data/raccoon`) — delete that directory too if you want a clean slate.
+`./data/raccoon`) - delete that directory too if you want a clean slate.

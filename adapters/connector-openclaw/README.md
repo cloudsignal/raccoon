@@ -5,7 +5,7 @@ Raccoon WebSocket hub (serving the installable Raccoon PWA) inside the OpenClaw
 gateway process and bridges it to an agent, so a user can chat with your
 OpenClaw agent from the Raccoon app, paired by QR, DM-gated by an allowlist.
 
-`openclaw` is a **peer dependency** — install it yourself. See
+`openclaw` is a **peer dependency** - install it yourself. See
 [../../docs/compatibility.md](../../docs/compatibility.md) for the supported
 OpenClaw version matrix, and
 [../../docs/connector-authoring.md](../../docs/connector-authoring.md) for the
@@ -198,7 +198,7 @@ envelopes, one per chunk, order preserved:
 
 The plugin registers an `approvalCapability` whose `render.exec` hooks turn
 OpenClaw exec-approval requests into compact card payloads: title, the FULL
-pending command (never truncated — an approval surface that hides part of what
+pending command (never truncated - an approval surface that hides part of what
 it approves is a security bug), an agent/host/expiry context line, and
 Allow Once / Allow Always / Deny buttons carrying the real `/approve <id>
 <decision>` command. Tapping a button resolves the approval and the blocked
@@ -209,18 +209,18 @@ Requirements, both handled by `openclaw raccoon setup`:
 - `approvals.exec.enabled` in `openclaw.json` (mode `session` routes the
   request back to the conversation that started the turn). Without it,
   OpenClaw never forwards exec approvals to ANY chat channel.
-- An exec-approval policy that actually prompts — `openclaw approvals set`
+- An exec-approval policy that actually prompts - `openclaw approvals set`
   with `ask: on-miss` (or `always`). With `ask: off` (the default) OpenClaw
   never requests approval; the configured `security` policy alone decides
   whether the command runs or is denied.
 
 One operational note: tell your agent how to behave at the gate. Smaller
 models that receive "Approval required" as a tool result may RETRY the
-command — every retry raises a new approval and a new card in the chat (and
+command - every retry raises a new approval and a new card in the chat (and
 some will even try to send `/approve` themselves). Add a short section to the
 agent's workspace instructions (e.g. `TOOLS.md`): when exec returns "Approval
 required", stop, do not re-run the command, never self-approve, tell the user
-it is waiting for them, and end the turn — the follow-up delivers the result
+it is waiting for them, and end the turn - the follow-up delivers the result
 after the tap. Prefer `security: allowlist` + `ask: on-miss` over
 `ask: always`: Allow Always is then available on the card and repeat commands
 stop prompting.

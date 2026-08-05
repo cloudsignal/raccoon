@@ -1,7 +1,7 @@
 # @raccoon/connector-nanoclaw
 
-NanoClaw channel connector for Raccoon: it embeds the raccoon endpoint —
-WebSocket hub, device pairing, and the Raccoon PWA — inside the NanoClaw host
+NanoClaw channel connector for Raccoon: it embeds the raccoon endpoint -
+WebSocket hub, device pairing, and the Raccoon PWA - inside the NanoClaw host
 process as a `ChannelAdapter`, shipped as a single self-contained bundle plus
 an `add-raccoon` install skill. Paired phones get a browser-installable
 messenger that talks to NanoClaw agents: chat turns, typing indicators,
@@ -16,7 +16,7 @@ The fork-droppable artifacts (`dist/raccoon.bundle.mjs`,
 `dist/raccoon.bundle.d.mts`, `dist/raccoon-app/`) are built from a source
 checkout of this repo: `npm run bundle:nanoclaw` at the repo root (shorthand
 for `npm run build:app && npm run bundle -w @raccoon/connector-nanoclaw`).
-They are NOT part of the release-pack tarballs — the release pipeline packs
+They are NOT part of the release-pack tarballs - the release pipeline packs
 the published npm set only and never runs the bundle script.
 
 ## Architecture
@@ -28,7 +28,7 @@ the published npm set only and never runs the bundle script.
 - **Park with timeout.** A reply arriving within `RACCOON_TURN_TIMEOUT_MS`
   settles the parked turn and returns as the bridge's synchronous reply to
   the phone.
-- **Async fallback.** A park that times out yields nothing — and the late
+- **Async fallback.** A park that times out yields nothing - and the late
   `deliver()` then flows out through `sendAgentEnvelope`, the
   history-recording, push-aware outbound seam. Nothing is dropped; slow
   agents just answer asynchronously.
@@ -39,12 +39,12 @@ the published npm set only and never runs the bundle script.
   becomes an approval-card envelope; the option labels shown on the phone are
   remembered against their underlying values, and a tap resolves the label
   back to the VALUE before it reaches the agent. If the mapping is lost
-  (restart, eviction), the connector fails closed — it never guesses a value
-  — and replies with a visible notice asking the user to have the agent
+  (restart, eviction), the connector fails closed (it never guesses a value)
+  and replies with a visible notice asking the user to have the agent
   re-send the question.
 - **Offline buffering.** Approval cards for a disconnected phone are buffered
   (capped per user) and replayed when the next inbound envelope proves the
-  socket is live again — push fallback would degrade a card to notification
+  socket is live again - push fallback would degrade a card to notification
   text, so the raw envelope is replayed instead. Plain text sent while
   offline lands in history and may still notify via web push.
 
@@ -56,20 +56,20 @@ but malformed value throws at startup.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `RACCOON_PORT` | yes | — | Port for the WebSocket hub + PWA. `0` binds an ephemeral port (tests, containers behind port maps). |
-| `RACCOON_INSTANCE_URL` | yes | — | Public `ws://` / `wss://` URL phones dial; encoded into the pairing QR. |
-| `RACCOON_PUBLIC_ORIGIN` | yes | — | HTTP origin at which agent containers fetch uploaded media (trailing slashes stripped). Must be reachable from inside the containers, not just the host. |
-| `RACCOON_CHANNELS` | yes | — | Comma-separated `channel=agent-group` pairs. The agent-group side is install-time wiring input only; the runtime adapter uses just the channel names. |
-| `RACCOON_ADMIN_SECRET` | yes | — | Bearer secret for the admin pair/revoke API. |
+| `RACCOON_PORT` | yes | - | Port for the WebSocket hub + PWA. `0` binds an ephemeral port (tests, containers behind port maps). |
+| `RACCOON_INSTANCE_URL` | yes | - | Public `ws://` / `wss://` URL phones dial; encoded into the pairing QR. |
+| `RACCOON_PUBLIC_ORIGIN` | yes | - | HTTP origin at which agent containers fetch uploaded media (trailing slashes stripped). Must be reachable from inside the containers, not just the host. |
+| `RACCOON_CHANNELS` | yes | - | Comma-separated `channel=agent-group` pairs. The agent-group side is install-time wiring input only; the runtime adapter uses just the channel names. |
+| `RACCOON_ADMIN_SECRET` | yes | - | Bearer secret for the admin pair/revoke API. |
 | `RACCOON_HOST` | no | hub default bind | Bind host for the hub port. |
 | `RACCOON_ADMIN_PORT` | no | `RACCOON_PORT + 1` | Port for the admin pair/revoke listener. |
-| `RACCOON_ADMIN_HOST` | no | `127.0.0.1` | Bind host for the admin listener. Loopback by default, and it **never inherits `RACCOON_HOST`** — exposing the hub to `0.0.0.0` must not silently expose pair/revoke. |
+| `RACCOON_ADMIN_HOST` | no | `127.0.0.1` | Bind host for the admin listener. Loopback by default, and it **never inherits `RACCOON_HOST`** - exposing the hub to `0.0.0.0` must not silently expose pair/revoke. |
 | `RACCOON_INSTANCE` | no | `nanoclaw` | Instance name shown to paired devices and used as the `instance` field on the adapter's `messaging_groups` wiring. |
 | `RACCOON_DATA_DIR` | no | `./data/raccoon` | Directory for the pairing session store (`sessions.json`) and uploaded media blobs (`media/`). |
 | `RACCOON_TURN_TIMEOUT_MS` | no | `90000` | Park timeout for a chat turn, in milliseconds. Slower replies still arrive via the async fallback. |
-| `VAPID_PUBLIC_KEY` | no | — | Web-push key for offline notification. All three VAPID vars must be set together or push stays off. |
-| `VAPID_PRIVATE_KEY` | no | — | Web-push private key. |
-| `VAPID_SUBJECT` | no | — | Web-push subject (`mailto:` or URL). |
+| `VAPID_PUBLIC_KEY` | no | - | Web-push key for offline notification. All three VAPID vars must be set together or push stays off. |
+| `VAPID_PRIVATE_KEY` | no | - | Web-push private key. |
+| `VAPID_SUBJECT` | no | - | Web-push subject (`mailto:` or URL). |
 
 ## Admin API: pair and revoke
 
@@ -77,11 +77,11 @@ The admin listener is a separate loopback-bound HTTP server (the hub exposes
 no custom-route hook). Both routes are `POST`, authenticated with
 `Authorization: Bearer $RACCOON_ADMIN_SECRET` (compared constant-time).
 
-Pair a device — returns `{ token, payload, qr }`. The QR encodes a raw JSON
+Pair a device - returns `{ token, payload, qr }`. The QR encodes a raw JSON
 pairing payload (instance URL + one-time token), not an http link, so a
 phone camera cannot open it directly. Pairing is app-first: open the served
 PWA in the phone's browser (`http(s)://<host>:<RACCOON_PORT>/`), then use
-the app's own pairing screen — scan the QR from within the app, or paste the
+the app's own pairing screen - scan the QR from within the app, or paste the
 `payload` string via "Enter code manually":
 
 ```bash
@@ -92,7 +92,7 @@ curl -X POST \
   http://127.0.0.1:4821/pair
 ```
 
-Revoke a user — clears push subscriptions, then revokes the pairing:
+Revoke a user - clears push subscriptions, then revokes the pairing:
 
 ```bash
 curl -X POST \
@@ -115,14 +115,14 @@ for quick LAN tests, but installability and push stay off.
 
 The adapter never writes NanoClaw's database. It declares
 `mentions: 'dm-only'` in its channel defaults and stamps every inbound DM
-with `isMention: true` — raccoon chats are DMs, and NanoClaw's router only
+with `isMention: true` - raccoon chats are DMs, and NanoClaw's router only
 runs its auto-create/registration flow for unwired conversations on
 mentions. The effect: a message from a paired-but-unwired user is escalated
 to the owner as a registration-approval request through NanoClaw's own flow,
 instead of being silently dropped. The owner approves (via any working
 owner channel), NanoClaw creates the conversation wiring itself, and
 subsequent messages route normally. Deterministic wiring for the owner's own
-conversations is done at install time through NanoClaw's CLI surfaces — see
+conversations is done at install time through NanoClaw's CLI surfaces - see
 the `add-raccoon` skill (`skill/add-raccoon/SKILL.md`), which also covers
 role grants.
 
@@ -138,7 +138,7 @@ An opt-in scripted rehearsal of the install's file steps exists at
 dir (or copies an existing checkout passed as `$1`), applies the skill's
 copy/barrel/.env/postbuild steps mechanically, runs their install and build,
 boots `node dist/index.js`, and curls the raccoon port for the PWA's
-`index.html`. It is NOT run by CI or vitest — it needs network access,
+`index.html`. It is NOT run by CI or vitest - it needs network access,
 NanoClaw's toolchain, and a checkout that can boot far enough to register
 channels.
 
@@ -147,7 +147,7 @@ channels.
 2. Build the connector deliverables in a raccoon checkout
    (`npm install && npm run bundle:nanoclaw`),
    then run the `add-raccoon` skill in the NanoClaw checkout. The skill also
-   wires a `postbuild` copy step into the fork's `package.json` — NanoClaw's
+   wires a `postbuild` copy step into the fork's `package.json` - NanoClaw's
    bare-`tsc` build does not copy the bundle or the PWA into `dist/`, so
    after `npm run build` confirm `dist/channels/raccoon.bundle.mjs` and
    `dist/channels/raccoon-app/index.html` both exist before
@@ -166,7 +166,7 @@ channels.
    agent.
 7. Verify **(d) inbound media**: send a photo from the phone; the agent can
    fetch it from inside its container (this exercises
-   `RACCOON_PUBLIC_ORIGIN` — the common failure is an origin only the host
+   `RACCOON_PUBLIC_ORIGIN` - the common failure is an origin only the host
    can reach).
 8. Verify **(e) outbound files**: have the agent write a file to its outbox;
    it arrives on the phone as an attachment.
@@ -177,13 +177,13 @@ channels.
 ## Limitations (v1)
 
 - **The fork's build needs the postbuild copy step.** NanoClaw's production
-  build is bare `tsc`, which compiles `.ts` only — the install must wire a
+  build is bare `tsc`, which compiles `.ts` only - the install must wire a
   `postbuild` script that copies `raccoon.bundle.mjs` and `raccoon-app/`
   into `dist/channels/` (the add-raccoon skill does this). Without it,
   `node dist/index.js` fails with `ERR_MODULE_NOT_FOUND` on the bundle while
   dev mode (`tsx src/index.ts`) works, masking the breakage.
 - **In-memory message history.** The endpoint's message store does not
-  survive a restart — pairing sessions persist (`sessions.json`), chat
+  survive a restart - pairing sessions persist (`sessions.json`), chat
   history does not. Buffered offline approval cards are also lost on
   restart, in which case a later tap fails closed with a user-visible
   notice.
@@ -202,7 +202,7 @@ isolated so a mismatch stays cheap to fix:
   fork's `registerChannelAdapter` option names and `ChannelDefaults` shape.
   Isolated to the thin wrapper `templates/raccoon.channel.ts` (installed as
   `src/channels/raccoon.ts`) and the declared types in
-  `templates/raccoon.bundle.d.mts` / `src/nanoclaw-types.ts` — a drift shows
+  `templates/raccoon.bundle.d.mts` / `src/nanoclaw-types.ts` - a drift shows
   up as a compile failure in the wrapper, and the fix lives there, not in
   the bundle. Note the check's honest scope: structural compilation catches
   incompatible changes to required members, not optional additions or
@@ -212,11 +212,11 @@ isolated so a mismatch stays cheap to fix:
   two listening sockets (hub + admin) inside NanoClaw's process; how their
   supervisor treats a channel that binds ports (restart ordering, crash
   handling) is unverified. Isolated to the single fail-clean boundary in
-  `src/adapter.ts` `setup()` / `teardown()` — everything starts there and is
+  `src/adapter.ts` `setup()` / `teardown()` - everything starts there and is
   closed in reverse order on any failure, so the adapter is never observable
   half-started.
 - **Container-reachable media mechanism.** Agents fetch phone-uploaded media
   over HTTP at `RACCOON_PUBLIC_ORIGIN`; whether that origin resolves from
   inside a given container runtime is deployment-dependent. Isolated to
   `src/media.ts` (path absolutization and attachment mapping) plus the one
-  env value — checklist item (d) is the probe.
+  env value - checklist item (d) is the probe.

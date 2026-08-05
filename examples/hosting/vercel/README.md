@@ -1,6 +1,6 @@
 # Raccoon PWA on Vercel
 
-Vercel's serverless platform can't host the hub — a Raccoon hub is a
+Vercel's serverless platform can't host the hub - a Raccoon hub is a
 **long-lived WebSocket server**, and serverless functions don't hold
 persistent socket connections. What Vercel hosts well is the **static PWA**:
 `@raccoon/app`'s `dist-standalone` is a plain static bundle, ideal for the
@@ -8,8 +8,8 @@ CDN.
 
 So this example splits the deployment:
 
-- **PWA on Vercel** (this page) — served from the edge on your domain.
-- **Hub elsewhere** — the [Railway](../railway/) service or the
+- **PWA on Vercel** (this page) - served from the edge on your domain.
+- **Hub elsewhere** - the [Railway](../railway/) service or the
   [Cloudflare Tunnel](../cloudflare/) setup. The app pairs to whatever
   `wss://` URL the QR payload carries; the PWA origin and hub origin don't
   need to match.
@@ -41,5 +41,5 @@ builds and deploys the PWA with no configuration.
    hub's boot log.
 
 The included `vercel.json` also marks `index.html`, `service-worker.js`, and
-`version.json` as `no-store` — the same cache policy the hub's own static
-server applies — so the PWA's update check keeps working through Vercel's CDN.
+`version.json` as `no-store` - the same cache policy the hub's own static
+server applies - so the PWA's update check keeps working through Vercel's CDN.
