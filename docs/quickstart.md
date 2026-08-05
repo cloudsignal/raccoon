@@ -239,8 +239,12 @@ signals.
 ## Path B - an existing OpenClaw agent
 
 If your agent runs on [OpenClaw](https://openclaw.ai), install the first-party
-connector as an OpenClaw plugin - no `AgentRunner` to write. v0.1 installs from
-a clone:
+connector as an OpenClaw plugin - no `AgentRunner` to write. (Running
+[NanoClaw](https://github.com/nanocoai/nanoclaw) instead? Its first-party
+connector embeds the raccoon endpoint inside NanoClaw's host process and
+installs via the `add-raccoon` skill - see
+[`adapters/connector-nanoclaw/README.md`](../adapters/connector-nanoclaw/README.md).)
+v0.1 installs from a clone:
 
 ```bash
 git clone https://github.com/cloudsignal/raccoon && cd raccoon
@@ -327,7 +331,7 @@ Vercel walkthroughs.
 - [`examples/hosting/`](../examples/hosting/) - deploy with HTTPS/WSS on
   Railway, Cloudflare (Tunnel/Pages), or Vercel, and pair a real phone.
 - [connector-authoring.md](connector-authoring.md) - the public ports a
-  connector implements, the package-boundary diagram, and how a second
-  connector (or a managed transport) plugs in without touching core.
+  connector implements, the package-boundary diagram, both first-party
+  connectors as worked examples, and the adapter conformance checklist.
 - [security.md](security.md) - what Raccoon does and does **not** protect
   (TLS/WSS, transit encryption, and why this is not end-to-end encryption).

@@ -24,12 +24,12 @@ framework. Raccoon gives them a single chat app instead. Pair your phone with
 a QR code, install the app to your home screen, and message your agents. The
 app stays the same when the framework underneath changes.
 
-v0.1 ships a vendor-neutral core and a first-party OpenClaw connector. Other
-agent frameworks connect through the same documented public ports, no fork
-required. The deeper plumbing is pluggable too: the wire that carries messages
-and the delivery behind push notifications are documented seams. Vendor
-integrations arrive as plugins you choose to install, never as core
-dependencies.
+v0.1 ships a vendor-neutral core and two first-party connectors, for OpenClaw
+and NanoClaw. Other agent frameworks connect through the same documented
+public ports, no fork required. The deeper plumbing is pluggable too: the
+wire that carries messages and the delivery behind push notifications are
+documented seams. Vendor integrations arrive as plugins you choose to
+install, never as core dependencies.
 
 ## Why Raccoon
 
@@ -46,10 +46,10 @@ dependencies.
   connector, agent runtime, and model provider all handle plaintext.
   [docs/security.md](docs/security.md) spells out what is and is not
   encrypted.
-- **A portable front end.** The app pairs to a Raccoon instance and gives
-  every agent on it its own channel. Moving to another framework means pairing
-  the same app to a different instance, not adopting a new UI. (v0.1 stores
-  one active pairing at a time. It is not yet a multi-instance aggregator.)
+- **A portable front end.** The app holds any number of pairings at once and
+  gives every agent its own channel; conversations from every paired platform
+  land in one list. Moving to another framework means pairing the same app to
+  a different instance, not adopting a new UI.
 - **Broker-free by default.** The built-in WebSocket hub needs no external
   broker or cloud service, and the self-hosted path involves no
   Raccoon-operated relay. The protocol is transport-agnostic; WebSocket is the
@@ -58,8 +58,8 @@ dependencies.
 
 ## Who it's for
 
-- People running agents on an agent framework (OpenClaw today) who want a
-  real chat app instead of a per-framework UI or a bot.
+- People running agents on an agent framework (OpenClaw and NanoClaw today)
+  who want a real chat app instead of a per-framework UI or a bot.
 - Teams that approve agent actions from a phone, with push to bring the right
   person in.
 - Builders who want one front end that survives changes of framework,
@@ -84,7 +84,7 @@ Everything below the app is a documented extension seam
 ([docs/connector-authoring.md](docs/connector-authoring.md)):
 
 - **Connectors** join an agent framework as a consumer of the messaging
-  ports. This is everything the OpenClaw connector uses.
+  ports. This is everything the two first-party connectors use.
 - **Transports** replace the built-in WebSocket with your own wire (a broker,
   a managed service) carrying the same envelopes.
 - **Push** hands notifications to your own delivery instead of raw Web Push.
@@ -92,6 +92,22 @@ Everything below the app is a documented extension seam
 Vendor integrations ship as plugins built on these seams, from their own
 repos. The core never names or depends on them. See
 [PROTOCOL.md](PROTOCOL.md) for the wire format.
+
+## Supported platforms
+
+Two agent platforms have first-party connectors:
+
+- **OpenClaw**: the connector installs as an OpenClaw channel plugin and
+  drives OpenClaw's own pipeline from inside the gateway. See
+  [adapters/connector-openclaw/README.md](adapters/connector-openclaw/README.md).
+- **NanoClaw**: the connector embeds the Raccoon endpoint (hub, pairing, PWA)
+  inside NanoClaw's host process; NanoClaw has no plugin loader, so it ships
+  as a self-contained bundle installed by the `add-raccoon` skill. See
+  [adapters/connector-nanoclaw/README.md](adapters/connector-nanoclaw/README.md).
+
+Any other framework connects through the same public ports:
+[docs/connector-authoring.md](docs/connector-authoring.md) documents the
+ports and the adapter conformance checklist.
 
 ## Try it (same-machine demo)
 
@@ -131,6 +147,21 @@ Configuration, the setup wizard, allowlist/DM policy, and the pairing CLI are
 documented in
 [adapters/connector-openclaw/README.md](adapters/connector-openclaw/README.md).
 
+## Use it with NanoClaw
+
+NanoClaw has no plugin loader, so the connector installs into a NanoClaw fork
+as a self-contained bundle. Build the deliverables from a clone:
+
+    git clone https://github.com/cloudsignal/raccoon && cd raccoon
+    npm install && npm run bundle:nanoclaw
+
+Then run the `add-raccoon` skill inside the NanoClaw checkout (copy
+`adapters/connector-nanoclaw/skill/add-raccoon` into its `.claude/skills/`).
+It copies the bundle and PWA, registers the channel, appends the `.env`
+block, wires the owner's conversations, and pairs the first phone. The full
+walkthrough, configuration table, and admin pair/revoke API are documented in
+[adapters/connector-nanoclaw/README.md](adapters/connector-nanoclaw/README.md).
+
 ## Deploy
 
 Production needs HTTPS/WSS: PWA install, service workers, and push all
@@ -152,6 +183,7 @@ require a secure origin, and phones can't reach `ws://127.0.0.1`.
 | --- | --- |
 | `@raccoon/app` | The installable, push-capable chat PWA (static build + host-embed surface) |
 | `@raccoon/connector-openclaw` | First-party OpenClaw channel connector (`openclaw` peer dep) |
+| `@raccoon/connector-nanoclaw` | First-party NanoClaw connector (self-contained bundle + install skill) |
 | `@raccoon/protocol` | Raccoon protocol envelope types, schemas, and codec |
 | `@raccoon/transport-ws` | Built-in broker-free WebSocket hub (`WsHub`) + client |
 | `@raccoon/bridge` | `RaccoonBridge` + the framework ports a connector implements |
@@ -175,16 +207,19 @@ this):
     # in your project:
     npm i /path/to/raccoon/release-artifacts/raccoon-*.tgz
 
-The repo also carries two `private`, unpublished transport implementations
-(an MQTT broker transport and a managed-service transport) that prove the
-transport seam from outside the neutral release. Nothing in core depends on
-them. A NanoClaw connector is planned, not yet shipped.
+The NanoClaw connector is not part of the release-pack tarball set: its
+fork-droppable artifacts (bundle, type declarations, built PWA) are built
+from a source checkout with `npm run bundle:nanoclaw` and installed into a
+NanoClaw fork by the `add-raccoon` skill. The repo also carries two
+`private`, unpublished transport implementations (an MQTT broker transport
+and a managed-service transport) that prove the transport seam from outside
+the neutral release. Nothing in core depends on them.
 
 ## Docs
 
 - [docs/quickstart.md](docs/quickstart.md): backend + PWA in 5 minutes
 - [PROTOCOL.md](PROTOCOL.md): the Raccoon wire protocol (versioned, connector-neutral)
-- [docs/connector-authoring.md](docs/connector-authoring.md): public ports, package-boundary diagram, second-connector example
+- [docs/connector-authoring.md](docs/connector-authoring.md): public ports, package-boundary diagram, both first-party connectors, adapter conformance checklist
 - [docs/compatibility.md](docs/compatibility.md): package versions and the OpenClaw version matrix
 - [docs/security.md](docs/security.md): HTTPS/WSS requirements, what's encrypted where, why this is not E2EE
 - [examples/hosting/](examples/hosting/): deploy on Railway, Cloudflare, or Vercel

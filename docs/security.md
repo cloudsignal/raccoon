@@ -33,8 +33,10 @@ With TLS in front of the hub:
 - **Revocation.** Unpairing a user closes their live sockets and invalidates
   their session immediately; a subsequent reconnect with the old session is
   rejected.
-- **DM gating (OpenClaw connector).** The connector enforces an allowlist /
-  DM policy before an agent turn runs.
+- **DM gating (connectors).** The OpenClaw connector enforces an allowlist /
+  DM policy before an agent turn runs. The NanoClaw connector routes messages
+  from paired-but-unwired senders into NanoClaw's own owner-approval
+  registration flow instead of running an agent turn.
 
 ## What Raccoon does NOT provide
 
@@ -43,10 +45,11 @@ With TLS in front of the hub:
   guarantee as visiting an HTTPS website. It is **not** a guarantee that only
   the two human/agent endpoints can read the content.
 - **The server sees plaintext.** The hub, the bridge, and, critically, the
-  **agent framework (OpenClaw) and the model provider** all receive message
-  content as **plaintext**. Your prompts and the agent's replies are visible to:
+  **agent framework (OpenClaw or NanoClaw) and the model provider** all
+  receive message content as **plaintext**. Your prompts and the agent's
+  replies are visible to:
   - the process running the hub/connector,
-  - the OpenClaw runtime handling the turn,
+  - the agent framework runtime (OpenClaw or NanoClaw) handling the turn,
   - the model provider you configured (e.g. your LLM vendor), under their data
     policies.
 

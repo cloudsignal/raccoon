@@ -26,9 +26,9 @@ const bridge = new RaccoonBridge({ hub, runner, store: new InMemoryMessageStore(
 const stop = bridge.start();
 ```
 
-This is the same port the first-party OpenClaw connector implements - a
-second connector (or a managed transport) plugs into core through it without
-touching core. See
+This is the same port both first-party connectors (OpenClaw and NanoClaw)
+implement - another connector (or a managed transport) plugs into core
+through it without touching core. See
 [connector-authoring.md](https://github.com/cloudsignal/raccoon/blob/main/docs/connector-authoring.md)
 for the full port surface and package-boundary diagram.
 
