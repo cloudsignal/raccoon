@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { InMemorySubscriptionStore } from '@raccoon/push';
+import { createEnvelope, agentAddress, userAddress } from '@raccoon/protocol';
 import { createRaccoonChannel } from './plugin.js';
 
 let dir: string;
@@ -52,6 +53,27 @@ describe('createRaccoonChannel (Plan C options)', () => {
     });
     await channel.start();
     await expect(channel.revoke('u1')).resolves.toBeUndefined();
+    await channel.stop();
+  });
+
+  it('sendAgentEnvelope records history and reports offline sends (agent-initiated outbound seam)', async () => {
+    // Mirrors connector-nanoclaw's endpoint.test.ts: an agent-initiated send
+    // with NO live socket must still land in the channel's message store, so
+    // history replay includes it — and the boolean reports the offline miss
+    // (push fallback, when configured, may still deliver).
+    const channel = createRaccoonChannel({
+      instance: 't', instanceUrl: 'ws://127.0.0.1:0/', port: 0, channels: ['echo'],
+      runner: { run: async function* () { yield 'ok'; } },
+    });
+    await channel.start();
+    const env = createEnvelope('msg', {
+      from: agentAddress('echo'), to: userAddress('u1'), channel: 'echo',
+      payload: { text: 'while you were away' },
+    });
+    const delivered = await channel.sendAgentEnvelope('u1', env);
+    expect(delivered).toBe(false); // no socket connected
+    const page = await channel.store.page('echo', { userId: 'u1', limit: 10 });
+    expect(page.messages.some((m) => m.text === 'while you were away' && m.role === 'agent')).toBe(true);
     await channel.stop();
   });
 

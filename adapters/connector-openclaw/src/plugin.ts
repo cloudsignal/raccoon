@@ -1,5 +1,7 @@
+import { ulid } from 'ulid';
 import { WsHub, type CredentialStore } from '@raccoon/transport-ws';
-import { InMemoryMessageStore, RaccoonBridge, type AgentRunner } from '@raccoon/bridge';
+import { InMemoryMessageStore, RaccoonBridge, type AgentRunner, type MessageStore } from '@raccoon/bridge';
+import type { AnyEnvelope } from '@raccoon/protocol';
 import { issuePairing, revokePairing } from '@raccoon/pairing';
 import { InMemorySubscriptionStore, VapidPushSender, withPushFallback } from '@raccoon/push';
 
@@ -45,10 +47,18 @@ export interface RaccoonChannelOptions {
 export interface RaccoonAgentChannel {
   hub: WsHub;
   bridge: RaccoonBridge;
+  /** The channel's own message store (in-memory v1) — exposed so hosts and
+   *  tests can read history without reaching into the bridge's internals. */
+  store: MessageStore;
   start(): Promise<{ port: number }>;
   stop(): Promise<void>;
   pair(userId: string): ReturnType<typeof issuePairing>;
   revoke(userId: string): ReturnType<typeof revokePairing>;
+  /** Agent-initiated sends (outbound replies, approval cards). Records 'msg'
+   *  envelopes in the message store (history) and permanent-references their
+   *  attachments, then sends through the push-wrapped hub. Returns whether a
+   *  live socket took it (push fallback may still deliver when false). */
+  sendAgentEnvelope(userId: string, env: AnyEnvelope): Promise<boolean>;
   buildId: string;
 }
 
@@ -86,13 +96,15 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
   // media: the hub's OWN store (Task 4 seam) — the bridge permanently
   // references a message's attachments after its durable append, so the
   // store's sweep never deletes blobs a recorded message points at.
-  const bridge = new RaccoonBridge({ hub: bridgeHub, runner: opts.runner, store: new InMemoryMessageStore(), media: hub.media });
+  const store = new InMemoryMessageStore();
+  const bridge = new RaccoonBridge({ hub: bridgeHub, runner: opts.runner, store, media: hub.media });
 
   let stopBridge: (() => void) | null = null;
 
   return {
     hub,
     bridge,
+    store,
     async start(): Promise<{ port: number }> {
       const { port } = await hub.start();
       stopBridge = bridge.start();
@@ -125,6 +137,30 @@ export function createRaccoonChannel(opts: RaccoonChannelOptions): RaccoonAgentC
       const pushCleared = clearPushForUser?.(userId) ?? Promise.resolve();
       await revokePairing(hub, userId);
       await pushCleared;
+    },
+    // Agent-initiated sends: history + media reference + push-wrapped hub —
+    // the same seam shape as connector-nanoclaw's sendAgentEnvelope (each
+    // connector owns its copy; see docs/connector-authoring.md "Record
+    // agent-initiated sends"). A false return means no live socket took it —
+    // push fallback (when configured) may still deliver; the message is in
+    // history either way.
+    async sendAgentEnvelope(userId: string, env: AnyEnvelope): Promise<boolean> {
+      if (env.kind === 'msg') {
+        const payload = env.payload;
+        if (payload.attachments && payload.attachments.length > 0) {
+          await hub.media.reference(payload.attachments.map((a) => a.url));
+        }
+        await store.append({
+          id: env.id.length > 0 ? env.id : ulid(),
+          channel: env.channel,
+          userId,
+          role: 'agent',
+          text: payload.text,
+          ts: env.ts,
+          ...(payload.attachments ? { attachments: payload.attachments } : {}),
+        });
+      }
+      return bridgeHub.sendToUser(userId, env);
     },
     buildId: opts.buildId ?? 'dev',
   };

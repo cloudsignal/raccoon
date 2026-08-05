@@ -40,7 +40,6 @@ import {
   agentAddress,
   type AnyEnvelope,
 } from '@raccoon/protocol';
-import type { OutboundHub } from '@raccoon/bridge';
 import { chunkReplyText } from './formatting.js';
 import type { ApprovalChoice, ApprovalValueStore } from './approval-values.js';
 import { RACCOON_APPROVAL_META_KEY } from './approval-render.js';
@@ -65,12 +64,27 @@ import { ulid } from 'ulid';
 // Factory deps
 // ---------------------------------------------------------------------------
 
+/**
+ * The send seam the outbound adapter delivers through. May be async: the
+ * gateway hands in the channel's sendAgentEnvelope seam (history append +
+ * media reference + push-wrapped hub — see plugin.ts and
+ * docs/connector-authoring.md "Record agent-initiated sends"), whose
+ * persistence must complete before the adapter reports delivery. A plain
+ * sync hub (@raccoon/bridge OutboundHub, WsHub) structurally satisfies it
+ * too — `await` on a boolean is a no-op.
+ */
+export interface OutboundSend {
+  sendToUser(userId: string, env: AnyEnvelope): boolean | Promise<boolean>;
+}
+
 export interface RaccoonOutboundDeps {
   /**
-   * The hub that delivers Raccoon envelopes to connected Raccoon users.
-   * Structurally matches @raccoon/bridge OutboundHub.
+   * The send seam that delivers Raccoon envelopes to Raccoon users. In
+   * production this is the gateway's recording, push-aware seam
+   * (RunningAccount.sendAgentEnvelope); a bare hub also fits (see
+   * OutboundSend).
    */
-  hub: OutboundHub;
+  hub: OutboundSend;
   /**
    * Raccoon channel name to use as envelope.channel and the source agent address.
    * Typically the agent's role name (e.g. 'coordinator'). Injectable so that
@@ -114,13 +128,15 @@ function parseRaccoonUserId(to: string): string {
 /**
  * Send one or more Raccoon `msg` envelopes for the given text chunks in order.
  * Returns the id of the FIRST envelope (used as messageId in the result).
+ * Async because the send seam may persist (history append) before delivery;
+ * awaiting each chunk keeps history order = delivery order.
  */
-function sendMsgChunks(
-  hub: OutboundHub,
+async function sendMsgChunks(
+  hub: OutboundSend,
   channel: string,
   userId: string,
   chunks: string[],
-): string {
+): Promise<string> {
   const nonEmpty = chunks.filter((c) => c.length > 0);
   if (nonEmpty.length === 0) {
     throw new Error('raccoon outbound: nothing to send (empty reply text)');
@@ -133,7 +149,7 @@ function sendMsgChunks(
       channel,
       payload: { text: chunk },
     });
-    hub.sendToUser(userId, env);
+    await hub.sendToUser(userId, env);
     if (firstId === '') firstId = env.id;
   }
   return firstId;
@@ -288,7 +304,7 @@ function presentationTextBlocks(presentation: MessagePresentation): string {
  * presentation carries no renderable text of its own.
  */
 async function deliverPresentation(
-  hub: OutboundHub,
+  hub: OutboundSend,
   channel: string,
   approvalValues: ApprovalValueStore | undefined,
   userId: string,
@@ -319,14 +335,14 @@ async function deliverPresentation(
       payload: { refId, title, description, options: choices.map((c) => c.label) },
     });
     approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])), approvalExpiresAtMs);
-    hub.sendToUser(userId, env);
+    await hub.sendToUser(userId, env);
     return makeResult(env.id, channel);
   }
 
   const rendered = presentationTextBlocks(presentation);
   const text = rendered.length > 0 ? rendered : fallbackText;
   const chunks = chunkReplyText(text);
-  const firstId = sendMsgChunks(hub, channel, userId, chunks);
+  const firstId = await sendMsgChunks(hub, channel, userId, chunks);
   return makeResult(firstId, channel);
 }
 
@@ -407,7 +423,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
   async function sendText(ctx: ChannelOutboundContext): Promise<OutboundDeliveryResult> {
     const userId = parseRaccoonUserId(ctx.to);
     const chunks = chunkReplyText(ctx.text);
-    const firstId = sendMsgChunks(hub, channel, userId, chunks);
+    const firstId = await sendMsgChunks(hub, channel, userId, chunks);
     return makeResult(firstId, channel);
   }
 
@@ -466,7 +482,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
           },
         });
         approvalValues?.remember(refId, userId, new Map(choices.map((c) => [c.label, c.choice])), approvalExpiresAtMs);
-        hub.sendToUser(userId, env);
+        await hub.sendToUser(userId, env);
         return makeResult(env.id, channel);
       }
 
@@ -481,7 +497,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
         ? `${baseText}\n\n${optionsList}`
         : baseText;
       const chunks = chunkReplyText(fallbackText);
-      const firstId = sendMsgChunks(hub, channel, userId, chunks);
+      const firstId = await sendMsgChunks(hub, channel, userId, chunks);
       return makeResult(firstId, channel);
     }
 
@@ -509,7 +525,7 @@ export function createRaccoonOutbound(deps: RaccoonOutboundDeps) {
         ? payload.text
         : ctx.text;
     const chunks = chunkReplyText(text);
-    const firstId = sendMsgChunks(hub, channel, userId, chunks);
+    const firstId = await sendMsgChunks(hub, channel, userId, chunks);
     return makeResult(firstId, channel);
   }
 

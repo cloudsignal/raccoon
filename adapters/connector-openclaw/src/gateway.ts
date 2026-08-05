@@ -19,12 +19,20 @@
 // - startAccount() stands up the WsHub+RaccoonBridge and stores the entry.
 // - stopAccount() tears it down and removes the entry.
 // - the plugin's outbound adapter (createRegistryOutbound) resolves the live
-//   hub for ctx.accountId (default 'default') from this registry per call and
-//   delegates to the T4 createRaccoonOutbound wiring with that hub + channel.
+//   entry for ctx.accountId (default 'default') from this registry per call
+//   and delegates to the T4 createRaccoonOutbound wiring with the entry's
+//   sendAgentEnvelope seam + channel.
 //
-// This keeps T4 unchanged (it still takes a concrete { hub, channel }); the
-// registry is the mechanism that bridges "one plugin object built at module
-// load" to "a hub that only exists once an account is started".
+// Agent-initiated sends do NOT go through the raw hub. The registry entry
+// carries the channel's sendAgentEnvelope seam (createRaccoonChannel —
+// plugin.ts), the ONE blessed outbound path: it appends 'msg' envelopes to the
+// channel's MessageStore (history replay), permanent-references their
+// attachments (so the media sweep can't delete blobs a delivered message
+// points at), and delivers via the possibly-push-wrapped bridgeHub (so an
+// offline phone still gets a VAPID push when configured). A raw entry.hub
+// send — the old wiring — bypassed all three, because the push wrapper,
+// store, and bridgeHub live only inside createRaccoonChannel's closure.
+// See docs/connector-authoring.md "Record agent-initiated sends".
 
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -67,6 +75,15 @@ export interface RunningAccount {
    * own closure, unreachable from the registry entry any other way.
    */
   revoke: RaccoonAgentChannel['revoke'];
+  /**
+   * The channel's recording, push-aware send seam (createRaccoonChannel's —
+   * plugin.ts): history append + media reference + delivery via the
+   * possibly-push-wrapped hub. ALL agent-initiated outbound (replies,
+   * approval cards) goes through THIS, never entry.hub.sendToUser directly —
+   * a raw hub send skips history, media referencing, and push fallback,
+   * which all live only inside the channel's closure.
+   */
+  sendAgentEnvelope: RaccoonAgentChannel['sendAgentEnvelope'];
 }
 
 /** Injectable factory + gate for startAccount (tests inject fakes). */
@@ -87,7 +104,7 @@ export interface StartAccountDeps {
     mediaDir?: string;
     vapid?: { publicKey: string; privateKey: string; subject: string };
     sessionStore?: CredentialStore;
-  }) => Pick<RaccoonAgentChannel, 'hub' | 'start' | 'stop' | 'revoke'>;
+  }) => Pick<RaccoonAgentChannel, 'hub' | 'start' | 'stop' | 'revoke' | 'sendAgentEnvelope'>;
   /**
    * Optional allowlist gate applied to the inbound runner. When it returns
    * false for a userId, the agent is not invoked and no reply is produced.
@@ -265,6 +282,7 @@ async function doStart(
     // closes it too).
     stop: async () => { try { await channel.stop(); } finally { await sessionStore.close?.(); } },
     revoke: (userId: string) => channel.revoke(userId),
+    sendAgentEnvelope: (userId, env) => channel.sendAgentEnvelope(userId, env),
   };
   running.set(accountId, entry);
   ctx.log?.info(`raccoon: account "${accountId}" started (channel ${channelName})`);
@@ -298,10 +316,13 @@ export async function stopAccount(
 // ---------------------------------------------------------------------------
 // createRegistryOutbound — the outbound adapter used by raccoonChannelPlugin
 //
-// Resolves the live hub for ctx.accountId from the registry per call, then
-// delegates to the T4 createRaccoonOutbound wiring. Building the T4 adapter
-// per call is cheap (it only closes over { hub, channel }); it keeps all the
-// chunking / interactive→approval mapping logic in one place (outbound.ts).
+// Resolves the live entry for ctx.accountId from the registry per call, then
+// delegates to the T4 createRaccoonOutbound wiring — handing it the entry's
+// sendAgentEnvelope seam (NOT the raw hub) as its OutboundSend, so every
+// agent-initiated send is recorded in history, media-referenced, and
+// push-aware (see the module header). Building the T4 adapter per call is
+// cheap (it only closes over { hub, channel }); it keeps all the chunking /
+// interactive→approval mapping logic in one place (outbound.ts).
 // ---------------------------------------------------------------------------
 
 export function createRegistryOutbound(
@@ -316,18 +337,18 @@ export function createRegistryOutbound(
       );
     }
     return createRaccoonOutbound({
-      hub: entry.hub,
+      hub: { sendToUser: (userId, env) => entry.sendAgentEnvelope(userId, env) },
       channel: entry.channel,
       approvalValues: approvalValues.get(accountId ?? 'default'),
     });
   }
 
   // presentationCapabilities, renderPresentation, and chunker are all
-  // stateless (none touch the hub — renderPresentation is a pure transform,
-  // see outbound.ts's R4-1 correction; chunker only chunks text): built once
-  // from a placeholder hub that real calls never reach.
+  // stateless (none touch the send seam — renderPresentation is a pure
+  // transform, see outbound.ts's R4-1 correction; chunker only chunks text):
+  // built once from a placeholder seam that real calls never reach.
   const stateless = createRaccoonOutbound({
-    hub: { sendToUser: () => false, onEnvelope: () => () => {} },
+    hub: { sendToUser: () => false },
     channel: 'raccoon',
   });
 
