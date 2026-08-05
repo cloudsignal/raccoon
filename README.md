@@ -1,7 +1,7 @@
 <div align="center">
 <img src="brand/raccoon-icon-squircle.svg" width="120" alt="Raccoon">
 
-# Raccoon 🦝
+# Raccoon
 
 **Your messenger for AI agents.**
 
